@@ -15,8 +15,8 @@
 	import { flagsOf, PLANNED, tools } from '$lib/analysis/tools';
 	import { COLOR_TYPES, isHeaderError, type AnalysisResponse } from '$lib/worker/protocol';
 
-	/** Plane responses update the open viewer; they never become the page state. */
-	type Analysis = Exclude<AnalysisResponse, { status: 'plane' }>;
+	/** Plane and extract responses update a panel; they never become the page state. */
+	type Analysis = Exclude<AnalysisResponse, { status: 'plane' } | { status: 'extract' }>;
 
 	type View =
 		| { phase: 'idle' }
@@ -27,6 +27,7 @@
 	let activeTool = $state('flags');
 	let selectedChunk = $state(-1);
 	let openPlane = $state<{ channel: number; bit: number; pixels: Uint8Array | null } | null>(null);
+	let extracted = $state<{ label: string; text: string } | null>(null);
 
 	let worker: Worker | null = null;
 	let ticket = 0;
@@ -46,10 +47,24 @@
 					return;
 				}
 
+				if (result.status === 'extract') {
+					// Non-printable bytes become dots so a binary payload stays legible
+					// as a shape rather than filling the pane with control characters.
+					const text = Array.from(result.bytes, (b) =>
+						b === 10 || b === 13 || (b >= 0x20 && b < 0x7f) ? String.fromCharCode(b) : '.'
+					)
+						.join('')
+						.replace(/\.{80,}/g, (run) => `${'.'.repeat(24)} [${run.length} unreadable bytes] `);
+
+					extracted = { label: result.label, text };
+					return;
+				}
+
 				const analysis: Analysis = result;
 				pending.then((bytes) => {
 					view = { phase: 'done', result: analysis, bytes };
 					openPlane = null;
+					extracted = null;
 					if (analysis.status !== 'ok') return;
 
 					selectedChunk = analysis.structure?.chunks[0]?.offset ?? -1;
@@ -87,6 +102,11 @@
 	function requestPlane(channel: number, bit: number) {
 		openPlane = { channel, bit, pixels: null };
 		ensureWorker().postMessage({ kind: 'plane', id: ticket, channel, bit });
+	}
+
+	function requestExtract(channels: string, bit: number, msbFirst: boolean) {
+		extracted = null;
+		ensureWorker().postMessage({ kind: 'extract', id: ticket, channels, bit, msbFirst });
 	}
 
 	function reset() {
@@ -307,7 +327,16 @@
 							onclose={() => (openPlane = null)}
 						/>
 					{:else if activeTool === 'lsb'}
-						<SweepView {sweep} error={pixelError} />
+						<SweepView {sweep} error={pixelError} {extracted} onextract={requestExtract} />
+						{#if sweep?.candidates.length && chi && !chi.detected}
+							<p class="scale-note">
+								Chi-square and RS stayed quiet on this file, which is consistent rather than
+								contradictory. They estimate what fraction of the image carries a payload, and a
+								short message occupies a tiny fraction of one. Below roughly 5% of the low bits
+								there is nothing for them to measure, so the sweep is the tool that finds small
+								payloads and they are the tools that size large ones.
+							</p>
+						{/if}
 					{:else if activeTool === 'flags'}
 						{#if credibleFlags.length === 0}
 							<p class="clear">
@@ -558,6 +587,16 @@
 		font-size: var(--t-mid);
 		overflow-wrap: anywhere;
 		user-select: all;
+	}
+
+	.scale-note {
+		margin: var(--s5) 0 0;
+		padding-top: var(--s3);
+		border-top: 1px solid var(--rule);
+		max-width: 78ch;
+		font-size: var(--t-label);
+		color: var(--muted);
+		line-height: 1.6;
 	}
 
 	.suppressed {

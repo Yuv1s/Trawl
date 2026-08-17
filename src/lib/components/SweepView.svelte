@@ -1,10 +1,22 @@
 <script lang="ts">
-	import type { Sweep } from '$lib/worker/protocol';
+	import type { Sweep, SweepCandidate } from '$lib/worker/protocol';
 
-	let { sweep, error }: { sweep: Sweep | null; error: string | null } = $props();
+	let {
+		sweep,
+		error,
+		extracted,
+		onextract
+	}: {
+		sweep: Sweep | null;
+		error: string | null;
+		extracted: { label: string; text: string } | null;
+		onextract: (channels: string, bit: number, msbFirst: boolean) => void;
+	} = $props();
 
-	const label = (c: { channels: string; bit: number; msbFirst: boolean }) =>
+	const label = (c: Pick<SweepCandidate, 'channels' | 'bit' | 'msbFirst'>) =>
 		`${c.channels} · bit ${c.bit} · ${c.msbFirst ? 'msb' : 'lsb'} first`;
+
+	const clipped = (c: SweepCandidate) => c.readable > c.preview.length;
 </script>
 
 {#if !sweep}
@@ -29,6 +41,12 @@
 					<span class="mono channels">{candidate.channels}</span>
 					<span class="mono chip">bit {candidate.bit}</span>
 					<span class="mono chip">{candidate.msbFirst ? 'msb' : 'lsb'} first</span>
+					<button
+						type="button"
+						onclick={() => onextract(candidate.channels, candidate.bit, candidate.msbFirst)}
+					>
+						Extract everything
+					</button>
 				</div>
 
 				<p class="reason">{candidate.reason}</p>
@@ -42,9 +60,23 @@
 				{/if}
 
 				<pre class="preview mono">{candidate.preview}</pre>
+
+				{#if clipped(candidate)}
+					<p class="clip">
+						Showing {candidate.preview.length.toLocaleString()} of
+						{candidate.readable.toLocaleString()} readable characters. Extract everything for the rest.
+					</p>
+				{/if}
 			</li>
 		{/each}
 	</ul>
+
+	{#if extracted}
+		<section class="extracted">
+			<h3 class="label">Full extraction · {extracted.label}</h3>
+			<pre class="dump mono">{extracted.text}</pre>
+		</section>
+	{/if}
 {/if}
 
 <style>
@@ -97,6 +129,23 @@
 		padding: 1px var(--s2);
 	}
 
+	.params button {
+		margin-left: auto;
+		background: none;
+		border: 1px solid var(--rule-bright);
+		border-radius: var(--radius);
+		color: var(--text);
+		font: inherit;
+		font-size: var(--t-label);
+		padding: var(--s1) var(--s3);
+		cursor: pointer;
+		transition: background-color 120ms var(--ease);
+	}
+
+	.params button:hover {
+		background: var(--panel-lift);
+	}
+
 	.reason {
 		margin: var(--s2) 0 0;
 		color: var(--muted);
@@ -117,7 +166,8 @@
 		user-select: all;
 	}
 
-	.preview {
+	.preview,
+	.dump {
 		margin: var(--s3) 0 0;
 		padding: var(--s2) var(--s3);
 		background: var(--ground);
@@ -128,5 +178,27 @@
 		white-space: pre-wrap;
 		overflow-wrap: anywhere;
 		color: var(--text);
+		user-select: all;
+	}
+
+	.clip {
+		margin: var(--s2) 0 0;
+		font-size: var(--t-label);
+		color: var(--signal);
+	}
+
+	.extracted {
+		margin-top: var(--s5);
+		padding-top: var(--s4);
+		border-top: 1px solid var(--rule);
+	}
+
+	.extracted h3 {
+		margin: 0;
+	}
+
+	.dump {
+		max-height: 26rem;
+		overflow: auto;
 	}
 </style>

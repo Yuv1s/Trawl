@@ -28,6 +28,9 @@ pub struct Candidate {
     pub params: Params,
     pub reason: String,
     pub preview: String,
+    /// Length of the readable run, so the caller can tell when the preview
+    /// stopped short of it rather than presenting a clipped message as whole.
+    pub readable: usize,
     pub flags: Vec<String>,
     pub bytes_read: usize,
 }
@@ -90,15 +93,18 @@ const MIN_RUN_AT_START: usize = 8;
 /// payload. Real text carries variety.
 const MIN_DISTINCT: usize = 6;
 
-fn assess(stream: &[u8]) -> Option<(String, String)> {
+/// How much of a readable run the sweep quotes. The full stream is available
+/// through `extract_named`; this is the summary, and the UI says when it clipped.
+const PREVIEW_LIMIT: usize = 512;
+
+fn assess(stream: &[u8]) -> Option<(String, String, usize)> {
     if let Some(format) = bytes::identify(stream) {
-        return Some((
-            format!("{format} signature at offset 0"),
-            String::from_utf8_lossy(&stream[..stream.len().min(48)])
-                .chars()
-                .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '.' })
-                .collect(),
-        ));
+        let preview: String = String::from_utf8_lossy(&stream[..stream.len().min(48)])
+            .chars()
+            .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '.' })
+            .collect();
+        let shown = preview.chars().count();
+        return Some((format!("{format} signature at offset 0"), preview, shown));
     }
 
     let (start, run) = bytes::longest_printable_run(stream);
@@ -111,14 +117,15 @@ fn assess(stream: &[u8]) -> Option<(String, String)> {
         return None;
     }
 
-    let preview: String = String::from_utf8_lossy(&stream[start..start + run.min(96)]).into_owned();
+    let preview: String =
+        String::from_utf8_lossy(&stream[start..start + run.min(PREVIEW_LIMIT)]).into_owned();
     let where_ = if start == 0 {
-        "text at offset 0".to_string()
+        format!("text at offset 0, {run} characters")
     } else {
         format!("printable run of {run} at offset {start}")
     };
 
-    Some((where_, preview))
+    Some((where_, preview, run))
 }
 
 /// Sweeps the parameter space and reports only combinations that produced
@@ -148,8 +155,14 @@ pub fn sweep(rgba: &[u8], has_alpha: bool, max_bytes: usize) -> Vec<Candidate> {
                     continue;
                 }
 
-                let (reason, preview) = assessed.unwrap_or_else(|| {
-                    ("flag-shaped string in the extracted stream".to_string(), flags.join("  "))
+                let (reason, preview, readable) = assessed.unwrap_or_else(|| {
+                    let joined = flags.join("  ");
+                    let shown = joined.chars().count();
+                    (
+                        "flag-shaped string in the extracted stream".to_string(),
+                        joined,
+                        shown,
+                    )
                 });
 
                 out.push(Candidate {
@@ -160,6 +173,7 @@ pub fn sweep(rgba: &[u8], has_alpha: bool, max_bytes: usize) -> Vec<Candidate> {
                     },
                     reason,
                     preview,
+                    readable,
                     flags,
                     bytes_read: stream.len(),
                 });
@@ -198,6 +212,8 @@ pub fn sweep_json(rgba: &[u8], has_alpha: bool, max_bytes: usize) -> String {
         push_field(&mut out, "reason", &candidate.reason);
         out.push(',');
         push_field(&mut out, "preview", &candidate.preview);
+        out.push(',');
+        push_number(&mut out, "readable", candidate.readable);
         out.push(',');
         push_number(&mut out, "bytesRead", candidate.bytes_read);
         out.push(',');

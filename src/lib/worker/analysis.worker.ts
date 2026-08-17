@@ -2,6 +2,7 @@ import init, {
 	file_survey,
 	png_chi_square,
 	png_idat,
+	png_lsb_extract,
 	png_lsb_sweep,
 	png_plane,
 	png_plane_wall,
@@ -117,13 +118,35 @@ async function plane(id: number, channel: number, bit: number): Promise<Analysis
 	};
 }
 
+/** The whole stream for one combination, not the preview the sweep quoted. */
+const EXTRACT_LIMIT = 1 << 20;
+
+async function extract(
+	id: number,
+	channels: string,
+	bit: number,
+	msbFirst: boolean
+): Promise<AnalysisResponse> {
+	await ready;
+	if (!cached) throw new Error('No decoded image is loaded.');
+
+	return {
+		id,
+		status: 'extract',
+		label: `${channels} · bit ${bit} · ${msbFirst ? 'msb' : 'lsb'} first`,
+		bytes: png_lsb_extract(cached.bytes, cached.inflated, channels, bit, msbFirst, EXTRACT_LIMIT)
+	};
+}
+
 self.addEventListener('message', (event: MessageEvent<AnalysisRequest>) => {
 	const request = event.data;
 
 	const work =
 		request.kind === 'plane'
 			? plane(request.id, request.channel, request.bit)
-			: analyse(request.id, request.name, new Uint8Array(request.bytes));
+			: request.kind === 'extract'
+				? extract(request.id, request.channels, request.bit, request.msbFirst)
+				: analyse(request.id, request.name, new Uint8Array(request.bytes));
 
 	work
 		.then((response) => self.postMessage(response))
@@ -136,5 +159,6 @@ self.addEventListener('message', (event: MessageEvent<AnalysisRequest>) => {
 				size: 0,
 				detail
 			} satisfies AnalysisResponse);
+			return;
 		});
 });

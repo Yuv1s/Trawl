@@ -50,6 +50,8 @@ export type SweepCandidate = {
 	msbFirst: boolean;
 	reason: string;
 	preview: string;
+	/** Length of the readable run, which exceeds the preview when it clipped. */
+	readable: number;
 	bytesRead: number;
 	flags: string[];
 };
@@ -113,7 +115,8 @@ export type PlaneWall = {
 
 export type AnalysisRequest =
 	| { kind: 'analyse'; id: number; name: string; bytes: ArrayBuffer }
-	| { kind: 'plane'; id: number; channel: number; bit: number };
+	| { kind: 'plane'; id: number; channel: number; bit: number }
+	| { kind: 'extract'; id: number; channels: string; bit: number; msbFirst: boolean };
 
 export type AnalysisResponse =
 	| {
@@ -131,6 +134,7 @@ export type AnalysisResponse =
 			pixelError: string | null;
 	  }
 	| { id: number; status: 'plane'; channel: number; bit: number; pixels: Uint8Array }
+	| { id: number; status: 'extract'; label: string; bytes: Uint8Array }
 	| { id: number; status: 'error'; name: string; size: number; detail: string };
 
 export const CHANNEL_NAMES = ['R', 'G', 'B', 'A'];

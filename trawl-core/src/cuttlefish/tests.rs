@@ -212,6 +212,38 @@ fn sweep_json_is_shaped_for_the_worker() {
     assert!(json.contains("\"combinations\":30"));
 }
 
+/// Regression: the preview was capped at 96 characters with nothing saying so,
+/// which presented a clipped message as if it were the whole thing.
+#[test]
+fn a_long_message_reports_its_true_length_even_when_the_preview_clips() {
+    let message: String = std::iter::repeat_n("the quick brown fox jumps. ", 40).collect();
+    let mut cover = clean_cover(200_000, 0x2024);
+    embed(&mut cover, &[0, 1, 2], 0, true, message.as_bytes());
+
+    let found = sweep(&cover, false, 4096);
+    let hit = found
+        .iter()
+        .find(|c| c.params.channels == "rgb" && c.params.bit == 0 && c.params.msb_first)
+        .expect("planted message not found");
+
+    assert!(hit.readable >= message.len(), "readable {} vs {}", hit.readable, message.len());
+    assert!(hit.preview.chars().count() > 96, "preview still clipped short");
+    assert!(hit.reason.contains("characters"), "length missing from the reason");
+}
+
+#[test]
+fn a_short_message_is_previewed_whole() {
+    let mut cover = clean_cover(40_000, 0x2025);
+    embed(&mut cover, &[0, 1, 2], 0, true, b"short and complete\x00");
+
+    let hit = sweep(&cover, false, 4096)
+        .into_iter()
+        .find(|c| c.preview.starts_with("short and complete"))
+        .expect("message not found");
+
+    assert_eq!(hit.preview.chars().count(), hit.readable);
+}
+
 #[test]
 fn plane_full_is_one_byte_per_pixel_and_only_ever_black_or_white() {
     let cover = gradient_cover(8, 4, 0x11);
