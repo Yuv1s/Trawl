@@ -1,0 +1,28 @@
+[package]
+name = "trawl-core"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+# cdylib is what makes the linker emit a standalone .wasm module with exported
+# symbols; the default rlib is a Rust-internal archive format that wasm-pack
+# cannot package. rlib is kept alongside it so `cargo test` can still link the
+# crate for integration tests under tests/.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The JS<->WASM ABI bridge, and the only dependency in the crate. WASM function
+# signatures are limited to i32/i64/f32/f64, so passing a &[u8] or returning a
+# struct means writing bytes into linear memory and handing JS a (pointer, length)
+# pair. wasm-bindgen generates that marshalling from the #[wasm_bindgen] attribute.
+# It carries no analysis code — every detector in this crate stays hand-written.
+wasm-bindgen = "0.2.127"
+
+[profile.release]
+opt-level = 3      # this crate is compute-bound; optimise for speed, not size
+lto = "fat"        # cross-crate inlining, which matters for the tight pixel loops
+codegen-units = 1  # slower builds, faster output
+
+# Note: deliberately no `panic = "abort"` here. It would shave a few KB off the
+# .wasm, but it breaks `cargo test --release` — and the steganalysis fixtures are
+# far too slow to test in a debug build.

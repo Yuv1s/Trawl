@@ -7,6 +7,14 @@ node_modules
 .wrangler
 /.svelte-kit
 /build
+CLAUDE.md
+
+# wasm-pack output — generated from trawl-core by `npm run build:wasm`
+/src/lib/wasm
+
+# Cargo build artifacts (also ignored by trawl-core/.gitignore; repeated here
+# so root-level tooling that only reads this file — eslint, prettier — skips them)
+/trawl-core/target
 
 # OS
 .DS_Store
@@ -17,6 +25,7 @@ Thumbs.db
 .env.*
 !.env.example
 !.env.test
+.claude/
 
 # Vite
 vite.config.js.timestamp-*

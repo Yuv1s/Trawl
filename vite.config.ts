@@ -1,23 +1,13 @@
 import { defineConfig } from 'vitest/config';
 import { playwright } from '@vitest/browser-playwright';
-import adapter from '@sveltejs/adapter-auto';
 import { sveltekit } from '@sveltejs/kit/vite';
 
 export default defineConfig({
-	plugins: [
-		sveltekit({
-			compilerOptions: {
-				// Force runes mode for the project, except for libraries. Can be removed in svelte 6.
-				runes: ({ filename }) =>
-					filename.split(/[/\\]/).includes('node_modules') ? undefined : true
-			},
-
-			// adapter-auto only supports some environments, see https://svelte.dev/docs/kit/adapter-auto for a list.
-			// If your environment is not supported, or you settled on a specific environment, switch out the adapter.
-			// See https://svelte.dev/docs/kit/adapters for more information about adapters.
-			adapter: adapter()
-		})
-	],
+	// `sveltekit()` takes no arguments on purpose. Passing it any config object makes
+	// SvelteKit ignore svelte.config.js entirely, which silently shadowed the static
+	// adapter. Svelte/Kit config lives in svelte.config.js — the one place svelte-check,
+	// eslint-plugin-svelte and the editor extension all read it from.
+	plugins: [sveltekit()],
 	test: {
 		expect: { requireAssertions: true },
 		projects: [
