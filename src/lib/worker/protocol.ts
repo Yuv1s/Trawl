@@ -23,6 +23,22 @@ export type Found = {
 	text: string;
 };
 
+export type MagicHit = {
+	offset: number;
+	label: string;
+	embedded: boolean;
+};
+
+/** What can be read from any file, whatever its format. */
+export type Survey = {
+	size: number;
+	format: string | null;
+	flags: FlagHit[];
+	magic: MagicHit[];
+	strings: { total: number; sample: Found[] };
+	entropy: { window: number; values: number[] };
+};
+
 export type FlagHit = Found & {
 	region: string;
 	credible: boolean;
@@ -105,7 +121,9 @@ export type AnalysisResponse =
 			status: 'ok';
 			name: string;
 			size: number;
-			structure: Structure;
+			survey: Survey;
+			/** Null when the file is not a PNG, so the format-level tools stand down. */
+			structure: Structure | null;
 			sweep: Sweep | null;
 			wall: PlaneWall | null;
 			chi: ChiSquare | null;
@@ -113,7 +131,7 @@ export type AnalysisResponse =
 			pixelError: string | null;
 	  }
 	| { id: number; status: 'plane'; channel: number; bit: number; pixels: Uint8Array }
-	| { id: number; status: 'unsupported' | 'error'; name: string; size: number; detail: string };
+	| { id: number; status: 'error'; name: string; size: number; detail: string };
 
 export const CHANNEL_NAMES = ['R', 'G', 'B', 'A'];
 

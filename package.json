@@ -6,6 +6,7 @@
 	"scripts": {
 		"dev": "vite dev",
 		"build:wasm": "cd trawl-core && wasm-pack build --target web --out-dir ../src/lib/wasm",
+		"fixtures": "node fixtures/generate.mjs",
 		"build": "npm run build:wasm && vite build",
 		"preview": "vite preview",
 		"prepare": "svelte-kit sync || echo ''",

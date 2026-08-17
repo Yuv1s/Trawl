@@ -10,7 +10,9 @@
 	import PlaneWall from '$lib/components/PlaneWall.svelte';
 	import ChiTrace from '$lib/components/ChiTrace.svelte';
 	import RsView from '$lib/components/RsView.svelte';
-	import { PLANNED, tools } from '$lib/analysis/tools';
+	import EntropyTrace from '$lib/components/EntropyTrace.svelte';
+	import MagicList from '$lib/components/MagicList.svelte';
+	import { flagsOf, PLANNED, tools } from '$lib/analysis/tools';
 	import { COLOR_TYPES, isHeaderError, type AnalysisResponse } from '$lib/worker/protocol';
 
 	/** Plane responses update the open viewer; they never become the page state. */
@@ -48,18 +50,25 @@
 				pending.then((bytes) => {
 					view = { phase: 'done', result: analysis, bytes };
 					openPlane = null;
-					if (analysis.status === 'ok') {
-						selectedChunk = analysis.structure.chunks[0]?.offset ?? -1;
-						activeTool = analysis.structure.flags.some((f) => f.credible)
-							? 'flags'
-							: analysis.sweep?.candidates.length
-								? 'lsb'
-								: analysis.chi?.detected
-									? 'chi'
-									: analysis.rs?.detected
-										? 'rs'
-										: 'chunks';
-					}
+					if (analysis.status !== 'ok') return;
+
+					selectedChunk = analysis.structure?.chunks[0]?.offset ?? -1;
+					const flags = flagsOf(analysis.survey, analysis.structure);
+
+					// Open whichever tool found something, most conclusive first.
+					activeTool = flags.some((f) => f.credible)
+						? 'flags'
+						: analysis.sweep?.candidates.length
+							? 'lsb'
+							: analysis.chi?.detected
+								? 'chi'
+								: analysis.rs?.detected
+									? 'rs'
+									: analysis.survey.magic.some((m) => m.embedded)
+										? 'magic'
+										: analysis.structure
+											? 'chunks'
+											: 'strings';
 				});
 			});
 		}
@@ -104,6 +113,9 @@
 		if (file) accept(file);
 	}
 
+	const survey = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.survey : null
+	);
 	const structure = $derived(
 		view.phase === 'done' && view.result.status === 'ok' ? view.result.structure : null
 	);
@@ -127,11 +139,12 @@
 		return { width: structure.header.width, height: structure.header.height };
 	});
 
-	const built = $derived(structure ? tools(structure, sweep, wall, chi, rs) : []);
+	const built = $derived(survey ? tools(survey, structure, sweep, wall, chi, rs) : []);
 	const current = $derived(built.find((t) => t.id === activeTool) ?? null);
 
-	const credibleFlags = $derived(structure?.flags.filter((f) => f.credible) ?? []);
-	const suppressedFlags = $derived(structure?.flags.filter((f) => !f.credible) ?? []);
+	const allFlags = $derived(survey ? flagsOf(survey, structure) : []);
+	const credibleFlags = $derived(allFlags.filter((f) => f.credible));
+	const suppressedFlags = $derived(allFlags.filter((f) => !f.credible));
 	const sweepFlags = $derived(sweep?.candidates.flatMap((c) => c.flags) ?? []);
 
 	const chunk = $derived(structure?.chunks.find((c) => c.offset === selectedChunk) ?? null);
@@ -158,16 +171,7 @@
 	/** Names the chunk a candidate sits inside, so a hit points somewhere. */
 	const flagSources = $derived.by(() => {
 		const sources: Record<number, string> = {};
-		if (!structure) return sources;
-
-		for (const found of structure.flags) {
-			const host = structure.chunks.find(
-				(c) => found.offset >= c.dataOffset && found.offset < c.dataOffset + c.length
-			);
-			if (host) sources[found.offset] = `inside ${host.kind}`;
-			else if (structure.trailing && found.offset >= structure.trailing.offset)
-				sources[found.offset] = 'after IEND';
-		}
+		for (const found of allFlags) sources[found.offset] = found.region;
 		return sources;
 	});
 
@@ -208,12 +212,16 @@
 				<span class="name">{view.phase === 'working' ? view.name : view.result.name}</span>
 				{#if view.phase === 'done'}
 					<span class="meta mono">{view.result.size.toLocaleString()} B</span>
-					{#if summary}<span class="meta mono">{summary}</span>{/if}
+					{#if summary}
+						<span class="meta mono">{summary}</span>
+					{:else if survey?.format}
+						<span class="meta mono">{survey.format}</span>
+					{/if}
 				{/if}
 			</div>
 
 			<div class="right">
-				{#if structure}
+				{#if survey}
 					<span class="tally mono" class:live={hits > 0}>
 						{hits} of {built.length} tools hit
 					</span>
@@ -238,7 +246,7 @@
 			</div>
 		{:else if view.result.status !== 'ok'}
 			<div class="notice">
-				<h2>{view.result.status === 'unsupported' ? 'Not analysed' : 'Analysis failed'}</h2>
+				<h2>Analysis failed</h2>
 				<p>{view.result.detail}</p>
 				<label class="pick">
 					<input type="file" onchange={pick} />
@@ -246,7 +254,7 @@
 				</label>
 				<p class="hint">Dropping or pasting one works too.</p>
 			</div>
-		{:else if structure}
+		{:else if survey}
 			{#if credibleFlags.length > 0 || sweepFlags.length > 0}
 				<Recovered candidates={credibleFlags} sources={flagSources} fromPixels={sweepFlags} />
 			{/if}
@@ -269,7 +277,22 @@
 						</div>
 					{/if}
 
-					{#if activeTool === 'chi'}
+					{#if current?.status === 'pending' && current.scope === 'png' && !structure}
+						<p class="clear">
+							This tool reads the PNG container, and this file is
+							{survey.format ? `a ${survey.format}` : 'not a PNG'}. The tools above it read raw
+							bytes and ran normally.
+						</p>
+					{:else if activeTool === 'magic'}
+						<MagicList hits={survey.magic} size={survey.size} />
+					{:else if activeTool === 'entropy'}
+						<EntropyTrace
+							values={survey.entropy.values}
+							window={survey.entropy.window}
+							size={survey.size}
+							marker={structure?.trailing?.offset ?? null}
+						/>
+					{:else if activeTool === 'chi'}
 						<ChiTrace {chi} error={pixelError} />
 					{:else if activeTool === 'rs'}
 						<RsView {rs} {chi} error={pixelError} />
@@ -331,7 +354,7 @@
 								</ul>
 							</details>
 						{/if}
-					{:else if activeTool === 'trailing'}
+					{:else if activeTool === 'trailing' && structure}
 						{#if structure.trailing}
 							<p class="lead">
 								{structure.trailing.length.toLocaleString()} bytes sit past IEND, starting at
@@ -342,7 +365,7 @@
 						{:else}
 							<p class="clear">The file ends at IEND. Nothing is appended.</p>
 						{/if}
-					{:else if activeTool === 'text'}
+					{:else if activeTool === 'text' && structure}
 						{#if structure.text.length === 0}
 							<p class="clear">No tEXt, zTXt or iTXt chunks.</p>
 						{:else}
@@ -360,7 +383,7 @@
 							</ul>
 						{/if}
 					{:else if activeTool === 'strings'}
-						<StringsView total={structure.strings.total} sample={structure.strings.sample} />
+						<StringsView total={survey.strings.total} sample={survey.strings.sample} />
 					{:else if activeTool === 'pixels'}
 						<p class="lead">
 							Pixels decode through a hand-written PNG decoder rather than the browser, because a
@@ -372,7 +395,7 @@
 								? `The LSB sweep and the bit-plane wall both read those pixels. Chi-square and RS analysis are next.`
 								: `Decoding failed on this file, so no pixel tool can run. ${pixelError ?? ''}`}
 						</p>
-					{:else}
+					{:else if structure}
 						<ChunkList
 							chunks={structure.chunks}
 							selected={selectedChunk}

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { PLANNED, tools } from './tools';
-import type { Chunk, Structure } from '$lib/worker/protocol';
+import { flagsOf, PLANNED, tools } from './tools';
+import type { Chunk, Structure, Survey } from '$lib/worker/protocol';
 
 const chunk = (kind: string, offset: number, length = 0, crcOk = true): Chunk => ({
 	kind,
@@ -11,7 +11,16 @@ const chunk = (kind: string, offset: number, length = 0, crcOk = true): Chunk =>
 	ancillary: kind[0] === kind[0].toLowerCase()
 });
 
-const clean: Structure = {
+const survey: Survey = {
+	size: 1024,
+	format: 'PNG image',
+	flags: [],
+	magic: [{ offset: 0, label: 'PNG image', embedded: false }],
+	strings: { total: 42, sample: [] },
+	entropy: { window: 256, values: [7.9, 7.8, 7.95] }
+};
+
+const structure: Structure = {
 	signature: true,
 	size: 1024,
 	header: { width: 64, height: 64, bitDepth: 8, colorType: 6, interlace: 0 },
@@ -22,126 +31,93 @@ const clean: Structure = {
 	trailing: null
 };
 
-const status = (s: Structure, id: string) => tools(s).find((t) => t.id === id)?.status;
+const status = (id: string, s = survey, st: Structure | null = structure) =>
+	tools(s, st).find((t) => t.id === id)?.status;
+
+const tool = (id: string, s = survey, st: Structure | null = structure) =>
+	tools(s, st).find((t) => t.id === id);
 
 describe('tools', () => {
-	it('reports every built tool as clear on a clean file', () => {
-		expect(tools(clean).some((t) => t.status === 'hit')).toBe(false);
+	it('reports every tool as clear on a clean PNG', () => {
+		expect(tools(survey, structure).some((t) => t.status === 'hit')).toBe(false);
 	});
 
 	it('marks the flag scan as a hit when a credible candidate exists', () => {
-		const s = {
-			...clean,
+		const s: Structure = {
+			...structure,
 			flags: [{ offset: 40, text: 'flag{abc}', region: 'inside tEXt', credible: true }]
 		};
-		expect(status(s, 'flags')).toBe('hit');
+		expect(status('flags', survey, s)).toBe('hit');
 	});
 
 	it('stays clear when the only candidate came out of a compressed stream', () => {
-		const s = {
-			...clean,
+		const s: Structure = {
+			...structure,
 			flags: [{ offset: 40, text: 'BM{GEBF}', region: 'inside IDAT', credible: false }]
 		};
-		expect(status(s, 'flags')).toBe('clear');
+		expect(status('flags', survey, s)).toBe('clear');
 	});
 
-	it('reports the sweep as pending when pixels could not be decoded', () => {
-		expect(status(clean, 'lsb')).toBe('pending');
-	});
-
-	it('reports the sweep as clear when it ran and found nothing', () => {
-		const sweep = { pixels: 100, combinations: 30, candidates: [] };
-		expect(tools(clean, sweep).find((t) => t.id === 'lsb')?.status).toBe('clear');
-	});
-
-	it('reports the sweep as a hit when a combination carried data', () => {
-		const sweep = {
-			pixels: 100,
-			combinations: 30,
-			candidates: [
-				{
-					channels: 'rgb',
-					bit: 0,
-					msbFirst: true,
-					reason: 'text at offset 0',
-					preview: 'flag{hello}',
-					bytesRead: 4096,
-					flags: ['flag{hello}']
-				}
+	it('flags an embedded file signature past offset zero', () => {
+		const s: Survey = {
+			...survey,
+			magic: [
+				{ offset: 0, label: 'PNG image', embedded: false },
+				{ offset: 9000, label: 'ZIP archive', embedded: true }
 			]
 		};
-		expect(tools(clean, sweep).find((t) => t.id === 'lsb')?.status).toBe('hit');
+		expect(status('magic', s)).toBe('hit');
+		expect(tool('magic', s)?.value).toBe('1 found');
 	});
 
-	it('marks post-IEND data as a hit', () => {
-		expect(status({ ...clean, trailing: { offset: 957, length: 8 } }, 'trailing')).toBe('hit');
+	it('does not treat the file’s own header as an embedded file', () => {
+		expect(status('magic')).toBe('clear');
 	});
 
-	it('marks a CRC mismatch as a hit', () => {
-		const s = { ...clean, chunks: [chunk('IHDR', 8, 13, false)] };
-		expect(status(s, 'crc')).toBe('hit');
+	it('reports the peak entropy it measured', () => {
+		expect(tool('entropy')?.value).toBe('peak 7.95 of 8');
+	});
+});
+
+describe('format scope', () => {
+	it('runs the byte-level tools with no PNG structure', () => {
+		const byteLevel = tools(survey, null).filter((t) => t.scope === 'bytes');
+		expect(byteLevel.length).toBeGreaterThan(0);
+		expect(byteLevel.every((t) => t.status !== 'pending')).toBe(true);
 	});
 
-	it('blocks pixel decode when the header cannot be read', () => {
-		const s: Structure = { ...clean, header: { error: 'bit depth 16 unsupported' } };
-		expect(status(s, 'pixels')).toBe('pending');
+	it('stands the PNG tools down rather than hiding them', () => {
+		const pngLevel = tools(survey, null).filter((t) => t.scope === 'png');
+		expect(pngLevel.length).toBeGreaterThan(0);
+		expect(pngLevel.every((t) => t.status === 'pending')).toBe(true);
+		expect(pngLevel.every((t) => t.value === 'PNG only, for now')).toBe(true);
 	});
 
-	it('no longer lists the sweep, the wall or chi-square as unbuilt', () => {
-		for (const id of ['lsb', 'planes', 'chi']) {
+	it('keeps strings and flags available on a file it cannot walk', () => {
+		expect(status('strings', survey, null)).toBe('ready');
+		expect(status('flags', survey, null)).toBe('clear');
+		expect(status('entropy', survey, null)).toBe('ready');
+	});
+
+	it('prefers the PNG chunk verdict over entropy when both exist', () => {
+		const s: Survey = {
+			...survey,
+			flags: [{ offset: 40, text: 'x{yz}', region: 'readable region', credible: true }]
+		};
+		const st: Structure = {
+			...structure,
+			flags: [{ offset: 40, text: 'x{yz}', region: 'inside IDAT', credible: false }]
+		};
+		expect(flagsOf(s, st)[0].credible).toBe(false);
+		expect(flagsOf(s, null)[0].credible).toBe(true);
+	});
+});
+
+describe('planned tools', () => {
+	it('no longer lists anything that has shipped', () => {
+		for (const id of ['lsb', 'planes', 'chi', 'rs', 'entropy', 'magic']) {
 			expect(PLANNED.some((t) => t.id === id)).toBe(false);
 		}
-	});
-
-	it('reports chi-square as pending until pixels decode', () => {
-		expect(status(clean, 'chi')).toBe('pending');
-	});
-
-	it('reports the embedded fraction when chi-square detects a payload', () => {
-		const chi = {
-			detected: true,
-			embeddedFraction: 0.34,
-			peakProbability: 0.999,
-			samples: 120000,
-			points: []
-		};
-		const tool = tools(clean, null, null, chi).find((t) => t.id === 'chi');
-		expect(tool?.status).toBe('hit');
-		expect(tool?.value).toBe('34% embedded');
-	});
-
-	it('shows the peak probability when chi-square finds nothing', () => {
-		const chi = {
-			detected: false,
-			embeddedFraction: 0,
-			peakProbability: 0.02,
-			samples: 120000,
-			points: []
-		};
-		const tool = tools(clean, null, null, chi).find((t) => t.id === 'chi');
-		expect(tool?.status).toBe('clear');
-		expect(tool?.value).toBe('peak p 0.02');
-	});
-
-	it('reports the plane wall as pending until pixels decode', () => {
-		expect(status(clean, 'planes')).toBe('pending');
-	});
-
-	it('reports the plane wall as ready once planes exist', () => {
-		const wall = {
-			thumbWidth: 220,
-			thumbHeight: 130,
-			channels: 4,
-			planes: Array.from({ length: 32 }, (_, i) => ({
-				channel: Math.floor(i / 8),
-				bit: i % 8,
-				transitionRate: 0.5
-			})),
-			thumbnails: new Uint8Array(32 * 220 * 130)
-		};
-		const tool = tools(clean, null, wall).find((t) => t.id === 'planes');
-		expect(tool?.status).toBe('ready');
-		expect(tool?.value).toBe('32 planes');
 	});
 
 	it('never claims a planned tool has run', () => {
@@ -150,7 +126,7 @@ describe('tools', () => {
 	});
 
 	it('keeps built and planned ids disjoint', () => {
-		const builtIds = new Set(tools(clean).map((t) => t.id));
+		const builtIds = new Set(tools(survey, structure).map((t) => t.id));
 		expect(PLANNED.some((t) => builtIds.has(t.id))).toBe(false);
 	});
 });

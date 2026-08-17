@@ -1,4 +1,5 @@
 import init, {
+	file_survey,
 	png_chi_square,
 	png_idat,
 	png_lsb_sweep,
@@ -14,6 +15,7 @@ import type {
 	PlaneWall,
 	RsAnalysis,
 	Structure,
+	Survey,
 	Sweep
 } from './protocol';
 
@@ -44,15 +46,25 @@ function readWall(packed: Uint8Array): PlaneWall {
 async function analyse(id: number, name: string, bytes: Uint8Array): Promise<AnalysisResponse> {
 	await ready;
 
-	const structure = JSON.parse(png_structure(bytes)) as Structure;
-	if (!structure.signature) {
+	// Byte-level analysis needs no format, so it runs on everything.
+	const survey = JSON.parse(file_survey(bytes)) as Survey;
+	const walked = JSON.parse(png_structure(bytes)) as Structure;
+	const structure = walked.signature ? walked : null;
+
+	if (!structure) {
 		cached = null;
 		return {
 			id,
-			status: 'unsupported',
+			status: 'ok',
 			name,
 			size: bytes.length,
-			detail: 'No PNG signature. Only PNG is supported so far.'
+			survey,
+			structure: null,
+			sweep: null,
+			wall: null,
+			chi: null,
+			rs: null,
+			pixelError: null
 		};
 	}
 
@@ -82,6 +94,7 @@ async function analyse(id: number, name: string, bytes: Uint8Array): Promise<Ana
 		status: 'ok',
 		name,
 		size: bytes.length,
+		survey,
 		structure,
 		sweep,
 		wall,

@@ -9,6 +9,14 @@ pub mod bytes;
 pub mod cuttlefish;
 pub mod json;
 pub mod png;
+pub mod survey;
+
+/// Everything that can be said about a file without knowing its format: flag
+/// shapes, strings, embedded signatures and entropy.
+#[wasm_bindgen]
+pub fn file_survey(file: &[u8]) -> String {
+    survey::json(file)
+}
 
 /// Sweeps LSB parameters and reports combinations that produced something.
 ///
