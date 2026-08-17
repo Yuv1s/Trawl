@@ -87,8 +87,61 @@ describe('tools', () => {
 		expect(status(s, 'pixels')).toBe('pending');
 	});
 
-	it('no longer lists the LSB sweep as unbuilt', () => {
-		expect(PLANNED.some((t) => t.id === 'lsb')).toBe(false);
+	it('no longer lists the sweep, the wall or chi-square as unbuilt', () => {
+		for (const id of ['lsb', 'planes', 'chi']) {
+			expect(PLANNED.some((t) => t.id === id)).toBe(false);
+		}
+	});
+
+	it('reports chi-square as pending until pixels decode', () => {
+		expect(status(clean, 'chi')).toBe('pending');
+	});
+
+	it('reports the embedded fraction when chi-square detects a payload', () => {
+		const chi = {
+			detected: true,
+			embeddedFraction: 0.34,
+			peakProbability: 0.999,
+			samples: 120000,
+			points: []
+		};
+		const tool = tools(clean, null, null, chi).find((t) => t.id === 'chi');
+		expect(tool?.status).toBe('hit');
+		expect(tool?.value).toBe('34% embedded');
+	});
+
+	it('shows the peak probability when chi-square finds nothing', () => {
+		const chi = {
+			detected: false,
+			embeddedFraction: 0,
+			peakProbability: 0.02,
+			samples: 120000,
+			points: []
+		};
+		const tool = tools(clean, null, null, chi).find((t) => t.id === 'chi');
+		expect(tool?.status).toBe('clear');
+		expect(tool?.value).toBe('peak p 0.02');
+	});
+
+	it('reports the plane wall as pending until pixels decode', () => {
+		expect(status(clean, 'planes')).toBe('pending');
+	});
+
+	it('reports the plane wall as ready once planes exist', () => {
+		const wall = {
+			thumbWidth: 220,
+			thumbHeight: 130,
+			channels: 4,
+			planes: Array.from({ length: 32 }, (_, i) => ({
+				channel: Math.floor(i / 8),
+				bit: i % 8,
+				transitionRate: 0.5
+			})),
+			thumbnails: new Uint8Array(32 * 220 * 130)
+		};
+		const tool = tools(clean, null, wall).find((t) => t.id === 'planes');
+		expect(tool?.status).toBe('ready');
+		expect(tool?.value).toBe('32 planes');
 	});
 
 	it('never claims a planned tool has run', () => {

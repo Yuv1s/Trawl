@@ -213,6 +213,184 @@ fn sweep_json_is_shaped_for_the_worker() {
 }
 
 #[test]
+fn plane_full_is_one_byte_per_pixel_and_only_ever_black_or_white() {
+    let cover = gradient_cover(8, 4, 0x11);
+    let plane = plane_full(&cover, 1, 3);
+
+    assert_eq!(plane.len(), 32);
+    assert!(plane.iter().all(|&v| v == 0 || v == 255));
+}
+
+#[test]
+fn plane_wall_sizes_the_thumbnails_to_the_target_width() {
+    let cover = gradient_cover(400, 200, 0x22);
+    let (json, tw, th, thumbnails) = plane_wall(&cover, 400, 200, 3, 100);
+
+    assert_eq!((tw, th), (100, 50));
+    assert_eq!(thumbnails.len(), 3 * 8 * 100 * 50);
+    assert!(json.contains("\"thumbWidth\":100"));
+    assert!(json.contains("\"channels\":3"));
+}
+
+#[test]
+fn plane_wall_never_upscales_past_the_source_width() {
+    let cover = gradient_cover(16, 16, 0x33);
+    let (_, tw, _, _) = plane_wall(&cover, 16, 16, 3, 512);
+    assert_eq!(tw, 16);
+}
+
+fn rate(json: &str, channel: usize, bit: usize) -> f32 {
+    let key = format!("\"channel\":{channel},\"bit\":{bit},\"transitionRate\":");
+    let start = json.find(&key).expect("plane missing from report") + key.len();
+    let rest = &json[start..];
+    let end = rest.find(['}', ',']).unwrap();
+    rest[..end].parse().unwrap()
+}
+
+#[test]
+fn the_wall_reports_a_rate_for_every_plane_of_every_channel() {
+    let cover = gradient_cover(120, 90, 0x44);
+    let (json, _, _, _) = plane_wall(&cover, 120, 90, 3, 60);
+
+    assert_eq!(json.matches("\"transitionRate\"").count(), 24);
+    assert!((0.0..=1.0).contains(&rate(&json, 0, 0)));
+}
+
+/// Regression: counting only horizontal neighbours reported every plane of a
+/// vertical gradient as perfectly flat, which is a measurement bug, not a finding.
+#[test]
+fn a_vertical_gradient_does_not_read_as_flat() {
+    let cover = gradient_cover(200, 150, 0x99);
+    let (json, _, _, _) = plane_wall(&cover, 200, 150, 3, 64);
+
+    // Channel 1 varies only down the image.
+    assert!(
+        rate(&json, 1, 7) > 0.0,
+        "vertical structure was invisible: {json}"
+    );
+}
+
+#[test]
+fn the_lowest_plane_of_a_clean_image_reads_close_to_noise() {
+    let cover = clean_cover(200 * 150, 0x55);
+    let (json, _, _, _) = plane_wall(&cover, 200, 150, 4, 64);
+
+    for channel in 0..3 {
+        let r = rate(&json, channel, 0);
+        assert!((0.45..=0.55).contains(&r), "channel {channel} bit 0 was {r}");
+    }
+}
+
+/// The wall's real job: a plane carrying a payload stops looking like the picture
+/// and starts looking like noise, and the rate is what makes that comparable.
+#[test]
+fn embedding_pushes_a_structured_plane_towards_noise() {
+    let clean = gradient_cover(200, 150, 0x66);
+    let (before, _, _, _) = plane_wall(&clean, 200, 150, 3, 64);
+
+    let mut stego = clean.clone();
+    let payload: Vec<u8> = (0..30_000).map(|i| (i * 37 % 251) as u8).collect();
+    embed(&mut stego, &[0, 1, 2], 4, true, &payload);
+    let (after, _, _, _) = plane_wall(&stego, 200, 150, 3, 64);
+
+    assert!(rate(&before, 0, 4) < 0.2, "plane 4 should start structured");
+    assert!(
+        rate(&after, 0, 4) > rate(&before, 0, 4) + 0.2,
+        "embedding did not move the rate: {} to {}",
+        rate(&before, 0, 4),
+        rate(&after, 0, 4)
+    );
+}
+
+#[test]
+fn the_wall_makes_no_claim_about_which_plane_is_suspicious() {
+    let cover = gradient_cover(120, 90, 0x77);
+    let (json, _, _, _) = plane_wall(&cover, 120, 90, 3, 60);
+    assert!(
+        !json.contains("anomalous"),
+        "the wall reports measurements; chi-square and RS do the judging"
+    );
+}
+
+/// A cover with a genuinely lumpy histogram. Chi-square asks whether value pairs
+/// are equal, so a flat histogram is already indistinguishable from embedding and
+/// would make the test meaningless.
+fn photo_like_cover(width: usize, height: usize) -> Vec<u8> {
+    let mut out = vec![0u8; width * height * 4];
+
+    for y in 0..height {
+        for x in 0..width {
+            let o = (y * width + x) * 4;
+            let fx = x as f32 / width as f32;
+            let fy = y as f32 / height as f32;
+            let r = ((fx - 0.5).powi(2) + (fy - 0.5).powi(2)).sqrt();
+
+            out[o] = (190.0 - 110.0 * r) as u8;
+            out[o + 1] = (140.0 + 60.0 * (fx * 3.0).sin()) as u8;
+            out[o + 2] = (95.0 + 55.0 * (fy * 2.0).cos()) as u8;
+            out[o + 3] = 255;
+        }
+    }
+
+    out
+}
+
+fn histogram_is_lumpy(rgba: &[u8]) -> bool {
+    let samples = traversal_samples(rgba);
+    let mut histogram = [0u64; 256];
+    for &s in &samples {
+        histogram[s as usize] += 1;
+    }
+    // At least one pair whose members differ by more than a fifth of their total.
+    (0..128).any(|k| {
+        let (a, b) = (histogram[k * 2] as f64, histogram[k * 2 + 1] as f64);
+        a + b > 100.0 && (a - b).abs() / (a + b) > 0.2
+    })
+}
+
+#[test]
+fn chi_square_stays_quiet_on_a_cover_with_a_lumpy_histogram() {
+    let cover = photo_like_cover(300, 220);
+    assert!(histogram_is_lumpy(&cover), "the control must be testable");
+
+    let json = chi_square_json(&cover, 32);
+    assert!(
+        json.contains("\"detected\":false"),
+        "clean cover read as embedded: {json}"
+    );
+}
+
+#[test]
+fn chi_square_detects_a_payload_written_into_the_low_bits() {
+    let mut cover = photo_like_cover(300, 220);
+    let payload: Vec<u8> = (0..20_000).map(|i| (i * 61 % 251) as u8).collect();
+    embed(&mut cover, &[0, 1, 2], 0, true, &payload);
+
+    let json = chi_square_json(&cover, 32);
+    assert!(
+        json.contains("\"detected\":true"),
+        "payload went unnoticed: {json}"
+    );
+}
+
+#[test]
+fn chi_square_json_carries_the_whole_curve() {
+    let cover = photo_like_cover(120, 90);
+    let json = chi_square_json(&cover, 16);
+
+    assert!(json.starts_with('{') && json.ends_with('}'));
+    assert_eq!(json.matches("\"fraction\"").count(), 16);
+    assert!(json.contains("\"peakProbability\""));
+    assert!(json.contains("\"samples\":32400"));
+}
+
+#[test]
+fn traversal_samples_drops_alpha_and_keeps_pixel_order() {
+    let rgba = [1, 2, 3, 255, 4, 5, 6, 128];
+    assert_eq!(traversal_samples(&rgba), vec![1, 2, 3, 4, 5, 6]);
+}
+
+#[test]
 fn extract_named_rejects_a_channel_set_that_does_not_exist() {
     let cover = clean_cover(64, 1);
     assert!(extract_named(&cover, "xyz", 0, true, 16).is_none());

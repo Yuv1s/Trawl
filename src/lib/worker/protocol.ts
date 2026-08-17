@@ -55,11 +55,49 @@ export type Structure = {
 	trailing: { offset: number; length: number } | null;
 };
 
-export type AnalysisRequest = {
-	id: number;
-	name: string;
-	bytes: ArrayBuffer;
+export type ChiPoint = {
+	fraction: number;
+	p: number;
+	chiSquare: number;
+	degrees: number;
 };
+
+export type ChiSquare = {
+	detected: boolean;
+	embeddedFraction: number;
+	peakProbability: number;
+	samples: number;
+	points: ChiPoint[];
+};
+
+export type RsAnalysis = {
+	rate: number;
+	reliable: boolean;
+	detected: boolean;
+	groups: number;
+	regular: number;
+	singular: number;
+	regularNegated: number;
+	singularNegated: number;
+};
+
+export type PlaneStat = {
+	channel: number;
+	bit: number;
+	transitionRate: number;
+};
+
+export type PlaneWall = {
+	thumbWidth: number;
+	thumbHeight: number;
+	channels: number;
+	planes: PlaneStat[];
+	thumbnails: Uint8Array;
+};
+
+export type AnalysisRequest =
+	| { kind: 'analyse'; id: number; name: string; bytes: ArrayBuffer }
+	| { kind: 'plane'; id: number; channel: number; bit: number };
 
 export type AnalysisResponse =
 	| {
@@ -69,9 +107,15 @@ export type AnalysisResponse =
 			size: number;
 			structure: Structure;
 			sweep: Sweep | null;
-			sweepError: string | null;
+			wall: PlaneWall | null;
+			chi: ChiSquare | null;
+			rs: RsAnalysis | null;
+			pixelError: string | null;
 	  }
+	| { id: number; status: 'plane'; channel: number; bit: number; pixels: Uint8Array }
 	| { id: number; status: 'unsupported' | 'error'; name: string; size: number; detail: string };
+
+export const CHANNEL_NAMES = ['R', 'G', 'B', 'A'];
 
 export function isHeaderError(header: Header): header is { error: string } {
 	return 'error' in header;

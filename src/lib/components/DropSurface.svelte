@@ -8,13 +8,17 @@
 	let depth = 0;
 
 	const READY = [
-		['Flag scan', 'tag{payload} anywhere in the raw bytes'],
-		['Post-IEND data', 'bytes past the terminator no decoder reads'],
-		['Text chunks', 'tEXt, zTXt and iTXt metadata'],
-		['Chunk CRC', 'stored checksum against chunk contents'],
-		['Chunk walk', 'every chunk typed, sized and located'],
-		['ASCII strings', 'printable runs of six characters or more'],
-		['Pixel decode', 'exact RGBA, no premultiply, no colour management']
+		['Flag scan', 'Looks for flag{...} text in the file'],
+		['LSB sweep', 'Tries every way of reading hidden bits'],
+		['Chi-square attack', 'Statistical test for a hidden payload'],
+		['RS analysis', 'Second opinion on how much is hidden'],
+		['Bit-plane wall', 'Shows each layer of bits as a picture'],
+		['Post-IEND data', 'Extra bytes stuck on the end of the file'],
+		['Text chunks', 'Comments and labels saved inside the image'],
+		['Chunk CRC', 'Checks each part against its own checksum'],
+		['Chunk walk', 'Lists every part of the file'],
+		['ASCII strings', 'Readable text anywhere in the file'],
+		['Pixel decode', 'Reads exact pixel values, nothing altered']
 	];
 
 	function enter(event: DragEvent) {

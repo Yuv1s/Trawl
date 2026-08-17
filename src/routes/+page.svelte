@@ -7,17 +7,24 @@
 	import HexView from '$lib/components/HexView.svelte';
 	import StringsView from '$lib/components/StringsView.svelte';
 	import SweepView from '$lib/components/SweepView.svelte';
+	import PlaneWall from '$lib/components/PlaneWall.svelte';
+	import ChiTrace from '$lib/components/ChiTrace.svelte';
+	import RsView from '$lib/components/RsView.svelte';
 	import { PLANNED, tools } from '$lib/analysis/tools';
 	import { COLOR_TYPES, isHeaderError, type AnalysisResponse } from '$lib/worker/protocol';
+
+	/** Plane responses update the open viewer; they never become the page state. */
+	type Analysis = Exclude<AnalysisResponse, { status: 'plane' }>;
 
 	type View =
 		| { phase: 'idle' }
 		| { phase: 'working'; name: string }
-		| { phase: 'done'; result: AnalysisResponse; bytes: Uint8Array };
+		| { phase: 'done'; result: Analysis; bytes: Uint8Array };
 
 	let view = $state<View>({ phase: 'idle' });
 	let activeTool = $state('flags');
 	let selectedChunk = $state(-1);
+	let openPlane = $state<{ channel: number; bit: number; pixels: Uint8Array | null } | null>(null);
 
 	let worker: Worker | null = null;
 	let ticket = 0;
@@ -27,17 +34,31 @@
 		if (!worker) {
 			worker = new AnalysisWorker();
 			worker.addEventListener('message', (event: MessageEvent<AnalysisResponse>) => {
-				if (event.data.id !== ticket) return;
+				const result = event.data;
+				if (result.id !== ticket) return;
+
+				if (result.status === 'plane') {
+					if (openPlane?.channel === result.channel && openPlane?.bit === result.bit) {
+						openPlane = { ...openPlane, pixels: result.pixels };
+					}
+					return;
+				}
+
+				const analysis: Analysis = result;
 				pending.then((bytes) => {
-					const result = event.data;
-					view = { phase: 'done', result, bytes };
-					if (result.status === 'ok') {
-						selectedChunk = result.structure.chunks[0]?.offset ?? -1;
-						activeTool = result.structure.flags.some((f) => f.credible)
+					view = { phase: 'done', result: analysis, bytes };
+					openPlane = null;
+					if (analysis.status === 'ok') {
+						selectedChunk = analysis.structure.chunks[0]?.offset ?? -1;
+						activeTool = analysis.structure.flags.some((f) => f.credible)
 							? 'flags'
-							: result.sweep?.candidates.length
+							: analysis.sweep?.candidates.length
 								? 'lsb'
-								: 'chunks';
+								: analysis.chi?.detected
+									? 'chi'
+									: analysis.rs?.detected
+										? 'rs'
+										: 'chunks';
 					}
 				});
 			});
@@ -51,7 +72,12 @@
 
 		const buffer = await file.arrayBuffer();
 		pending = Promise.resolve(new Uint8Array(buffer));
-		ensureWorker().postMessage({ id, name: file.name, bytes: buffer });
+		ensureWorker().postMessage({ kind: 'analyse', id, name: file.name, bytes: buffer });
+	}
+
+	function requestPlane(channel: number, bit: number) {
+		openPlane = { channel, bit, pixels: null };
+		ensureWorker().postMessage({ kind: 'plane', id: ticket, channel, bit });
 	}
 
 	function reset() {
@@ -85,11 +111,23 @@
 	const sweep = $derived(
 		view.phase === 'done' && view.result.status === 'ok' ? view.result.sweep : null
 	);
-	const sweepError = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.sweepError : null
+	const wall = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.wall : null
+	);
+	const chi = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.chi : null
+	);
+	const rs = $derived(view.phase === 'done' && view.result.status === 'ok' ? view.result.rs : null);
+	const pixelError = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.pixelError : null
 	);
 
-	const built = $derived(structure ? tools(structure, sweep) : []);
+	const dimensions = $derived.by(() => {
+		if (!structure || isHeaderError(structure.header)) return { width: 0, height: 0 };
+		return { width: structure.header.width, height: structure.header.height };
+	});
+
+	const built = $derived(structure ? tools(structure, sweep, wall, chi, rs) : []);
 	const current = $derived(built.find((t) => t.id === activeTool) ?? null);
 
 	const credibleFlags = $derived(structure?.flags.filter((f) => f.credible) ?? []);
@@ -231,8 +269,22 @@
 						</div>
 					{/if}
 
-					{#if activeTool === 'lsb'}
-						<SweepView {sweep} error={sweepError} />
+					{#if activeTool === 'chi'}
+						<ChiTrace {chi} error={pixelError} />
+					{:else if activeTool === 'rs'}
+						<RsView {rs} {chi} error={pixelError} />
+					{:else if activeTool === 'planes'}
+						<PlaneWall
+							{wall}
+							error={pixelError}
+							width={dimensions.width}
+							height={dimensions.height}
+							open={openPlane}
+							onopen={requestPlane}
+							onclose={() => (openPlane = null)}
+						/>
+					{:else if activeTool === 'lsb'}
+						<SweepView {sweep} error={pixelError} />
 					{:else if activeTool === 'flags'}
 						{#if credibleFlags.length === 0}
 							<p class="clear">
@@ -317,8 +369,8 @@
 						</p>
 						<p class="clear">
 							{sweep
-								? `The LSB sweep reads those pixels. Bit planes and steganalysis are the next detectors.`
-								: `Decoding failed on this file, so no pixel tool can run. ${sweepError ?? ''}`}
+								? `The LSB sweep and the bit-plane wall both read those pixels. Chi-square and RS analysis are next.`
+								: `Decoding failed on this file, so no pixel tool can run. ${pixelError ?? ''}`}
 						</p>
 					{:else}
 						<ChunkList

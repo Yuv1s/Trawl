@@ -2,6 +2,9 @@
 
 use crate::bytes;
 
+pub mod chi;
+pub mod rs;
+
 /// Channel orders worth sweeping. Index into an RGBA pixel.
 pub const CHANNEL_SETS: [(&str, &[usize]); 7] = [
     ("rgb", &[0, 1, 2]),
@@ -219,6 +222,202 @@ pub fn combination_count(has_alpha: bool) -> usize {
         .filter(|(_, ch)| has_alpha || !ch.contains(&3))
         .count();
     sets * 3 * 2
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlaneStat {
+    pub channel: usize,
+    pub bit: u8,
+    /// Fraction of adjacent pairs, horizontally and vertically, whose bit differs.
+    /// Near 0.5 is indistinguishable from noise; near 0 means the plane carries
+    /// image structure.
+    ///
+    /// Reported, never judged. A fine gradient flips bit 1 on almost every step,
+    /// so a high rate in an upper plane is ordinary rather than suspicious, and
+    /// any threshold that called it suspicious would be invented rather than
+    /// derived. Chi-square and RS are the detectors that get to make claims.
+    pub transition_rate: f32,
+}
+
+/// One bit plane of one channel as 0 or 255 per pixel, at full resolution.
+pub fn plane_full(rgba: &[u8], channel: usize, bit: u8) -> Vec<u8> {
+    rgba.chunks_exact(4)
+        .map(|p| if (p[channel] >> bit) & 1 == 1 { 255 } else { 0 })
+        .collect()
+}
+
+/// Every plane downsampled for the wall, plus the statistics that rank them.
+///
+/// One pass over the image fills every plane's accumulator at once, because
+/// thirty-two separate passes over a twelve-megapixel buffer is thirty-two times
+/// the memory traffic for the same arithmetic.
+///
+/// Returns the stats as JSON and the thumbnails as one grayscale block, ordered
+/// channel-major then bit ascending.
+pub fn plane_wall(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    channels: usize,
+    target_width: usize,
+) -> (String, usize, usize, Vec<u8>) {
+    let tw = target_width.clamp(1, width);
+    let th = (height * tw / width).max(1);
+    let cells = tw * th;
+    let planes = channels * 8;
+
+    let mut sums = vec![0u32; planes * cells];
+    let mut counts = vec![0u32; cells];
+    let mut transitions = vec![0u64; planes];
+    // Vertical neighbours matter as much as horizontal: a vertical gradient shows
+    // zero horizontal change, which would report every one of its planes as flat.
+    let mut previous_row = vec![0u8; width * channels];
+
+    for y in 0..height {
+        let ty = (y * th / height).min(th - 1);
+        let mut previous = [0u8; 4];
+
+        for x in 0..width {
+            let tx = (x * tw / width).min(tw - 1);
+            let cell = ty * tw + tx;
+            counts[cell] += 1;
+
+            let pixel = &rgba[(y * width + x) * 4..(y * width + x) * 4 + 4];
+
+            for c in 0..channels {
+                let value = pixel[c];
+                let above = previous_row[x * channels + c];
+
+                for bit in 0..8usize {
+                    let set = (value >> bit) & 1;
+                    sums[(c * 8 + bit) * cells + cell] += set as u32;
+                    if x > 0 && ((previous[c] >> bit) & 1) != set {
+                        transitions[c * 8 + bit] += 1;
+                    }
+                    if y > 0 && ((above >> bit) & 1) != set {
+                        transitions[c * 8 + bit] += 1;
+                    }
+                }
+
+                previous[c] = value;
+                previous_row[x * channels + c] = value;
+            }
+        }
+    }
+
+    let mut thumbnails = vec![0u8; planes * cells];
+    for plane in 0..planes {
+        for cell in 0..cells {
+            let count = counts[cell].max(1);
+            thumbnails[plane * cells + cell] = ((sums[plane * cells + cell] * 255) / count) as u8;
+        }
+    }
+
+    let pairs =
+        (width.saturating_sub(1) * height + width * height.saturating_sub(1)).max(1) as f32;
+    let stats: Vec<PlaneStat> = (0..planes)
+        .map(|p| PlaneStat {
+            channel: p / 8,
+            bit: (p % 8) as u8,
+            transition_rate: transitions[p] as f32 / pairs,
+        })
+        .collect();
+
+    (stats_json(&stats, tw, th, channels), tw, th, thumbnails)
+}
+
+fn stats_json(stats: &[PlaneStat], tw: usize, th: usize, channels: usize) -> String {
+    use crate::json::{push_number, push_string};
+
+    let mut out = String::from("{");
+    push_number(&mut out, "thumbWidth", tw);
+    out.push(',');
+    push_number(&mut out, "thumbHeight", th);
+    out.push(',');
+    push_number(&mut out, "channels", channels);
+    out.push(',');
+    push_string(&mut out, "planes");
+    out.push_str(":[");
+
+    for (i, stat) in stats.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        push_number(&mut out, "channel", stat.channel);
+        out.push(',');
+        push_number(&mut out, "bit", stat.bit as usize);
+        out.push(',');
+        push_string(&mut out, "transitionRate");
+        out.push(':');
+        out.push_str(&format!("{:.4}", stat.transition_rate));
+        out.push('}');
+    }
+
+    out.push_str("]}");
+    out
+}
+
+/// Sample values in the order a sequential embedder walks them.
+///
+/// Alpha is excluded on purpose. It is constant on most images, and a single
+/// value holding every count would dominate the histogram and drown the channels
+/// that carry the picture.
+pub fn traversal_samples(rgba: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rgba.len() / 4 * 3);
+    for pixel in rgba.chunks_exact(4) {
+        out.extend_from_slice(&pixel[..3]);
+    }
+    out
+}
+
+/// The chi-square sweep as JSON, ready to leave the worker.
+pub fn chi_square_json(rgba: &[u8], steps: usize) -> String {
+    use crate::json::{push_bool, push_number, push_string};
+
+    let samples = traversal_samples(rgba);
+    let points = chi::sweep(&samples, steps);
+    let result = chi::verdict(&points);
+
+    let mut out = String::from("{");
+    push_bool(&mut out, "detected", result.detected);
+    out.push(',');
+    push_string(&mut out, "embeddedFraction");
+    out.push(':');
+    out.push_str(&format!("{:.4}", result.embedded_fraction));
+    out.push(',');
+    push_string(&mut out, "peakProbability");
+    out.push(':');
+    out.push_str(&format!("{:.4}", result.peak_probability));
+    out.push(',');
+    push_number(&mut out, "samples", samples.len());
+    out.push(',');
+    push_string(&mut out, "points");
+    out.push_str(":[");
+
+    for (i, point) in points.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        push_string(&mut out, "fraction");
+        out.push(':');
+        out.push_str(&format!("{:.4}", point.fraction));
+        out.push(',');
+        push_string(&mut out, "p");
+        out.push(':');
+        out.push_str(&format!("{:.4}", point.p_embedding));
+        out.push(',');
+        push_string(&mut out, "chiSquare");
+        out.push(':');
+        out.push_str(&format!("{:.2}", point.chi_square));
+        out.push(',');
+        push_number(&mut out, "degrees", point.degrees);
+        out.push('}');
+    }
+
+    out.push_str("]}");
+    out
 }
 
 /// Full extraction for one combination, once the user has picked it.
