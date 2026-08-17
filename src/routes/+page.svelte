@@ -12,7 +12,9 @@
 	import RsView from '$lib/components/RsView.svelte';
 	import EntropyTrace from '$lib/components/EntropyTrace.svelte';
 	import MagicList from '$lib/components/MagicList.svelte';
-	import { flagsOf, PLANNED, tools } from '$lib/analysis/tools';
+	import ExifView from '$lib/components/ExifView.svelte';
+	import JpegView from '$lib/components/JpegView.svelte';
+	import { flagsOf, PLANNED, tools, WRITTEN_BY_HAND } from '$lib/analysis/tools';
 	import { COLOR_TYPES, isHeaderError, type AnalysisResponse } from '$lib/worker/protocol';
 
 	/** Plane and extract responses update a panel; they never become the page state. */
@@ -69,21 +71,28 @@
 
 					selectedChunk = analysis.structure?.chunks[0]?.offset ?? -1;
 					const flags = flagsOf(analysis.survey, analysis.structure);
+					const written = (analysis.survey.exif ?? []).some(
+						(e) => e.textual && WRITTEN_BY_HAND.has(e.name) && e.value.trim() !== ''
+					);
 
 					// Open whichever tool found something, most conclusive first.
 					activeTool = flags.some((f) => f.credible)
 						? 'flags'
 						: analysis.sweep?.candidates.length
 							? 'lsb'
-							: analysis.chi?.detected
-								? 'chi'
-								: analysis.rs?.detected
-									? 'rs'
-									: analysis.survey.magic.some((m) => m.embedded)
-										? 'magic'
-										: analysis.structure
-											? 'chunks'
-											: 'strings';
+							: written
+								? 'exif'
+								: analysis.survey.jpegComments.length
+									? 'jpeg'
+									: analysis.chi?.detected
+										? 'chi'
+										: analysis.rs?.detected
+											? 'rs'
+											: analysis.survey.magic.some((m) => m.embedded)
+												? 'magic'
+												: analysis.structure
+													? 'chunks'
+													: 'strings';
 				});
 			});
 		}
@@ -305,6 +314,14 @@
 						</p>
 					{:else if activeTool === 'magic'}
 						<MagicList hits={survey.magic} size={survey.size} />
+					{:else if activeTool === 'exif'}
+						<ExifView entries={survey.exif} />
+					{:else if activeTool === 'jpeg'}
+						<JpegView
+							segments={survey.jpegSegments}
+							comments={survey.jpegComments}
+							trailing={survey.jpegTrailing}
+						/>
 					{:else if activeTool === 'entropy'}
 						<EntropyTrace
 							values={survey.entropy.values}
@@ -410,6 +427,34 @@
 									</li>
 								{/each}
 							</ul>
+						{/if}
+					{:else if activeTool === 'palette' && structure}
+						{#if !structure.palette}
+							<p class="clear">This image has no colour palette, so there is nothing to compare.</p>
+						{:else}
+							<p class="lead">
+								{structure.palette.entries} colours, {structure.palette.unused} of them used by no pixel.
+							</p>
+							{#if structure.palette.duplicates.length === 0}
+								<p class="clear">
+									Every entry is a different colour. A palette with two entries for the same colour
+									lets an encoder pick either one, which changes the file without changing the
+									picture, and there is none of that here.
+								</p>
+							{:else}
+								<ul class="findings">
+									{#each structure.palette.duplicates as dup (dup.colour)}
+										<li>
+											<span class="mono big flagged">{dup.colour}</span>
+											<span class="mono muted">appears {dup.count} times in the palette</span>
+										</li>
+									{/each}
+								</ul>
+								<p class="scale-note">
+									Roughly {structure.palette.capacityBits.toLocaleString()} bits could be hidden by choosing
+									between duplicate entries, and the picture would look identical.
+								</p>
+							{/if}
 						{/if}
 					{:else if activeTool === 'strings'}
 						<StringsView total={survey.strings.total} sample={survey.strings.sample} />

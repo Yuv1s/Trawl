@@ -7,6 +7,8 @@ use wasm_bindgen::prelude::*;
 
 pub mod bytes;
 pub mod cuttlefish;
+pub mod exif;
+pub mod jpeg;
 pub mod json;
 pub mod png;
 pub mod survey;
@@ -28,7 +30,13 @@ pub fn png_lsb_sweep(file: &[u8], inflated: &[u8], max_bytes: usize) -> Result<S
     let rgba = png::decode(file, inflated).map_err(|e| JsError::new(&e.to_string()))?;
     let has_alpha = matches!(header.color_type, 4 | 6);
 
-    Ok(cuttlefish::sweep_json(&rgba, has_alpha, max_bytes))
+    Ok(cuttlefish::sweep_json(
+        &rgba,
+        header.width as usize,
+        header.height as usize,
+        has_alpha,
+        max_bytes,
+    ))
 }
 
 /// Every bit plane downsampled for the wall.
@@ -66,6 +74,64 @@ pub fn png_plane_wall(
 pub fn png_chi_square(file: &[u8], inflated: &[u8], steps: usize) -> Result<String, JsError> {
     let rgba = png::decode(file, inflated).map_err(|e| JsError::new(&e.to_string()))?;
     Ok(cuttlefish::chi_square_json(&rgba, steps))
+}
+
+/// Flag-shaped matches in a byte run, as JSON.
+///
+/// Exposed so the worker can re-scan text it decompressed itself, using the same
+/// matcher as everything else rather than a second implementation in JS.
+#[wasm_bindgen]
+pub fn find_flags(data: &[u8]) -> String {
+    use json::{push_field, push_number};
+
+    let mut out = String::from("[");
+    for (i, found) in bytes::flag_candidates(data).iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        push_number(&mut out, "offset", found.offset);
+        out.push(',');
+        push_field(&mut out, "text", &found.text);
+        out.push('}');
+    }
+    out.push(']');
+    out
+}
+
+/// Palette findings for an indexed image, as JSON. Null when there is no PLTE.
+#[wasm_bindgen]
+pub fn png_palette(file: &[u8], inflated: &[u8]) -> String {
+    use json::{push_number, push_string};
+
+    let indices = png::palette_indices(file, inflated);
+    let Some(palette) = png::palette(file, indices.as_deref()) else {
+        return "null".to_string();
+    };
+
+    let mut out = String::from("{");
+    push_number(&mut out, "entries", palette.entries);
+    out.push(',');
+    push_number(&mut out, "unused", palette.unused);
+    out.push(',');
+    push_number(&mut out, "capacityBits", palette.capacity_bits);
+    out.push(',');
+    push_string(&mut out, "duplicates");
+    out.push_str(":[");
+    for (i, (colour, count)) in palette.duplicates.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        push_string(&mut out, "colour");
+        out.push(':');
+        push_string(&mut out, colour);
+        out.push(',');
+        push_number(&mut out, "count", *count);
+        out.push('}');
+    }
+    out.push_str("]}");
+    out
 }
 
 /// RS analysis, estimating the embedding rate (Fridrich, Goljan & Du, 2001).

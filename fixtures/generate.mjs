@@ -76,7 +76,16 @@ function cover(width, height) {
 			const r = Math.hypot(nx - 0.5, ny - 0.5);
 
 			const detail = 5 * Math.sin(x * 0.9) + 4 * Math.cos(y * 1.1) + 3 * Math.sin((x + y) * 0.35);
-			const level = (base) => Math.max(2, Math.min(253, Math.round(base + detail)));
+
+			// A tone curve, which is the other property real photographs have and
+			// smooth gradients do not. A gradient spreads values evenly, so the
+			// counts of 2i and 2i+1 come out equal by accident, and that is
+			// precisely what chi-square reads as a payload. Bunching the values
+			// gives the histogram the local slope the test needs to see.
+			const level = (base) => {
+				const t = Math.min(1, Math.max(0, (base + detail) / 255));
+				return Math.max(2, Math.min(253, Math.round(255 * Math.pow(t, 1.9))));
+			};
 
 			px[o] = level(180 - 96 * r);
 			px[o + 1] = level(138 + 52 * Math.sin(nx * 3));
@@ -236,6 +245,213 @@ emit(
 	]),
 	'JPEG header, for the non-PNG path'
 );
+
+// Compressed text, which used to be reported as present but unread.
+{
+	const body = Buffer.from('flag{compressed_text_chunk}', 'latin1');
+	const ztxt = Buffer.concat([
+		Buffer.from('Secret', 'latin1'),
+		Buffer.from([0, 0]), // null terminator, then compression method 0
+		deflateSync(body, { level: 9 })
+	]);
+	emit(
+		'ztxt.png',
+		encode(W, H, cover(W, H), [chunk('zTXt', ztxt)]),
+		'flag in a deflate-compressed zTXt chunk'
+	);
+}
+
+// UTF-16LE text, which a single-byte string scan walks straight past.
+{
+	const wide = Buffer.alloc(0);
+	const text = 'flag{wide_characters}';
+	const utf16 = Buffer.alloc(text.length * 2);
+	for (let i = 0; i < text.length; i++) utf16.writeUInt16LE(text.charCodeAt(i), i * 2);
+
+	emit(
+		'utf16.png',
+		Buffer.concat([encode(W, H, cover(W, H)), wide, utf16]),
+		'flag stored as UTF-16LE after IEND'
+	);
+}
+
+// An indexed image whose palette holds the same colour twice.
+{
+	const width = 64;
+	const height = 64;
+	const palette = Buffer.alloc(256 * 3);
+	for (let i = 0; i < 256; i++) {
+		palette[i * 3] = i;
+		palette[i * 3 + 1] = 255 - i;
+		palette[i * 3 + 2] = (i * 7) % 256;
+	}
+	// Three entries painting an identical colour, which is the hiding place.
+	for (const at of [10, 200, 201]) {
+		palette[at * 3] = 0x40;
+		palette[at * 3 + 1] = 0x80;
+		palette[at * 3 + 2] = 0xc0;
+	}
+
+	const stride = width;
+	const raw = Buffer.alloc((stride + 1) * height);
+	const next = rng(0xfeed);
+	for (let y = 0; y < height; y++) {
+		raw[y * (stride + 1)] = 0;
+		for (let x = 0; x < width; x++) {
+			raw[y * (stride + 1) + 1 + x] = [10, 200, 201][next() % 3];
+		}
+	}
+
+	const ihdr = Buffer.alloc(13);
+	ihdr.writeUInt32BE(width, 0);
+	ihdr.writeUInt32BE(height, 4);
+	ihdr[8] = 8;
+	ihdr[9] = 3; // indexed
+
+	emit(
+		'palette-duplicates.png',
+		Buffer.concat([
+			SIGNATURE,
+			chunk('IHDR', ihdr),
+			chunk('PLTE', palette),
+			chunk('IDAT', deflateSync(raw, { level: 9 })),
+			chunk('IEND', Buffer.alloc(0))
+		]),
+		'indexed image with one colour repeated three times'
+	);
+}
+
+// Adam7 interlaced, which the decoder used to refuse.
+// Full size, so the statistical tools have enough samples to be meaningful and
+// this doubles as a control that interlacing changes nothing they measure.
+{
+	const width = W;
+	const height = H;
+	const passes = [
+		[0, 0, 8, 8],
+		[4, 0, 8, 8],
+		[0, 4, 4, 8],
+		[2, 0, 4, 4],
+		[0, 2, 2, 4],
+		[1, 0, 2, 2],
+		[0, 1, 1, 2]
+	];
+
+	const full = cover(width, height);
+	const parts = [];
+	for (const [x0, y0, dx, dy] of passes) {
+		const pw = Math.ceil(Math.max(0, width - x0) / dx);
+		const ph = Math.ceil(Math.max(0, height - y0) / dy);
+		if (pw === 0 || ph === 0) continue;
+
+		const stride = pw * 4;
+		const raw = Buffer.alloc((stride + 1) * ph);
+		for (let row = 0; row < ph; row++) {
+			raw[row * (stride + 1)] = 0;
+			for (let col = 0; col < pw; col++) {
+				const src = ((y0 + row * dy) * width + (x0 + col * dx)) * 4;
+				full.copy(raw, row * (stride + 1) + 1 + col * 4, src, src + 4);
+			}
+		}
+		parts.push(raw);
+	}
+
+	const ihdr = Buffer.alloc(13);
+	ihdr.writeUInt32BE(width, 0);
+	ihdr.writeUInt32BE(height, 4);
+	ihdr[8] = 8;
+	ihdr[9] = 6;
+	ihdr[12] = 1; // Adam7
+
+	emit(
+		'interlaced.png',
+		Buffer.concat([
+			SIGNATURE,
+			chunk('IHDR', ihdr),
+			chunk('IDAT', deflateSync(Buffer.concat(parts), { level: 9 })),
+			chunk('IEND', Buffer.alloc(0))
+		]),
+		'Adam7 interlaced, seven passes'
+	);
+}
+
+/** A little-endian TIFF block, the same structure JPEG and PNG both carry. */
+function tiff(fields) {
+	const count = fields.length;
+	let heapAt = 8 + 2 + count * 12 + 4;
+	const head = [];
+	const heap = [];
+
+	for (const [tag, text] of fields) {
+		const value = Buffer.concat([Buffer.from(text, 'latin1'), Buffer.from([0])]);
+		const entry = Buffer.alloc(12);
+		entry.writeUInt16LE(tag, 0);
+		entry.writeUInt16LE(2, 2); // ASCII
+		entry.writeUInt32LE(value.length, 4);
+
+		if (value.length <= 4) {
+			value.copy(entry, 8);
+		} else {
+			entry.writeUInt32LE(heapAt, 8);
+			heap.push(value);
+			heapAt += value.length;
+		}
+		head.push(entry);
+	}
+
+	const header = Buffer.alloc(10);
+	header.write('II', 0, 'latin1');
+	header.writeUInt16LE(42, 2);
+	header.writeUInt32LE(8, 4);
+	header.writeUInt16LE(count, 8);
+
+	return Buffer.concat([header, ...head, Buffer.alloc(4), ...heap]);
+}
+
+// EXIF inside a JPEG, which is where metadata challenges hide a flag.
+{
+	const block = Buffer.concat([
+		Buffer.from('Exif\0\0', 'latin1'),
+		tiff([
+			[0x010f, 'Nikon'],
+			[0x0110, 'D850'],
+			[0x0131, 'Trawl fixture generator'],
+			[0x010e, 'flag{read_the_metadata}'],
+			[0x013b, 'yuv1s']
+		])
+	]);
+
+	const app1 = Buffer.alloc(4);
+	app1[0] = 0xff;
+	app1[1] = 0xe1;
+	app1.writeUInt16BE(block.length + 2, 2);
+
+	const comment = Buffer.from('nothing to see here, move along', 'latin1');
+	const com = Buffer.alloc(4);
+	com[0] = 0xff;
+	com[1] = 0xfe;
+	com.writeUInt16BE(comment.length + 2, 2);
+
+	emit(
+		'exif-flag.jpg',
+		Buffer.concat([
+			Buffer.from([0xff, 0xd8]),
+			app1,
+			block,
+			com,
+			comment,
+			Buffer.from([0xff, 0xd9])
+		]),
+		'flag in the EXIF ImageDescription of a JPEG'
+	);
+}
+
+// The same TIFF block in a PNG eXIf chunk, read by the same walker.
+{
+	const block = tiff([[0x9286, 'flag{png_carries_exif_too}']]);
+	const px = cover(120, 90);
+	emit('exif-in-png.png', encode(120, 90, px, [chunk('eXIf', block)]), 'flag in a PNG eXIf chunk');
+}
 
 const width = Math.max(...made.map((m) => m.name.length));
 for (const m of made) {

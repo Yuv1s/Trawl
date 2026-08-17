@@ -28,6 +28,11 @@ impl Header {
         }
     }
 
+    /// For call sites that have already validated the colour type.
+    fn channels_unchecked(&self) -> usize {
+        self.channels().unwrap_or(1)
+    }
+
     /// Bytes per complete pixel, rounded up, floored at 1. This is the filter
     /// offset from PNG spec 9.2, not the storage size of a pixel.
     pub fn filter_bpp(&self) -> Result<usize, PngError> {
@@ -112,6 +117,11 @@ const CRC_TABLE: [u32; 256] = {
     }
     table
 };
+
+/// Exposed so tests elsewhere can build valid PNG chunks.
+pub fn crc_of(bytes: &[u8]) -> u32 {
+    crc32(bytes)
+}
 
 fn crc32(bytes: &[u8]) -> u32 {
     let mut c = 0xffff_ffffu32;
@@ -199,9 +209,9 @@ pub fn header(file: &[u8]) -> Result<Header, PngError> {
     }
 
     let depth_ok = match header.color_type {
-        0 => matches!(header.bit_depth, 1 | 2 | 4 | 8),
+        0 => matches!(header.bit_depth, 1 | 2 | 4 | 8 | 16),
         3 => matches!(header.bit_depth, 1 | 2 | 4 | 8),
-        2 | 4 | 6 => header.bit_depth == 8,
+        2 | 4 | 6 => matches!(header.bit_depth, 8 | 16),
         other => return Err(PngError::UnsupportedColorType(other)),
     };
     if !depth_ok {
@@ -212,6 +222,14 @@ pub fn header(file: &[u8]) -> Result<Header, PngError> {
     }
 
     Ok(header)
+}
+
+/// The payload of the first chunk of a given type, if the file has one.
+pub fn chunk_payload<'a>(file: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
+    chunks(file)
+        .into_iter()
+        .find(|c| c.is(kind))
+        .map(|c| chunk_data(file, c))
 }
 
 /// Concatenated IDAT payloads, ready to hand to `DecompressionStream('deflate')`.
@@ -298,6 +316,80 @@ fn packed_sample(row: &[u8], index: usize, bit_depth: u8) -> u8 {
     ((raw as u16 * 255) / max) as u8
 }
 
+/// Writes one pixel of a row into the RGBA buffer.
+///
+/// At 16 bits per sample the high byte is taken, which is the standard reduction
+/// and keeps the picture intact. The low half of a 16-bit image is not examined
+/// by any detector yet, and that is a known gap rather than a silent one.
+fn write_pixel(
+    row: &[u8],
+    x: usize,
+    header: &Header,
+    palette: &[u8],
+    transparency: &[u8],
+    rgba: &mut [u8],
+    out: usize,
+) -> Result<(), PngError> {
+    let wide = header.bit_depth == 16;
+    let step = if wide { 2 } else { 1 };
+    let sample = |channel: usize| row[(x * header.channels_unchecked() + channel) * step];
+
+    match header.color_type {
+        0 => {
+            let value = match header.bit_depth {
+                16 => sample(0),
+                8 => row[x],
+                depth => packed_sample(row, x, depth),
+            };
+            rgba[out] = value;
+            rgba[out + 1] = value;
+            rgba[out + 2] = value;
+            rgba[out + 3] = 255;
+        }
+        2 => {
+            for c in 0..3 {
+                rgba[out + c] = sample(c);
+            }
+            rgba[out + 3] = 255;
+        }
+        3 => {
+            let per_byte = 8 / header.bit_depth as usize;
+            let index = if header.bit_depth == 8 {
+                row[x]
+            } else {
+                let byte = row[x / per_byte];
+                let shift = 8 - header.bit_depth as usize * (x % per_byte + 1);
+                (byte >> shift) & ((1u16 << header.bit_depth) - 1) as u8
+            };
+
+            let base = index as usize * 3;
+            if base + 3 > palette.len() {
+                return Err(PngError::PaletteIndexOutOfRange {
+                    index,
+                    entries: palette.len() / 3,
+                });
+            }
+            rgba[out..out + 3].copy_from_slice(&palette[base..base + 3]);
+            rgba[out + 3] = transparency.get(index as usize).copied().unwrap_or(255);
+        }
+        4 => {
+            let value = sample(0);
+            rgba[out] = value;
+            rgba[out + 1] = value;
+            rgba[out + 2] = value;
+            rgba[out + 3] = sample(1);
+        }
+        6 => {
+            for c in 0..4 {
+                rgba[out + c] = sample(c);
+            }
+        }
+        other => return Err(PngError::UnsupportedColorType(other)),
+    }
+
+    Ok(())
+}
+
 fn expand(
     samples: &[u8],
     header: &Header,
@@ -311,53 +403,79 @@ fn expand(
 
     for y in 0..height {
         let row = &samples[y * stride..(y + 1) * stride];
-
         for x in 0..width {
-            let out = (y * width + x) * 4;
+            write_pixel(row, x, header, palette, transparency, &mut rgba, (y * width + x) * 4)?;
+        }
+    }
 
-            match header.color_type {
-                0 => {
-                    let value = if header.bit_depth == 8 {
-                        row[x]
-                    } else {
-                        packed_sample(row, x, header.bit_depth)
-                    };
-                    rgba[out] = value;
-                    rgba[out + 1] = value;
-                    rgba[out + 2] = value;
-                    rgba[out + 3] = 255;
-                }
-                2 => {
-                    rgba[out..out + 3].copy_from_slice(&row[x * 3..x * 3 + 3]);
-                    rgba[out + 3] = 255;
-                }
-                3 => {
-                    let per_byte = 8 / header.bit_depth as usize;
-                    let index = if header.bit_depth == 8 {
-                        row[x]
-                    } else {
-                        let byte = row[x / per_byte];
-                        let shift = 8 - header.bit_depth as usize * (x % per_byte + 1);
-                        (byte >> shift) & ((1u16 << header.bit_depth) - 1) as u8
-                    };
+    Ok(rgba)
+}
 
-                    let entries = palette.len() / 3;
-                    let base = index as usize * 3;
-                    if base + 3 > palette.len() {
-                        return Err(PngError::PaletteIndexOutOfRange { index, entries });
-                    }
-                    rgba[out..out + 3].copy_from_slice(&palette[base..base + 3]);
-                    rgba[out + 3] = transparency.get(index as usize).copied().unwrap_or(255);
-                }
-                4 => {
-                    let value = row[x * 2];
-                    rgba[out] = value;
-                    rgba[out + 1] = value;
-                    rgba[out + 2] = value;
-                    rgba[out + 3] = row[x * 2 + 1];
-                }
-                6 => rgba[out..out + 4].copy_from_slice(&row[x * 4..x * 4 + 4]),
-                other => return Err(PngError::UnsupportedColorType(other)),
+/// Adam7 pass geometry: starting column, starting row, column step, row step.
+const ADAM7: [(usize, usize, usize, usize); 7] = [
+    (0, 0, 8, 8),
+    (4, 0, 8, 8),
+    (0, 4, 4, 8),
+    (2, 0, 4, 4),
+    (0, 2, 2, 4),
+    (1, 0, 2, 2),
+    (0, 1, 1, 2),
+];
+
+/// Decodes an interlaced image.
+///
+/// Adam7 stores seven progressively finer passes, each filtered independently
+/// with its own width. Rather than reassembling packed samples and expanding
+/// afterwards, each pass writes straight to its scattered positions in the RGBA
+/// buffer, which avoids repacking sub-byte rows.
+fn decode_interlaced(
+    inflated: &[u8],
+    header: &Header,
+    palette: &[u8],
+    transparency: &[u8],
+) -> Result<Vec<u8>, PngError> {
+    let width = header.width as usize;
+    let height = header.height as usize;
+    let channels = header.channels()?;
+    let bpp = header.filter_bpp()?;
+
+    let mut rgba = vec![0u8; width * height * 4];
+    let mut consumed = 0usize;
+
+    for (x0, y0, dx, dy) in ADAM7 {
+        let pass_width = width.saturating_sub(x0).div_ceil(dx);
+        let pass_height = height.saturating_sub(y0).div_ceil(dy);
+        if pass_width == 0 || pass_height == 0 {
+            continue;
+        }
+
+        let stride = (pass_width * channels * header.bit_depth as usize).div_ceil(8);
+        let needed = (stride + 1) * pass_height;
+
+        let slice = inflated
+            .get(consumed..consumed + needed)
+            .ok_or(PngError::ShortPixelData {
+                expected: consumed + needed,
+                actual: inflated.len(),
+            })?;
+        consumed += needed;
+
+        let samples = unfilter(slice, stride, bpp, pass_height)?;
+
+        for row in 0..pass_height {
+            let line = &samples[row * stride..(row + 1) * stride];
+            for col in 0..pass_width {
+                let x = x0 + col * dx;
+                let y = y0 + row * dy;
+                write_pixel(
+                    line,
+                    col,
+                    header,
+                    palette,
+                    transparency,
+                    &mut rgba,
+                    (y * width + x) * 4,
+                )?;
             }
         }
     }
@@ -371,7 +489,7 @@ fn expand(
 /// @param inflated the concatenated IDAT payloads after zlib decompression
 pub fn decode(file: &[u8], inflated: &[u8]) -> Result<Vec<u8>, PngError> {
     let header = header(file)?;
-    if header.interlace != 0 {
+    if header.interlace > 1 {
         return Err(PngError::Interlaced);
     }
 
@@ -390,6 +508,10 @@ pub fn decode(file: &[u8], inflated: &[u8]) -> Result<Vec<u8>, PngError> {
         return Err(PngError::MissingPalette);
     }
 
+    if header.interlace == 1 {
+        return decode_interlaced(inflated, &header, palette, transparency);
+    }
+
     let samples = unfilter(
         inflated,
         header.stride()?,
@@ -406,11 +528,17 @@ pub struct TextChunk {
     pub keyword: String,
     pub text: String,
     pub compressed: bool,
+    /// Where the zlib stream starts, so the caller can inflate it. Zero when the
+    /// chunk carries plain text.
+    pub payload_offset: usize,
+    pub payload_length: usize,
 }
 
-/// Reads `tEXt` and uncompressed `iTXt`. Compressed payloads are reported as
-/// present but left empty: inflate lives on the JS side, and claiming to have
-/// read something we have not is worse than saying so.
+/// Reads `tEXt` and uncompressed `iTXt` outright, and locates the zlib stream in
+/// the compressed variants so the caller can inflate it.
+///
+/// Inflate is a platform call on the JS side, so this module reports where the
+/// stream is rather than pretending to have read it.
 pub fn text_chunks(file: &[u8]) -> Vec<TextChunk> {
     let mut out = Vec::new();
 
@@ -427,26 +555,34 @@ pub fn text_chunks(file: &[u8]) -> Vec<TextChunk> {
         let keyword = crate::json::latin1(&data[..split]);
         let rest = &data[split + 1..];
 
-        let (text, compressed) = if chunk.is(b"tEXt") {
-            (crate::json::latin1(rest), false)
+        let (text, compressed, payload_at) = if chunk.is(b"tEXt") {
+            (crate::json::latin1(rest), false, None)
         } else if chunk.is(b"zTXt") {
-            (String::new(), true)
+            // keyword \0 method <zlib>
+            (String::new(), true, Some(split + 2))
         } else {
-            // iTXt: compression flag, method, language tag, translated keyword, text
+            // iTXt: keyword \0 flag method language \0 translated \0 text
             let compressed = rest.first().is_some_and(|&flag| flag != 0);
-            let body = rest
-                .get(2..)
-                .map(|b| {
-                    let mut fields = b.splitn(3, |&x| x == 0);
-                    fields.nth(2).unwrap_or(&[])
-                })
-                .unwrap_or(&[]);
-            let text = if compressed {
-                String::new()
-            } else {
-                String::from_utf8_lossy(body).into_owned()
+
+            let body_at = rest.get(2..).and_then(|after| {
+                let language = after.iter().position(|&b| b == 0)?;
+                let translated = after[language + 1..].iter().position(|&b| b == 0)?;
+                Some(split + 1 + 2 + language + 1 + translated + 1)
+            });
+
+            let text = match (compressed, body_at) {
+                (false, Some(at)) => String::from_utf8_lossy(&data[at..]).into_owned(),
+                _ => String::new(),
             };
-            (text, compressed)
+
+            (text, compressed, if compressed { body_at } else { None })
+        };
+
+        let (payload_offset, payload_length) = match payload_at {
+            Some(at) if at <= chunk.length => {
+                (chunk.data_offset + at, chunk.length - at)
+            }
+            _ => (0, 0),
         };
 
         out.push(TextChunk {
@@ -454,6 +590,8 @@ pub fn text_chunks(file: &[u8]) -> Vec<TextChunk> {
             keyword,
             text,
             compressed,
+            payload_offset,
+            payload_length,
         });
     }
 
@@ -521,6 +659,106 @@ pub fn located_flags(file: &[u8]) -> Vec<FlagHit> {
             }
         })
         .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Palette {
+    pub entries: usize,
+    /// Colours appearing more than once. Two indices that paint the same pixel
+    /// let an encoder choose between them, which carries a bit per pixel and
+    /// leaves the picture untouched.
+    pub duplicates: Vec<(String, usize)>,
+    /// Entries no pixel refers to.
+    pub unused: usize,
+    /// Bits an encoder could hide using duplicate entries alone.
+    pub capacity_bits: usize,
+}
+
+/// Reads PLTE and, when pixel data is available, which entries actually get used.
+pub fn palette(file: &[u8], indices: Option<&[u8]>) -> Option<Palette> {
+    let plte = chunk_payload(file, b"PLTE")?;
+    let entries = plte.len() / 3;
+
+    let mut seen: Vec<(&[u8], Vec<usize>)> = Vec::new();
+    for i in 0..entries {
+        let colour = &plte[i * 3..i * 3 + 3];
+        match seen.iter_mut().find(|(c, _)| *c == colour) {
+            Some((_, at)) => at.push(i),
+            None => seen.push((colour, vec![i])),
+        }
+    }
+
+    let duplicates: Vec<(String, usize)> = seen
+        .iter()
+        .filter(|(_, at)| at.len() > 1)
+        .map(|(c, at)| (format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]), at.len()))
+        .collect();
+
+    let mut used = [false; 256];
+    if let Some(data) = indices {
+        for &index in data {
+            used[index as usize] = true;
+        }
+    }
+
+    let unused = if indices.is_some() {
+        (0..entries).filter(|&i| !used[i]).count()
+    } else {
+        0
+    };
+
+    // Each pixel painted with a duplicated colour can choose among its copies.
+    let capacity_bits = match indices {
+        Some(data) => seen
+            .iter()
+            .filter(|(_, at)| at.len() > 1)
+            .map(|(_, at)| {
+                let bits = (usize::BITS - (at.len() - 1).leading_zeros()) as usize;
+                let pixels = data
+                    .iter()
+                    .filter(|&&i| at.contains(&(i as usize)))
+                    .count();
+                bits * pixels
+            })
+            .sum(),
+        None => 0,
+    };
+
+    Some(Palette {
+        entries,
+        duplicates,
+        unused,
+        capacity_bits,
+    })
+}
+
+/// Raw palette indices, one per pixel, for an indexed image.
+pub fn palette_indices(file: &[u8], inflated: &[u8]) -> Option<Vec<u8>> {
+    let header = header(file).ok()?;
+    if header.color_type != 3 || header.interlace != 0 {
+        return None;
+    }
+
+    let stride = header.stride().ok()?;
+    let samples = unfilter(inflated, stride, header.filter_bpp().ok()?, header.height as usize).ok()?;
+    let width = header.width as usize;
+    let per_byte = 8 / header.bit_depth as usize;
+
+    let mut out = Vec::with_capacity(width * header.height as usize);
+    for y in 0..header.height as usize {
+        let row = &samples[y * stride..(y + 1) * stride];
+        for x in 0..width {
+            out.push(if header.bit_depth == 8 {
+                row[x]
+            } else {
+                let byte = row[x / per_byte];
+                let shift = 8 - header.bit_depth as usize * (x % per_byte + 1);
+                (byte >> shift) & ((1u16 << header.bit_depth) - 1) as u8
+            });
+        }
+    }
+
+    Some(out)
 }
 
 /// Offset and length of anything after the IEND chunk. A PNG is complete at IEND,
@@ -612,6 +850,10 @@ pub fn structure_json(file: &[u8]) -> String {
         push_field(&mut out, "text", &text.text);
         out.push(',');
         push_bool(&mut out, "compressed", text.compressed);
+        out.push(',');
+        push_number(&mut out, "payloadOffset", text.payload_offset);
+        out.push(',');
+        push_number(&mut out, "payloadLength", text.payload_length);
         out.push('}');
     }
     out.push(']');
@@ -635,28 +877,8 @@ pub fn structure_json(file: &[u8]) -> String {
     }
     out.push(']');
 
-    out.push(',');
-    push_string(&mut out, "strings");
-    out.push(':');
-    {
-        let all = crate::bytes::ascii_strings(file, 6);
-        out.push('{');
-        push_number(&mut out, "total", all.len());
-        out.push(',');
-        push_string(&mut out, "sample");
-        out.push_str(":[");
-        for (i, found) in all.iter().take(300).enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push('{');
-            push_number(&mut out, "offset", found.offset);
-            out.push(',');
-            push_field(&mut out, "text", &found.text);
-            out.push('}');
-        }
-        out.push_str("]}");
-    }
+    // Strings are a byte-level concern and belong to the survey, which runs on
+    // every format. Emitting them here too would be the same work twice.
 
     out.push(',');
     push_string(&mut out, "trailing");

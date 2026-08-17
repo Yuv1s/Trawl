@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+﻿import { describe, expect, it } from 'vitest';
 import { flagsOf, PLANNED, tools } from './tools';
 import type { Chunk, Structure, Survey } from '$lib/worker/protocol';
 
@@ -16,7 +16,11 @@ const survey: Survey = {
 	format: 'PNG image',
 	flags: [],
 	magic: [{ offset: 0, label: 'PNG image', embedded: false }],
-	strings: { total: 42, sample: [] },
+	exif: null,
+	jpegSegments: [],
+	jpegComments: [],
+	jpegTrailing: null,
+	strings: { total: 42, wide: 0, sample: [] },
 	entropy: { window: 256, values: [7.9, 7.8, 7.95] }
 };
 
@@ -27,7 +31,6 @@ const structure: Structure = {
 	chunks: [chunk('IHDR', 8, 13), chunk('IDAT', 33, 900), chunk('IEND', 945)],
 	text: [],
 	flags: [],
-	strings: { total: 42, sample: [] },
 	trailing: null
 };
 
@@ -70,12 +73,72 @@ describe('tools', () => {
 		expect(tool('magic', s)?.value).toBe('1 found');
 	});
 
-	it('does not treat the file’s own header as an embedded file', () => {
+	it('does not treat the file own signature as an embedded file', () => {
 		expect(status('magic')).toBe('clear');
 	});
 
 	it('reports the peak entropy it measured', () => {
 		expect(tool('entropy')?.value).toBe('peak 7.95 of 8');
+	});
+});
+
+describe('metadata', () => {
+	const withExif = (exif: Survey['exif']): Survey => ({ ...survey, exif });
+
+	it('reports no metadata block as clear', () => {
+		expect(status('exif')).toBe('clear');
+		expect(tool('exif')?.value).toBe('none');
+	});
+
+	it('flags a field a person typed into', () => {
+		const s = withExif([
+			{ ifd: 'IFD0', tag: 0x010e, name: 'ImageDescription', value: 'flag{x}', textual: true }
+		]);
+		expect(status('exif', s)).toBe('hit');
+		expect(tool('exif', s)?.value).toBe('1 written field');
+	});
+
+	it('does not flag fields a camera fills in by itself', () => {
+		const s = withExif([
+			{ ifd: 'IFD0', tag: 0x0110, name: 'Model', value: 'EOS 5D', textual: true },
+			{ ifd: 'IFD0', tag: 0x0112, name: 'Orientation', value: '6', textual: false }
+		]);
+		expect(status('exif', s)).toBe('ready');
+		expect(tool('exif', s)?.value).toBe('2 fields');
+	});
+
+	it('ignores an empty description rather than calling it a find', () => {
+		const s = withExif([
+			{ ifd: 'IFD0', tag: 0x010e, name: 'ImageDescription', value: '   ', textual: true }
+		]);
+		expect(status('exif', s)).toBe('ready');
+	});
+});
+
+describe('jpeg segments', () => {
+	it('says so plainly when the file is not a JPEG', () => {
+		expect(status('jpeg')).toBe('clear');
+		expect(tool('jpeg')?.value).toBe('not a JPEG');
+	});
+
+	it('flags a comment segment', () => {
+		const s: Survey = {
+			...survey,
+			jpegSegments: [{ name: 'SOI', marker: 0xd8, offset: 0, length: 0 }],
+			jpegComments: [{ offset: 20, text: 'flag{comment}' }]
+		};
+		expect(status('jpeg', s)).toBe('hit');
+		expect(tool('jpeg', s)?.value).toBe('1 comment');
+	});
+
+	it('flags bytes past the end-of-image marker', () => {
+		const s: Survey = {
+			...survey,
+			jpegSegments: [{ name: 'EOI', marker: 0xd9, offset: 40, length: 0 }],
+			jpegTrailing: { offset: 42, length: 2048 }
+		};
+		expect(status('jpeg', s)).toBe('hit');
+		expect(tool('jpeg', s)?.value).toBe('2,048 bytes past EOI');
 	});
 });
 
@@ -115,7 +178,7 @@ describe('format scope', () => {
 
 describe('planned tools', () => {
 	it('no longer lists anything that has shipped', () => {
-		for (const id of ['lsb', 'planes', 'chi', 'rs', 'entropy', 'magic']) {
+		for (const id of ['lsb', 'planes', 'chi', 'rs', 'entropy', 'magic', 'exif', 'jpeg']) {
 			expect(PLANNED.some((t) => t.id === id)).toBe(false);
 		}
 	});

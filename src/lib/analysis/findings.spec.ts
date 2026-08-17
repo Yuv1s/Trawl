@@ -18,7 +18,6 @@ const clean: Structure = {
 	chunks: [chunk('IHDR', 8, 13), chunk('IDAT', 33, 900), chunk('IEND', 945)],
 	text: [],
 	flags: [],
-	strings: { total: 0, sample: [] },
 	trailing: null
 };
 
@@ -55,7 +54,16 @@ describe('findings', () => {
 	it('reports compressed text as unread rather than empty', () => {
 		const s: Structure = {
 			...clean,
-			text: [{ kind: 'zTXt', keyword: 'Secret', text: '', compressed: true }]
+			text: [
+				{
+					kind: 'zTXt',
+					keyword: 'Secret',
+					text: '',
+					compressed: true,
+					payloadOffset: 60,
+					payloadLength: 12
+				}
+			]
 		};
 		const finding = findings(s).find((f) => f.id.startsWith('text-'));
 		expect(finding?.detail).toMatch(/not yet inflated/);

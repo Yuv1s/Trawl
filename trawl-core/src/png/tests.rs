@@ -143,15 +143,41 @@ fn header_rejects_files_that_are_not_png() {
 }
 
 #[test]
-fn header_rejects_bit_depths_the_decoder_would_get_wrong() {
+fn header_accepts_sixteen_bit_truecolour() {
     let file = png(4, 4, 16, 2, &[]);
+    assert_eq!(header(&file).unwrap().bit_depth, 16);
+}
+
+#[test]
+fn header_rejects_depth_and_colour_combinations_the_spec_forbids() {
+    // A palette cannot be 16 bits deep; indices are at most 8.
     assert_eq!(
-        header(&file),
+        header(&png(4, 4, 16, 3, &[])),
         Err(PngError::UnsupportedBitDepth {
-            color_type: 2,
+            color_type: 3,
             bit_depth: 16
         })
     );
+    // Truecolour has no sub-byte form.
+    assert_eq!(
+        header(&png(4, 4, 4, 2, &[])),
+        Err(PngError::UnsupportedBitDepth {
+            color_type: 2,
+            bit_depth: 4
+        })
+    );
+}
+
+#[test]
+fn decode_takes_the_high_byte_of_a_sixteen_bit_sample() {
+    let file = png(2, 1, 16, 2, &[]);
+    // Two pixels, three channels, big-endian pairs.
+    let raw = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44];
+    let inflated = filter_rows(&raw, 12, 6, 1, 0);
+
+    let rgba = decode(&file, &inflated).unwrap();
+    assert_eq!(&rgba[0..4], &[0x12, 0x56, 0x9a, 255]);
+    assert_eq!(&rgba[4..8], &[0xde, 0x11, 0x33, 255]);
 }
 
 #[test]
@@ -258,14 +284,75 @@ fn decode_keeps_gray_alpha_channels_separate() {
     assert_eq!(&rgba[4..8], &[0x33, 0x33, 0x33, 0x44]);
 }
 
+/// Adam7 splits the image into seven passes, each filtered independently with
+/// its own width. This builds one the way an encoder would, then checks every
+/// pixel lands back where it started.
 #[test]
-fn decode_refuses_interlaced_rather_than_guessing() {
+fn decode_reassembles_an_adam7_interlaced_image() {
+    const W: usize = 8;
+    const H: usize = 8;
+
+    // Each pixel gets a value derived from its position, so a misplacement shows.
+    let colour = |x: usize, y: usize| [(x * 16 + 8) as u8, (y * 16 + 8) as u8, ((x ^ y) * 8) as u8];
+
+    let mut interlaced = Vec::new();
+    for (x0, y0, dx, dy) in ADAM7 {
+        let pw = W.saturating_sub(x0).div_ceil(dx);
+        let ph = H.saturating_sub(y0).div_ceil(dy);
+        if pw == 0 || ph == 0 {
+            continue;
+        }
+
+        let mut raw = Vec::with_capacity(pw * ph * 3);
+        for row in 0..ph {
+            for col in 0..pw {
+                raw.extend_from_slice(&colour(x0 + col * dx, y0 + row * dy));
+            }
+        }
+        interlaced.extend_from_slice(&filter_rows(&raw, pw * 3, 3, ph, 0));
+    }
+
     let mut file = Vec::new();
     file.extend_from_slice(&SIGNATURE);
-    file.extend_from_slice(&ihdr(4, 4, 8, 2, 1));
+    file.extend_from_slice(&ihdr(W as u32, H as u32, 8, 2, 1));
+    file.extend_from_slice(&chunk(b"IEND", &[]));
+
+    let rgba = decode(&file, &interlaced).unwrap();
+
+    for y in 0..H {
+        for x in 0..W {
+            let at = (y * W + x) * 4;
+            assert_eq!(
+                &rgba[at..at + 3],
+                &colour(x, y),
+                "pixel ({x}, {y}) landed in the wrong place"
+            );
+            assert_eq!(rgba[at + 3], 255);
+        }
+    }
+}
+
+#[test]
+fn decode_rejects_an_unknown_interlace_method() {
+    let mut file = Vec::new();
+    file.extend_from_slice(&SIGNATURE);
+    file.extend_from_slice(&ihdr(4, 4, 8, 2, 7));
     file.extend_from_slice(&chunk(b"IEND", &[]));
 
     assert_eq!(decode(&file, &[]), Err(PngError::Interlaced));
+}
+
+#[test]
+fn an_interlaced_image_with_too_little_data_reports_it() {
+    let mut file = Vec::new();
+    file.extend_from_slice(&SIGNATURE);
+    file.extend_from_slice(&ihdr(16, 16, 8, 2, 1));
+    file.extend_from_slice(&chunk(b"IEND", &[]));
+
+    assert!(matches!(
+        decode(&file, &[0u8; 8]),
+        Err(PngError::ShortPixelData { .. })
+    ));
 }
 
 #[test]
@@ -436,10 +523,10 @@ fn structure_json_is_parseable_and_reports_the_walk() {
 
 #[test]
 fn structure_json_reports_the_header_error_rather_than_omitting_it() {
-    let file = png(4, 4, 16, 2, &[]);
+    let file = png(4, 4, 16, 3, &[]);
     let json = structure_json(&file);
 
-    assert!(json.contains("\"error\":\"bit depth 16 unsupported for colour type 2\""));
+    assert!(json.contains("\"error\":\"bit depth 16 unsupported for colour type 3\""));
     assert!(json.contains("\"kind\":\"IHDR\""), "the walk still happens");
 }
 

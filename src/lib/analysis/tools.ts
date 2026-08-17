@@ -31,15 +31,34 @@ export const STATUS_LABEL: Record<ToolStatus, string> = {
 };
 
 /**
- * The PNG walker knows which chunks are compressed, so it judges a flag match
- * more precisely than entropy can. Entropy is the fallback for formats whose
- * structure we cannot read.
+ * Every flag candidate, from whichever scan found it.
+ *
+ * The PNG walker judges a raw-byte match more precisely than entropy can,
+ * because it knows which chunks are compressed, so its verdict wins where the
+ * two overlap. But the survey also finds things the chunk walk structurally
+ * cannot: UTF-16 text, and anything recovered by inflating a compressed chunk.
+ * Returning one list or the other silently dropped those.
  */
 export function flagsOf(survey: Survey, structure: Structure | null): FlagHit[] {
-	return structure ? structure.flags : survey.flags;
+	if (!structure) return survey.flags;
+
+	const judged = new Set(structure.flags.map((f) => f.offset));
+	return [...structure.flags, ...survey.flags.filter((f) => !judged.has(f.offset))];
 }
 
 const UNAVAILABLE = 'PNG only, for now';
+
+/** Metadata fields a person types into, as opposed to ones a camera fills in. */
+export const WRITTEN_BY_HAND = new Set([
+	'ImageDescription',
+	'UserComment',
+	'Artist',
+	'Copyright',
+	'Software',
+	'ImageUniqueID',
+	'CameraOwnerName',
+	'MakerNote'
+]);
 
 export function tools(
 	survey: Survey,
@@ -52,6 +71,11 @@ export function tools(
 	const credible = flagsOf(survey, structure).filter((f) => f.credible);
 	const embedded = survey.magic.filter((m) => m.embedded);
 	const peakEntropy = survey.entropy.values.length ? Math.max(...survey.entropy.values) : 0;
+	const writtenFields = (survey.exif ?? []).filter(
+		(e) => e.textual && WRITTEN_BY_HAND.has(e.name) && e.value.trim() !== ''
+	);
+	const jpegish = survey.jpegSegments.length > 0;
+	const duplicateColours = structure?.palette?.duplicates.length ?? 0;
 
 	const headerBroken = !structure || isHeaderError(structure.header);
 	const badCrc = structure?.chunks.filter((c) => !c.crcOk).length ?? 0;
@@ -125,6 +149,33 @@ export function tools(
 			value: wall ? `${wall.planes.length} planes` : 'pixels unavailable'
 		}),
 		{
+			id: 'exif',
+			name: 'Metadata',
+			measures: 'Camera details and notes saved with the photo',
+			scope: 'bytes',
+			status: writtenFields.length ? 'hit' : survey.exif?.length ? 'ready' : 'clear',
+			value: writtenFields.length
+				? `${writtenFields.length} written field${writtenFields.length === 1 ? '' : 's'}`
+				: survey.exif?.length
+					? `${survey.exif.length} fields`
+					: 'none'
+		},
+		{
+			id: 'jpeg',
+			name: 'JPEG segments',
+			measures: 'Lists every part of a JPEG',
+			scope: 'bytes',
+			status:
+				survey.jpegComments.length || survey.jpegTrailing ? 'hit' : jpegish ? 'ready' : 'clear',
+			value: survey.jpegComments.length
+				? `${survey.jpegComments.length} comment${survey.jpegComments.length === 1 ? '' : 's'}`
+				: survey.jpegTrailing
+					? `${survey.jpegTrailing.length.toLocaleString()} bytes past EOI`
+					: jpegish
+						? `${survey.jpegSegments.length} segments`
+						: 'not a JPEG'
+		},
+		{
 			id: 'entropy',
 			name: 'Entropy window',
 			measures: 'Finds compressed or encrypted regions',
@@ -147,6 +198,17 @@ export function tools(
 			value: structure?.text.length ? `${structure.text.length} found` : 'none'
 		}),
 		png({
+			id: 'palette',
+			name: 'Palette',
+			measures: 'Repeated colours that could carry hidden bits',
+			status: duplicateColours ? 'hit' : structure?.palette ? 'ready' : 'clear',
+			value: duplicateColours
+				? `${duplicateColours} duplicated`
+				: structure?.palette
+					? `${structure.palette.entries} colours`
+					: 'not an indexed image'
+		}),
+		png({
 			id: 'crc',
 			name: 'Chunk CRC',
 			measures: 'Checks each part against its own checksum',
@@ -162,11 +224,13 @@ export function tools(
 		}),
 		{
 			id: 'strings',
-			name: 'ASCII strings',
-			measures: 'Readable text anywhere in the file',
+			name: 'Readable text',
+			measures: 'Text anywhere in the file, plain or wide',
 			scope: 'bytes',
 			status: 'ready',
-			value: survey.strings.total.toLocaleString()
+			value: survey.strings.wide
+				? `${survey.strings.total.toLocaleString()}, ${survey.strings.wide} wide`
+				: survey.strings.total.toLocaleString()
 		},
 		png({
 			id: 'pixels',
@@ -181,14 +245,6 @@ export function tools(
 /** Named so the rack shows the whole instrument, not only the parts that work. */
 export const PLANNED: Tool[] = [
 	{
-		id: 'exif',
-		name: 'EXIF / TIFF',
-		measures: 'Camera and editing metadata',
-		scope: 'bytes',
-		status: 'pending',
-		value: ''
-	},
-	{
 		id: 'carve',
 		name: 'File carving',
 		measures: 'Pulls embedded files out to save',
@@ -197,9 +253,9 @@ export const PLANNED: Tool[] = [
 		value: ''
 	},
 	{
-		id: 'jpeg',
-		name: 'JPEG segments',
-		measures: 'Walks comments and app data in a JPEG',
+		id: 'wav',
+		name: 'Audio analysis',
+		measures: 'Hidden data and pictures inside sound files',
 		scope: 'bytes',
 		status: 'pending',
 		value: ''

@@ -43,6 +43,53 @@ pub fn ascii_strings(data: &[u8], min_len: usize) -> Vec<Found> {
     out
 }
 
+/// Runs of printable ASCII stored as UTF-16LE, which is how Windows tools write
+/// text. Each character occupies two bytes with a zero high byte, so a scan for
+/// single bytes walks straight past them.
+pub fn utf16le_strings(data: &[u8], min_len: usize) -> Vec<Found> {
+    let mut out = Vec::new();
+
+    // Both alignments: the run may start on an even or an odd offset.
+    for phase in 0..2usize {
+        let mut start = phase;
+        let mut run = 0usize;
+        let mut at = phase;
+
+        while at + 1 < data.len() {
+            let printable = printable(data[at]) && data[at + 1] == 0;
+
+            if printable {
+                if run == 0 {
+                    start = at;
+                }
+                run += 1;
+            } else {
+                if run >= min_len {
+                    out.push(Found {
+                        offset: start,
+                        text: data[start..at].iter().step_by(2).map(|&b| b as char).collect(),
+                    });
+                }
+                run = 0;
+            }
+
+            at += 2;
+        }
+
+        if run >= min_len {
+            out.push(Found {
+                offset: start,
+                text: data[start..].iter().step_by(2).map(|&b| b as char).collect(),
+            });
+        }
+    }
+
+    // A run found on both alignments is the same run; keep the earlier offset.
+    out.sort_by_key(|f| f.offset);
+    out.dedup_by(|a, b| a.offset.abs_diff(b.offset) <= 1 && a.text.len() == b.text.len());
+    out
+}
+
 fn tag_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
 }
@@ -297,6 +344,14 @@ pub fn longest_printable_run(data: &[u8]) -> (usize, usize) {
     best
 }
 
+/// Latin-1 with control bytes dropped, for metadata fields that claim to be text.
+pub fn latin1_lossy(data: &[u8]) -> String {
+    data.iter()
+        .filter(|&&b| b >= 0x20 || b == b'\n' || b == b'\t')
+        .map(|&b| b as char)
+        .collect()
+}
+
 /// How many distinct byte values a slice holds.
 ///
 /// The upper bit planes of a smooth image repeat a short cycle, so extracting
@@ -463,6 +518,39 @@ mod tests {
     fn ascii_strings_keeps_a_run_that_reaches_the_end() {
         let found = ascii_strings(b"\x00trailing", 4);
         assert_eq!(found[0].text, "trailing");
+    }
+
+    #[test]
+    fn utf16le_strings_reads_text_a_single_byte_scan_walks_past() {
+        let mut data = vec![0xffu8; 8];
+        for c in "flag{wide}".chars() {
+            data.push(c as u8);
+            data.push(0);
+        }
+        data.extend_from_slice(&[0xff; 8]);
+
+        let found = utf16le_strings(&data, 6);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].text, "flag{wide}");
+        assert_eq!(found[0].offset, 8);
+
+        assert!(ascii_strings(&data, 6).is_empty(), "the ascii scan misses it");
+    }
+
+    #[test]
+    fn utf16le_strings_finds_a_run_starting_on_an_odd_offset() {
+        let mut data = vec![0xffu8];
+        for c in "oddaligned".chars() {
+            data.push(c as u8);
+            data.push(0);
+        }
+        assert_eq!(utf16le_strings(&data, 6)[0].text, "oddaligned");
+    }
+
+    #[test]
+    fn utf16le_strings_ignores_plain_ascii_and_noise() {
+        assert!(utf16le_strings(b"just some plain ascii text here", 6).is_empty());
+        assert!(utf16le_strings(&noise(4096, 0x1234), 8).is_empty());
     }
 
     #[test]

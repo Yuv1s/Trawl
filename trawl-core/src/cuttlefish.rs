@@ -21,6 +21,9 @@ pub struct Params {
     pub channels: &'static str,
     pub bit: u8,
     pub msb_first: bool,
+    /// Down each column instead of along each row. Some encoders traverse this
+    /// way, and a payload written in one order is unreadable in the other.
+    pub column_major: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,11 +58,33 @@ pub fn extract(
     msb_first: bool,
     max_bytes: usize,
 ) -> Vec<u8> {
+    let pixels = rgba.len() / 4;
+    extract_ordered(rgba, channels, bit, msb_first, max_bytes, |i| i, pixels)
+}
+
+/// Reads pixels in an arbitrary order, which is what makes column-major possible
+/// without copying the whole raster into a second layout.
+///
+/// @param index maps a step number to a pixel index
+fn extract_ordered(
+    rgba: &[u8],
+    channels: &[usize],
+    bit: u8,
+    msb_first: bool,
+    max_bytes: usize,
+    index: impl Fn(usize) -> usize,
+    pixels: usize,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(max_bytes.min(1 << 16));
     let mut acc = 0u8;
     let mut filled = 0u8;
 
-    for pixel in rgba.chunks_exact(4) {
+    for step in 0..pixels {
+        let at = index(step) * 4;
+        let Some(pixel) = rgba.get(at..at + 4) else {
+            break;
+        };
+
         for &c in channels {
             let value = (pixel[c] >> bit) & 1;
             if msb_first {
@@ -81,6 +106,31 @@ pub fn extract(
     }
 
     out
+}
+
+/// Reads down each column rather than along each row.
+pub fn extract_columns(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    channels: &[usize],
+    bit: u8,
+    msb_first: bool,
+    max_bytes: usize,
+) -> Vec<u8> {
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    extract_ordered(
+        rgba,
+        channels,
+        bit,
+        msb_first,
+        max_bytes,
+        |step| (step % height) * width + step / height,
+        width * height,
+    )
 }
 
 /// Thresholds are chosen so random data clears them roughly once per fifty
@@ -133,7 +183,13 @@ fn assess(stream: &[u8]) -> Option<(String, String, usize)> {
 ///
 /// @param has_alpha skip alpha combinations when the source had no alpha channel,
 ///        since a synthesised 255 gives a constant plane and pure noise findings
-pub fn sweep(rgba: &[u8], has_alpha: bool, max_bytes: usize) -> Vec<Candidate> {
+pub fn sweep(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    has_alpha: bool,
+    max_bytes: usize,
+) -> Vec<Candidate> {
     let mut out = Vec::new();
 
     for (label, channels) in CHANNEL_SETS {
@@ -143,7 +199,12 @@ pub fn sweep(rgba: &[u8], has_alpha: bool, max_bytes: usize) -> Vec<Candidate> {
 
         for bit in 0..3u8 {
             for msb_first in [true, false] {
-                let stream = extract(rgba, channels, bit, msb_first, max_bytes);
+                for column_major in [false, true] {
+                let stream = if column_major {
+                    extract_columns(rgba, width, height, channels, bit, msb_first, max_bytes)
+                } else {
+                    extract(rgba, channels, bit, msb_first, max_bytes)
+                };
 
                 let flags: Vec<String> = bytes::flag_candidates(&stream)
                     .into_iter()
@@ -170,6 +231,7 @@ pub fn sweep(rgba: &[u8], has_alpha: bool, max_bytes: usize) -> Vec<Candidate> {
                         channels: label,
                         bit,
                         msb_first,
+                        column_major,
                     },
                     reason,
                     preview,
@@ -177,6 +239,7 @@ pub fn sweep(rgba: &[u8], has_alpha: bool, max_bytes: usize) -> Vec<Candidate> {
                     flags,
                     bytes_read: stream.len(),
                 });
+                }
             }
         }
     }
@@ -185,10 +248,16 @@ pub fn sweep(rgba: &[u8], has_alpha: bool, max_bytes: usize) -> Vec<Candidate> {
 }
 
 /// Sweep results as JSON, ready to leave the worker.
-pub fn sweep_json(rgba: &[u8], has_alpha: bool, max_bytes: usize) -> String {
+pub fn sweep_json(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    has_alpha: bool,
+    max_bytes: usize,
+) -> String {
     use crate::json::{push_bool, push_field, push_number, push_string};
 
-    let found = sweep(rgba, has_alpha, max_bytes);
+    let found = sweep(rgba, width, height, has_alpha, max_bytes);
     let mut out = String::from("{");
 
     push_number(&mut out, "pixels", rgba.len() / 4);
@@ -208,6 +277,8 @@ pub fn sweep_json(rgba: &[u8], has_alpha: bool, max_bytes: usize) -> String {
         push_number(&mut out, "bit", candidate.params.bit as usize);
         out.push(',');
         push_bool(&mut out, "msbFirst", candidate.params.msb_first);
+        out.push(',');
+        push_bool(&mut out, "columnMajor", candidate.params.column_major);
         out.push(',');
         push_field(&mut out, "reason", &candidate.reason);
         out.push(',');
@@ -232,12 +303,14 @@ pub fn sweep_json(rgba: &[u8], has_alpha: bool, max_bytes: usize) -> String {
     out
 }
 
+/// Channel sets, times three bit planes, times two bit orders, times two
+/// traversal directions.
 pub fn combination_count(has_alpha: bool) -> usize {
     let sets = CHANNEL_SETS
         .iter()
         .filter(|(_, ch)| has_alpha || !ch.contains(&3))
         .count();
-    sets * 3 * 2
+    sets * 3 * 2 * 2
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

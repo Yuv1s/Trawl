@@ -17,6 +17,16 @@ fn clean_cover(pixels: usize, seed: u32) -> Vec<u8> {
     (0..pixels * 4).map(|_| (next() & 0xff) as u8).collect()
 }
 
+/// Sweeps a buffer with no meaningful geometry. Height one makes column-major
+/// identical to row-major, which is what these tests want.
+fn sweep_flat(cover: &[u8], has_alpha: bool, max_bytes: usize) -> Vec<Candidate> {
+    sweep(cover, cover.len() / 4, 1, has_alpha, max_bytes)
+}
+
+fn sweep_json_flat(cover: &[u8], has_alpha: bool, max_bytes: usize) -> String {
+    sweep_json(cover, cover.len() / 4, 1, has_alpha, max_bytes)
+}
+
 /// The inverse of `extract`, so a test can plant a payload at known parameters.
 fn embed(rgba: &mut [u8], channels: &[usize], bit: u8, msb_first: bool, payload: &[u8]) {
     let mut bits = payload.iter().flat_map(|&byte| {
@@ -79,7 +89,7 @@ fn sweep_finds_a_planted_flag_and_names_the_parameters() {
     let mut cover = clean_cover(40_000, 0xabcd);
     embed(&mut cover, &[0, 1, 2], 0, true, b"flag{hello}\x00");
 
-    let found = sweep(&cover, false, 4096);
+    let found = sweep_flat(&cover, false, 4096);
     let hit = found
         .iter()
         .find(|c| c.flags.iter().any(|f| f == "flag{hello}"))
@@ -95,7 +105,7 @@ fn sweep_finds_a_planted_file_signature() {
     let mut cover = clean_cover(40_000, 0x4242);
     embed(&mut cover, &[2, 1, 0], 0, true, b"PK\x03\x04and then some archive");
 
-    let found = sweep(&cover, false, 4096);
+    let found = sweep_flat(&cover, false, 4096);
     assert!(
         found
             .iter()
@@ -115,7 +125,7 @@ fn sweep_finds_plain_text_with_no_flag_shape() {
         b"meet me behind the bike sheds at midnight",
     );
 
-    let found = sweep(&cover, false, 4096);
+    let found = sweep_flat(&cover, false, 4096);
     assert!(found.iter().any(|c| c.params.channels == "r"));
 }
 
@@ -144,7 +154,7 @@ fn gradient_cover(width: usize, height: usize, seed: u32) -> Vec<u8> {
 fn sweep_reports_nothing_on_a_clean_random_cover() {
     for seed in [0x1111u32, 0x2222, 0x3333, 0x4444, 0x5555, 0xfeed, 0xbeef] {
         let cover = clean_cover(40_000, seed);
-        let found = sweep(&cover, true, 4096);
+        let found = sweep_flat(&cover, true, 4096);
         assert!(
             found.is_empty(),
             "false positive on clean cover seed {seed:#x}: {found:?}"
@@ -158,7 +168,9 @@ fn sweep_reports_nothing_on_a_clean_random_cover() {
 fn sweep_reports_nothing_on_a_clean_gradient_cover() {
     for (w, h, seed) in [(200usize, 150usize, 0xaaaa_u32), (96, 96, 0x5eed), (320, 40, 0x1)] {
         let cover = gradient_cover(w, h, seed);
-        let found = sweep(&cover, true, 4096);
+        // Real geometry, so column-major traversal is exercised too. A gradient
+        // read down its columns is just as ordered as one read along its rows.
+        let found = sweep(&cover, w, h, true, 4096);
         assert!(
             found.is_empty(),
             "false positive on a {w}x{h} gradient: {found:?}"
@@ -167,11 +179,58 @@ fn sweep_reports_nothing_on_a_clean_gradient_cover() {
 }
 
 #[test]
+fn extract_columns_inverts_a_column_major_payload() {
+    let (w, h) = (64usize, 48usize);
+    let mut cover = gradient_cover(w, h, 0x2468);
+    let payload = b"written down the columns";
+
+    let mut bits = payload.iter().flat_map(|&byte| (0..8).map(move |i| (byte >> (7 - i)) & 1));
+    'outer: for step in 0..w * h {
+        let pixel = (step % h) * w + step / h;
+        for c in 0..3 {
+            let Some(bit) = bits.next() else { break 'outer };
+            cover[pixel * 4 + c] = (cover[pixel * 4 + c] & 0xfe) | bit;
+        }
+    }
+
+    let read = extract_columns(&cover, w, h, &[0, 1, 2], 0, true, payload.len());
+    assert_eq!(read, payload);
+
+    let row_major = extract(&cover, &[0, 1, 2], 0, true, payload.len());
+    assert_ne!(row_major, payload, "the two orders must not agree");
+}
+
+/// The parameter BUILD_PLAN names and the sweep skipped until now.
+#[test]
+fn the_sweep_finds_a_payload_written_down_the_columns() {
+    let (w, h) = (200usize, 150usize);
+    let mut cover = gradient_cover(w, h, 0x1357);
+
+    let payload = b"flag{column_major}\x00";
+    let mut bits = payload.iter().flat_map(|&byte| (0..8).map(move |i| (byte >> (7 - i)) & 1));
+    'outer: for step in 0..w * h {
+        let pixel = (step % h) * w + step / h;
+        for c in 0..3 {
+            let Some(bit) = bits.next() else { break 'outer };
+            cover[pixel * 4 + c] = (cover[pixel * 4 + c] & 0xfe) | bit;
+        }
+    }
+
+    let hit = sweep(&cover, w, h, true, 4096)
+        .into_iter()
+        .find(|c| c.flags.iter().any(|f| f == "flag{column_major}"))
+        .expect("column-major payload not recovered");
+
+    assert!(hit.params.column_major);
+    assert_eq!(hit.params.channels, "rgb");
+}
+
+#[test]
 fn sweep_still_finds_a_payload_hidden_in_a_gradient() {
     let mut cover = gradient_cover(200, 150, 0xaaaa);
     embed(&mut cover, &[0, 1, 2], 0, true, b"testCTF{hello}\x00");
 
-    let found = sweep(&cover, true, 4096);
+    let found = sweep_flat(&cover, true, 4096);
     assert!(
         found
             .iter()
@@ -185,16 +244,16 @@ fn a_long_run_of_one_repeated_character_is_not_a_payload() {
     let mut cover = gradient_cover(200, 150, 0x77);
     embed(&mut cover, &[0, 1, 2], 0, true, &[b'U'; 64]);
 
-    let found = sweep(&cover, true, 4096);
+    let found = sweep_flat(&cover, true, 4096);
     assert!(found.is_empty(), "structure was reported as a find: {found:?}");
 }
 
 #[test]
 fn sweep_skips_alpha_combinations_when_there_is_no_alpha_channel() {
     let cover = clean_cover(4_000, 0x31337);
-    assert_eq!(combination_count(false), 5 * 3 * 2);
-    assert_eq!(combination_count(true), 7 * 3 * 2);
-    assert!(sweep(&cover, false, 512).iter().all(|c| {
+    assert_eq!(combination_count(false), 5 * 3 * 2 * 2);
+    assert_eq!(combination_count(true), 7 * 3 * 2 * 2);
+    assert!(sweep_flat(&cover, false, 512).iter().all(|c| {
         c.params.channels != "a" && c.params.channels != "rgba"
     }));
 }
@@ -204,12 +263,13 @@ fn sweep_json_is_shaped_for_the_worker() {
     let mut cover = clean_cover(40_000, 0xc0ffee);
     embed(&mut cover, &[0, 1, 2], 0, true, b"flag{json}\x00");
 
-    let json = sweep_json(&cover, false, 4096);
+    let json = sweep_json_flat(&cover, false, 4096);
     assert!(json.starts_with('{') && json.ends_with('}'));
     assert!(json.contains("\"channels\":\"rgb\""));
     assert!(json.contains("\"msbFirst\":true"));
     assert!(json.contains("flag{json}"));
-    assert!(json.contains("\"combinations\":30"));
+    assert!(json.contains("\"combinations\":60"));
+    assert!(json.contains("\"columnMajor\":false"));
 }
 
 /// Regression: the preview was capped at 96 characters with nothing saying so,
@@ -220,7 +280,7 @@ fn a_long_message_reports_its_true_length_even_when_the_preview_clips() {
     let mut cover = clean_cover(200_000, 0x2024);
     embed(&mut cover, &[0, 1, 2], 0, true, message.as_bytes());
 
-    let found = sweep(&cover, false, 4096);
+    let found = sweep_flat(&cover, false, 4096);
     let hit = found
         .iter()
         .find(|c| c.params.channels == "rgb" && c.params.bit == 0 && c.params.msb_first)
@@ -236,7 +296,7 @@ fn a_short_message_is_previewed_whole() {
     let mut cover = clean_cover(40_000, 0x2025);
     embed(&mut cover, &[0, 1, 2], 0, true, b"short and complete\x00");
 
-    let hit = sweep(&cover, false, 4096)
+    let hit = sweep_flat(&cover, false, 4096)
         .into_iter()
         .find(|c| c.preview.starts_with("short and complete"))
         .expect("message not found");

@@ -12,6 +12,18 @@ export type TextChunk = {
 	keyword: string;
 	text: string;
 	compressed: boolean;
+	/** Where the zlib stream sits, so the worker can inflate it. */
+	payloadOffset: number;
+	payloadLength: number;
+	/** Set when inflation was attempted and failed. */
+	error?: string;
+};
+
+export type Palette = {
+	entries: number;
+	unused: number;
+	capacityBits: number;
+	duplicates: { colour: string; count: number }[];
 };
 
 export type Header =
@@ -29,13 +41,34 @@ export type MagicHit = {
 	embedded: boolean;
 };
 
+export type ExifEntry = {
+	ifd: string;
+	tag: number;
+	name: string;
+	value: string;
+	/** True when the value is text a person could have written. */
+	textual: boolean;
+};
+
+export type JpegSegment = {
+	name: string;
+	marker: number;
+	offset: number;
+	length: number;
+};
+
 /** What can be read from any file, whatever its format. */
 export type Survey = {
 	size: number;
 	format: string | null;
 	flags: FlagHit[];
 	magic: MagicHit[];
-	strings: { total: number; sample: Found[] };
+	/** Null when the file carries no metadata block at all. */
+	exif: ExifEntry[] | null;
+	jpegSegments: JpegSegment[];
+	jpegComments: Found[];
+	jpegTrailing: { offset: number; length: number } | null;
+	strings: { total: number; wide: number; sample: Found[] };
 	entropy: { window: number; values: number[] };
 };
 
@@ -69,8 +102,9 @@ export type Structure = {
 	chunks: Chunk[];
 	text: TextChunk[];
 	flags: FlagHit[];
-	strings: { total: number; sample: Found[] };
 	trailing: { offset: number; length: number } | null;
+	/** Filled in by the worker for indexed images. */
+	palette?: Palette | null;
 };
 
 export type ChiPoint = {
