@@ -1,6 +1,7 @@
 <script lang="ts">
 	import AnalysisWorker from '$lib/worker/analysis.worker?worker';
 	import DropSurface from '$lib/components/DropSurface.svelte';
+	import PeelPanel from '$lib/components/PeelPanel.svelte';
 	import Logo from '$lib/components/Logo.svelte';
 	import ToolRack from '$lib/components/ToolRack.svelte';
 	import Recovered from '$lib/components/Recovered.svelte';
@@ -24,16 +25,23 @@
 		COLOR_TYPES,
 		isHeaderError,
 		isJpegError,
-		type AnalysisResponse
+		type AnalysisResponse,
+		type PeelResult
 	} from '$lib/worker/protocol';
 
-	/** Plane and extract responses update a panel; they never become the page state. */
-	type Analysis = Exclude<AnalysisResponse, { status: 'plane' } | { status: 'extract' }>;
+	/** Plane, extract and peel responses update a panel or open their own view;
+	 *  none of them become the file-analysis state. */
+	type Analysis = Exclude<
+		AnalysisResponse,
+		{ status: 'plane' } | { status: 'extract' } | { status: 'peel' }
+	>;
 
 	type View =
 		| { phase: 'idle' }
 		| { phase: 'working'; name: string }
-		| { phase: 'done'; result: Analysis; bytes: Uint8Array };
+		| { phase: 'done'; result: Analysis; bytes: Uint8Array }
+		/** A pasted string, which has no file behind it and no tool rack. */
+		| { phase: 'text'; input: string; peel: PeelResult };
 
 	let view = $state<View>({ phase: 'idle' });
 	let activeTool = $state('flags');
@@ -51,6 +59,11 @@
 			worker.addEventListener('message', (event: MessageEvent<AnalysisResponse>) => {
 				const result = event.data;
 				if (result.id !== ticket) return;
+
+				if (result.status === 'peel') {
+					view = { phase: 'text', input: result.input, peel: result.peel };
+					return;
+				}
 
 				if (result.status === 'plane') {
 					if (openPlane?.channel === result.channel && openPlane?.bit === result.bit) {
@@ -119,6 +132,12 @@
 			});
 		}
 		return worker;
+	}
+
+	function acceptText(text: string) {
+		const id = ++ticket;
+		view = { phase: 'working', name: 'pasted text' };
+		ensureWorker().postMessage({ kind: 'peel', id, text });
 	}
 
 	async function accept(file: File) {
@@ -384,7 +403,9 @@
 </svelte:head>
 
 {#if view.phase === 'idle'}
-	<DropSurface onfile={accept} />
+	<DropSurface onfile={accept} ontext={acceptText} />
+{:else if view.phase === 'text'}
+	<PeelPanel input={view.input} peel={view.peel} onreset={reset} />
 {:else}
 	<div
 		class="shell"

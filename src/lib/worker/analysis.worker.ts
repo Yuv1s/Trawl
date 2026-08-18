@@ -13,6 +13,7 @@ import init, {
 	jpeg_stego_extract,
 	palette_extract,
 	palette_stego,
+	peel_encodings,
 	rs_analysis,
 	wav_lsb_extract,
 	wav_lsb_sweep,
@@ -28,6 +29,7 @@ import type {
 	JpegError,
 	JpegStego,
 	PaletteStego,
+	PeelResult,
 	PlaneWall,
 	RsAnalysis,
 	Spectrogram,
@@ -239,6 +241,18 @@ async function extract(
 	};
 }
 
+/** Mantis. The only request that carries no file: a string is the whole subject. */
+async function peelText(id: number, text: string): Promise<AnalysisResponse> {
+	await ready;
+
+	return {
+		id,
+		status: 'peel',
+		input: text,
+		peel: JSON.parse(peel_encodings(new TextEncoder().encode(text))) as PeelResult
+	};
+}
+
 async function extractPalette(id: number, msbFirst: boolean): Promise<AnalysisResponse> {
 	await ready;
 	if (!cached) throw new Error('No file is loaded.');
@@ -291,23 +305,25 @@ self.addEventListener('message', (event: MessageEvent<AnalysisRequest>) => {
 	const request = event.data;
 
 	const work =
-		request.kind === 'plane'
-			? requestPlane(request.id, request.channel, request.bit)
-			: request.kind === 'extract'
-				? extract(request.id, request.channels, request.bit, request.msbFirst)
-				: request.kind === 'extractPalette'
-					? extractPalette(request.id, request.msbFirst)
-					: request.kind === 'extractJpeg'
-						? extractJpeg(request.id, request.includeDc, request.msbFirst)
-						: request.kind === 'extractAudio'
-							? extractAudio(
-									request.id,
-									request.label,
-									request.channelIndex,
-									request.bit,
-									request.msbFirst
-								)
-							: analyse(request.id, request.name, new Uint8Array(request.bytes));
+		request.kind === 'peel'
+			? peelText(request.id, request.text)
+			: request.kind === 'plane'
+				? requestPlane(request.id, request.channel, request.bit)
+				: request.kind === 'extract'
+					? extract(request.id, request.channels, request.bit, request.msbFirst)
+					: request.kind === 'extractPalette'
+						? extractPalette(request.id, request.msbFirst)
+						: request.kind === 'extractJpeg'
+							? extractJpeg(request.id, request.includeDc, request.msbFirst)
+							: request.kind === 'extractAudio'
+								? extractAudio(
+										request.id,
+										request.label,
+										request.channelIndex,
+										request.bit,
+										request.msbFirst
+									)
+								: analyse(request.id, request.name, new Uint8Array(request.bytes));
 
 	work
 		.then((response) => self.postMessage(response))

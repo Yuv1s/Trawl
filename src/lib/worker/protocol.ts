@@ -147,6 +147,22 @@ export function isJpegError(jpeg: JpegStego | JpegError): jpeg is JpegError {
 	return 'error' in jpeg;
 }
 
+/** One encoding layer removed from a pasted string. */
+export type PeelStep = {
+	encoding: string;
+	/** Why it was kept: a gain in readability, a flag, or a file signature. */
+	reason: string;
+	output: string;
+};
+
+export type PeelResult = {
+	depth: number;
+	/** How much the final answer reads like ordinary text, 0 to 1. */
+	score: number;
+	result: string;
+	steps: PeelStep[];
+};
+
 export type PaletteGroup = {
 	colour: string;
 	copies: number;
@@ -279,6 +295,7 @@ export type AnalysisRequest =
 	| { kind: 'analyse'; id: number; name: string; bytes: ArrayBuffer }
 	| { kind: 'plane'; id: number; channel: number; bit: number }
 	| { kind: 'extract'; id: number; channels: string; bit: number; msbFirst: boolean }
+	| { kind: 'peel'; id: number; text: string }
 	| { kind: 'extractPalette'; id: number; msbFirst: boolean }
 	| {
 			kind: 'extractJpeg';
@@ -319,6 +336,7 @@ export type AnalysisResponse =
 			pixelError: string | null;
 			audioError: string | null;
 	  }
+	| { id: number; status: 'peel'; input: string; peel: PeelResult }
 	| { id: number; status: 'plane'; channel: number; bit: number; pixels: Uint8Array }
 	| { id: number; status: 'extract'; label: string; bytes: Uint8Array }
 	| { id: number; status: 'error'; name: string; size: number; detail: string };

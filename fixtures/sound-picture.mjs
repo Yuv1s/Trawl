@@ -197,8 +197,25 @@ function wav(frames, rate) {
 	return Buffer.concat([head, body]);
 }
 
-const out = join(dirname(imagePath), `${basename(imagePath, extname(imagePath))}.wav`);
-writeFileSync(out, wav(pcm, RATE));
+const name = `${basename(imagePath, extname(imagePath))}.wav`;
+const audio = wav(pcm, RATE);
+
+/**
+ * Next to the picture, or the working directory if that is not writable.
+ *
+ * Windows refuses writes to a drive root without administrator rights, so an
+ * image sitting at `C:\` would otherwise stop the script dead after all the work
+ * was already done.
+ */
+let out = join(dirname(imagePath), name);
+try {
+	writeFileSync(out, audio);
+} catch (error) {
+	if (error.code !== 'EPERM' && error.code !== 'EACCES') throw error;
+	out = join(process.cwd(), name);
+	console.log(`cannot write next to the picture (${error.code}), using this folder instead`);
+	writeFileSync(out, audio);
+}
 
 console.log(
 	`${basename(imagePath)}: ${sourceWidth} x ${sourceHeight}, drawn at ${width} x ${height}`

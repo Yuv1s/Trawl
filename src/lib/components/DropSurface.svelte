@@ -3,24 +3,67 @@
 	import Logo from '$lib/components/Logo.svelte';
 	import { PLANNED } from '$lib/analysis/tools';
 
-	let { onfile }: { onfile: (file: File) => void } = $props();
+	let { onfile, ontext }: { onfile: (file: File) => void; ontext: (text: string) => void } =
+		$props();
 
 	let dragging = $state(false);
 	let depth = 0;
+	let pasted = $state('');
 
-	const READY = [
-		['Flag scan', 'Looks for flag{...} text in the file'],
-		['LSB sweep', 'Tries every way of reading hidden bits'],
-		['Chi-square attack', 'Statistical test for a hidden payload'],
-		['RS analysis', 'Second opinion on how much is hidden'],
-		['Bit-plane wall', 'Shows each layer of bits as a picture'],
-		['Post-IEND data', 'Extra bytes stuck on the end of the file'],
-		['Text chunks', 'Comments and labels saved inside the image'],
-		['Chunk CRC', 'Checks each part against its own checksum'],
-		['Chunk walk', 'Lists every part of the file'],
-		['ASCII strings', 'Readable text anywhere in the file'],
-		['Pixel decode', 'Reads exact pixel values, nothing altered']
+	/** Long enough that a stray word does not launch an analysis. */
+	const MIN_TEXT = 6;
+	const ready = $derived(pasted.trim().length >= MIN_TEXT);
+
+	function submit(event: SubmitEvent) {
+		event.preventDefault();
+		if (ready) ontext(pasted.trim());
+	}
+
+	/**
+	 * What the page can actually do, grouped the way the workbench groups it.
+	 *
+	 * Written out rather than derived, because there is no file here to run
+	 * anything against. That makes it a promise, so it has to stay true: every
+	 * line below is a tool that exists.
+	 */
+	const GROUPS: { name: string; blurb: string; tools: [string, string][] }[] = [
+		{
+			name: 'Cuttlefish',
+			blurb: 'Runs on an image or a sound file',
+			tools: [
+				['LSB sweep', 'Tries every way of reading hidden bits'],
+				['Bit-plane wall', 'Shows each layer of bits as a picture'],
+				['Chi-square attack', 'Statistical test for a hidden payload'],
+				['RS analysis', 'Second opinion on how much is hidden'],
+				['Spectrogram', 'Draws the sound, in case a picture is hiding in it'],
+				['Audio LSB sweep', 'Hidden bits in the samples of a sound file'],
+				['JSteg sweep', 'Reads hidden bits out of a JPEG after compression'],
+				['Palette', 'Repeated colours that carry hidden bits']
+			]
+		},
+		{
+			name: 'Survey',
+			blurb: 'Runs on any file you drop',
+			tools: [
+				['Flag scan', 'Looks for flag{...} text in the file'],
+				['Embedded files', 'Finds files hidden inside this one, and saves them'],
+				['Metadata', 'Camera details and notes saved with the photo'],
+				['Entropy window', 'Finds compressed or encrypted regions'],
+				['Chunk walk', 'Lists every part of the file'],
+				['Readable text', 'Text anywhere in the file, plain or wide']
+			]
+		},
+		{
+			name: 'Mantis',
+			blurb: 'Runs on a string you paste',
+			tools: [
+				['Encoding peeler', 'Unwraps base64, hex, morse and ten more, layer by layer'],
+				['Caesar solver', 'Tries every shift and keeps the one that reads']
+			]
+		}
 	];
+
+	const total = GROUPS.reduce((n, group) => n + group.tools.length, 0);
 
 	function enter(event: DragEvent) {
 		event.preventDefault();
@@ -49,9 +92,28 @@
 		input.value = '';
 	}
 
+	/**
+	 * A file if the clipboard holds one, otherwise the text goes to the box.
+	 *
+	 * Pasting anywhere on the page is how people already start here, and until now
+	 * that only worked for files. Typing into the box has to keep working, so a
+	 * paste aimed at it is left alone.
+	 */
 	function paste(event: ClipboardEvent) {
 		const file = event.clipboardData?.files?.[0];
-		if (file) onfile(file);
+		if (file) {
+			onfile(file);
+			return;
+		}
+
+		if ((event.target as HTMLElement | null)?.tagName === 'TEXTAREA') return;
+
+		const text = event.clipboardData?.getData('text')?.trim();
+		if (text && text.length >= MIN_TEXT) {
+			event.preventDefault();
+			pasted = text;
+			ontext(text);
+		}
 	}
 </script>
 
@@ -69,7 +131,7 @@
 	<header>
 		<h1><Logo size={44} /><span>Trawl</span></h1>
 		<p class="lede">
-			Every tool for a file-based CTF challenge, running at once, in this tab. Nothing is uploaded.
+			{total} tools for a CTF challenge, running at once, in this tab. Nothing is uploaded.
 		</p>
 
 		<label class="pick" class:armed={dragging}>
@@ -77,22 +139,35 @@
 			<span>{dragging ? 'Release to analyse' : 'Select a file'}</span>
 		</label>
 		<span class="alt">or drop one anywhere, or paste from the clipboard</span>
+
+		<form class="decode" onsubmit={submit}>
+			<label class="label" for="paste">Or paste a string to decode</label>
+			<textarea
+				id="paste"
+				bind:value={pasted}
+				rows="2"
+				spellcheck="false"
+				placeholder="SGVsbG8sIHdvcmxkIQ=="></textarea>
+			<button type="submit" disabled={!ready}>Peel it</button>
+		</form>
 	</header>
 
 	<div class="rack">
-		<div class="rack-head">
-			<h2 class="label">Runs on drop</h2>
-			<span class="label count mono">{READY.length} tools</span>
-		</div>
-		<ul>
-			{#each READY as [name, measures] (name)}
-				<li>
-					<span class="name">{name}</span>
-					<span class="measures">{measures}</span>
-					<span class="state mono">idle</span>
-				</li>
-			{/each}
-		</ul>
+		{#each GROUPS as group (group.name)}
+			<div class="rack-head">
+				<h2 class="label">{group.name}</h2>
+				<span class="label count mono">{group.blurb}</span>
+			</div>
+			<ul>
+				{#each group.tools as [name, measures] (name)}
+					<li>
+						<span class="name">{name}</span>
+						<span class="measures">{measures}</span>
+						<span class="state mono">idle</span>
+					</li>
+				{/each}
+			</ul>
+		{/each}
 
 		<div class="rack-head sub">
 			<h2 class="label">Not built yet</h2>
@@ -201,6 +276,55 @@
 		color: var(--muted);
 	}
 
+	.decode {
+		display: grid;
+		gap: var(--s2);
+		margin-top: var(--s5);
+		padding-top: var(--s4);
+		border-top: 1px solid var(--rule);
+	}
+
+	.decode textarea {
+		width: 100%;
+		resize: vertical;
+		background: var(--panel);
+		border: 1px solid var(--rule-bright);
+		border-radius: var(--radius);
+		color: var(--text);
+		font-family: var(--mono);
+		font-size: var(--t-data);
+		line-height: 1.5;
+		padding: var(--s2) var(--s3);
+	}
+
+	.decode textarea::placeholder {
+		color: var(--muted);
+	}
+
+	.decode button {
+		justify-self: start;
+		background: none;
+		border: 1px solid var(--rule-bright);
+		border-radius: var(--radius);
+		color: var(--text);
+		font: inherit;
+		font-size: var(--t-label);
+		padding: var(--s2) var(--s4);
+		cursor: pointer;
+		transition:
+			background-color 140ms var(--ease),
+			opacity 140ms var(--ease);
+	}
+
+	.decode button:hover:not(:disabled) {
+		background: var(--panel-lift);
+	}
+
+	.decode button:disabled {
+		opacity: 0.45;
+		cursor: default;
+	}
+
 	.rack {
 		align-self: stretch;
 		min-height: 0;
@@ -222,7 +346,9 @@
 		top: 0;
 	}
 
-	.sub {
+	/* Each group after the first gets a rule above it, so the rack reads as
+	   three instruments rather than one long list. */
+	ul + .rack-head {
 		border-top: 1px solid var(--rule);
 	}
 

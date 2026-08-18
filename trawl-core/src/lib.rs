@@ -12,6 +12,7 @@ pub mod exif;
 pub mod gif;
 pub mod jpeg;
 pub mod json;
+pub mod mantis;
 pub mod pixels;
 pub mod png;
 pub mod spectrogram;
@@ -194,6 +195,15 @@ pub fn png_dimensions(file: &[u8]) -> Result<Vec<u32>, JsError> {
     png::header(file)
         .map(|h| vec![h.width, h.height])
         .map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// Peels encoding layers off a pasted string, as JSON.
+///
+/// Reports the chain it followed and what fell out at the end, or an empty chain
+/// when nothing it tried made the input more readable than it already was.
+#[wasm_bindgen]
+pub fn peel_encodings(data: &[u8]) -> String {
+    mantis::json(data)
 }
 
 /// JPEG coefficient analysis as JSON: the chi-square attack, the coefficient

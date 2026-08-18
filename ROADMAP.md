@@ -27,12 +27,12 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 
 ## Next
 
-Nothing here is started.
+### Mantis, the cryptography half
 
-### Cryptography
-
-- [ ] Spot an encoding and peel it, over and over, until plain text falls out
-- [ ] Caesar, Vigenère, and substitution, solved rather than just applied
+- [x] Spot an encoding and peel it, over and over, until plain text falls out
+- [x] Caesar, solved rather than applied: every shift tried, the readable one kept
+- [ ] Vigenère and substitution, which need a stronger language model than the
+      word list the peeler uses
 - [ ] XOR key recovery
 - [ ] RSA weaknesses that turn up in competitions
 - [ ] Hash identification
