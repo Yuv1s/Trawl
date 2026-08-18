@@ -8,6 +8,7 @@ node_modules
 /.svelte-kit
 /build
 CLAUDE.md
+testImgs/
 
 # wasm-pack output — generated from trawl-core by `npm run build:wasm`
 /src/lib/wasm

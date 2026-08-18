@@ -1,247 +1,110 @@
 # Trawl
 
-A local toolkit for the file-based CTF categories: steganography, cryptography, and forensics. Drop
-a file or paste a string, and every relevant check runs in your browser. Nothing is uploaded.
+Drop a file into the page and Trawl looks for whatever is hidden in it. Nothing
+leaves your computer.
 
-> **Status: in development.** This document describes what Trawl is being built to do. See the
-> [roadmap](#roadmap) for what currently works.
+It is built for capture-the-flag competitions, where a puzzle often arrives as
+an ordinary-looking image or sound file with a message buried inside it.
 
----
+**Status: in development.** [ROADMAP.md](ROADMAP.md) has the current state. The
+steganography half works. Cryptography and forensics are not started.
 
-## The problem
+## What it is for
 
-When a competition hands you a suspicious PNG, the real workflow looks like this:
+A competition hands you a photo. Somewhere in it, someone has hidden a password.
+It is not written in the picture, it is written into the numbers the picture is
+made of, so looking at the image tells you nothing.
 
-```
-$ exiftool chal.png          # metadata
-$ strings chal.png | less    # eyeball for flags
-$ binwalk chal.png           # appended files
-$ zsteg -a chal.png          # brute-force LSB parameters
-$ steghide extract -sf ...   # if it's JPEG and passworded
-$ java -jar stegsolve.jar    # bit planes, in a 2011 Java applet
-```
+The usual answer is four or five separate programs, in three languages, each
+installed separately, none of which talk to each other. One is an abandoned Java
+applet from 2011. For someone who has done it before, that is fifteen minutes of
+habit. For a beginner it is the reason they skip the category.
 
-Six tools, five interfaces, three languages, and every one has to be installed first. zsteg is Ruby
-and only reads PNG and BMP. StegSolve is an unmaintained Java applet. binwalk returns a wall of
-false positives. None of them talk to each other, and none of them tell you where to look first.
+Trawl runs the same checks from one page, and tells you which one found
+something.
 
-Crypto is the same story with different names. CyberChef in one tab, a Python REPL with
-pycryptodome in another, RsaCtfTool in a third, and whatever substitution solver you bookmarked two
-years ago.
+## What it can do today
 
-For an experienced player that is fifteen minutes of muscle memory. For a beginner it is the reason
-they skip forensics and crypto entirely, because they do not know the tools exist, let alone which
-one to reach for.
+Drop in a PNG, BMP, GIF, WAV or JPEG and it runs everything that applies.
 
-Trawl runs all of it from one page, on files that stay on your machine.
+It reads what the file says about itself: hidden text, camera metadata, other
+files buried inside it, and anything stuck on the end where a viewer would never
+look. Buried files can be saved out with one click.
 
-## Why not upload it to an AI
+Then Cuttlefish, the steganography half, goes after the data itself. It shows
+every layer of an image at once so an odd one stands out. It tries up to 84 different
+ways of reading hidden bits rather than making you guess which. Two published
+statistical tests estimate how much of a file is carrying a payload. Sound files
+get the same bit-level treatment, plus a spectrogram, because drawing a picture
+into audio is a common trick and it only shows up when you look at the sound
+instead of listening to it. JPEGs get their compressed numbers read directly,
+which is where JPEG payloads live, whether the file is an ordinary one or the
+progressive kind that loads in passes. Images that paint by numbers get their
+palette read too, since two entries holding the same colour let a pixel pick
+either one and that choice carries a message no viewer can show you.
 
-The model never receives your file. It receives a small resampled copy of the picture, and in a
-steganography challenge the answer is not in the picture. It is in the bytes.
+Everything found collects in the Cod-end, the panel at the top of the page.
 
-### What upload does to your image
+## What it will not tell you
 
-Every vision model runs the same preprocessing before any part of the network sees anything.
+Trawl never claims to have found a flag it has not actually checked. When a
+result is uncertain it says what it measured and lets you decide.
 
-1. **Decode.** Your PNG is inflated and unfiltered into a raster. The container is discarded here,
-   along with appended ZIPs, `tEXt` chunks, and anything sitting after `IEND`.
-2. **Resample.** The raster is scaled to fit the model's input budget. Each output pixel becomes a
-   weighted average of several input pixels. Averaging neighboring values does not preserve the low
-   bit of any of them, so an LSB payload does not survive this step.
-3. **Normalize.** Values become floats and are rescaled. Bit planes are only meaningful on integers,
-   so they stop existing here.
-4. **Patch and project.** The result is cut into a grid of patches, and each patch is flattened and
-   multiplied into a single embedding vector.
+Every detector is tested against files with a known answer, and also against
+clean files, to make sure it stays quiet when there is nothing there. That
+second half matters more than it sounds. A tool that reports something on every
+file is no better than one that reports nothing.
 
-Step 4 holds even if you defeat the first three. Hand the model a native-resolution image with no
-resizing, and the patch projection still collapses hundreds of subpixel values into one vector of a
-few hundred dimensions. That operation has no inverse. Nothing downstream can ask for bit 0 of the
-blue channel at pixel (417, 92), because that number was never encoded.
+## Why not just upload it to an AI
 
-The model is not refusing to check the bit plane. There is no mechanism by which it could.
+Because the model never receives your file.
 
-### The arithmetic
+Before any part of the network sees an image, it is decoded, shrunk, and turned
+into averages. Shrinking replaces each pixel with a blend of its neighbours, and
+a blend of two numbers does not preserve the last digit of either. The hidden
+message is in those last digits. It is gone before the model starts reading.
 
-A 12-megapixel PNG holds 36 million least significant bits, which is roughly 4.5 MB of hiding
-capacity. Here is what survives the trip.
+So the answer you get back is either an honest "I cannot see that", or a
+confident invented one. Under a competition clock, the second costs you real
+time.
 
-| Per analysis                | Trawl                | Upload to a vision model     |
-| --------------------------- | -------------------- | ---------------------------- |
-| LSBs the analysis can read  | 36,000,000           | 0                            |
-| Tokens spent                | 0                    | ~1,500                       |
-| Bytes sent over the network | 0                    | the whole file               |
-| Original file preserved     | Exact, byte for byte | Resampled before first layer |
-| Cost to run it again        | 0                    | Billed again, every time     |
+An assistant that can run code is a different case. It can read the bytes. What
+it produces is a fresh, untested program every time, and a program that finds
+nothing because it has a bug looks exactly like a file with nothing in it.
 
-The token figure comes from published tiling formulas. A 12-megapixel image is scaled to about one
-megapixel and split into a few thousand patches. Those tokens are not a compressed encoding of the
-36 million bits. Step 2 averaged the bits away, and no amount of prompting recovers them from what
-is left.
+## Everything runs on your machine
 
-Ask anyway and you get one of two answers. Either an honest "I can't extract that", or a confident,
-well-formatted, invented flag. Under a competition clock the second one costs you real time.
+There is no server, no upload, no account, no tracking. After the page loads
+once it works with the network unplugged. Your file is opened read-only and
+never changed.
 
-### The caveat people will raise
-
-An assistant with code execution can bypass its own vision pipeline, write a script, and read the
-bytes directly. That works, and it is worth being straight about it.
-
-What it produces is a fresh implementation on every run, written by a process that cannot check its
-own work. A first attempt that sweeps only one bit per channel returns a clean, confident nothing on
-a file that does have a payload, and that failure looks identical to a correct negative. Silence
-from an untested decoder tells you the script found nothing, which is a much weaker claim than the
-file being clean.
-
-Trawl's detectors are fixed, tested against fixtures with known embedding rates, and asserted not to
-fire on clean inputs. When it reports 25 percent sequential LSB embedding, that number comes from a
-chi-square test whose source you can read and whose fixtures you can regenerate. When it reports
-nothing, the negative has been tested too.
-
-### Everything runs on your machine
-
-There is no backend. No upload endpoint, no API key, no account, no telemetry. Analysis runs in a
-Web Worker against a Rust core compiled to WebAssembly, so the arithmetic runs at native speed in
-your tab with nothing to wait on but your own CPU. After the first load it works with the network
-cable pulled.
-
-Files are opened read-only and never modified.
-
-That also settles a rules question. Most competitions restrict redistributing challenge files
-outside the event, and uploading one to a third-party API is arguably exactly that. Trawl has
-nowhere to send it.
-
-|                                      | Trawl | Chat upload (no code execution) | zsteg / StegSolve / binwalk |
-| ------------------------------------ | ----- | ------------------------------- | --------------------------- |
-| Reads least significant bits         | Yes   | No, destroyed in preprocessing  | Yes                         |
-| Deterministic and reproducible       | Yes   | No                              | Yes                         |
-| Tested false-positive rate           | Yes   | No                              | Varies                      |
-| File leaves your machine             | Never | Every time                      | Never                       |
-| Tokens and cost per run              | None  | Billed on every re-run          | None                        |
-| Tools to install                     | None  | None                            | Four, in three languages    |
-| Works offline                        | Yes   | No                              | Yes                         |
-| Explains what it found and why       | Yes   | Yes                             | Not really                  |
-| One interface for the whole workflow | Yes   | Yes                             | No                          |
-
-An assistant _with_ code execution is the different case covered above. It can read the bytes, but
-each run is a new untested implementation.
-
-## What Trawl does
-
-### Steganography
-
-The steganography module is called Cuttlefish, and it is the part furthest along.
-
-Container analysis reads raw bytes and does not depend on decoding the image at all. It scans the
-entire buffer for file signatures instead of only offset zero, flags data sitting after PNG `IEND`,
-JPEG `FFD9`, and the ZIP end-of-central-directory record, walks PNG chunks with `tEXt`, `zTXt` and
-`iTXt` decoded, walks JPEG `COM` and `APPn` segments, plots Shannon entropy over a sliding window so
-an appended compressed blob shows up as a high-entropy tail, extracts ASCII and UTF-16LE strings,
-and parses EXIF through a hand-written IFD walker.
-
-Pixel analysis renders all 8 bit planes across every channel at once, so an anomalous plane stands
-out from a field of noise without you having to guess which one to open first. The LSB parameter
-sweep covers channel order, bit order, bit plane, and traversal direction, which is `zsteg -a` with
-the results laid out visually.
-
-Steganalysis is statistical rather than pattern matching. The chi-square attack (Westfeld and
-Pfitzmann, 1999) uses the fact that sequential LSB embedding equalizes the frequencies of pairs of
-values. Run over increasing prefixes of the image, the point where embedding stops appears as a
-cliff, which also estimates payload length. RS analysis (Fridrich, Goljan and Du, 2001) classifies
-pixel groups under flipping masks and estimates the embedding rate instead of answering yes or no.
-
-### Cryptography
-
-Paste a string and Trawl works out what it is before you have to.
-
-Encoding chains are detected and peeled automatically, covering base64, base32, base85, hex, URL,
-HTML entities, ROT47, morse, and binary, applied repeatedly until the output stops looking encoded.
-
-Classical ciphers get solved rather than merely applied. Caesar and ROT-N are scored across all
-shifts against English quadgram frequencies. Vigenère key length comes from index of coincidence and
-Kasiski examination, and then each column is solved independently. Simple substitution is attacked
-by hill climbing against the same quadgram model. XOR handles single byte and repeating key, with
-key length recovered through normalized Hamming distance.
-
-RSA covers the weaknesses that actually show up in competition: small public exponent with an
-integer cube root, shared factors between two moduli found by GCD, Fermat factorization when the
-primes sit too close together, and Wiener's attack when d is small. All of it runs on native BigInt.
-
-Hash identification works from length and alphabet. SHA-1 through SHA-512 come from SubtleCrypto.
-
-### Forensics
-
-File carving scans for signatures across the whole buffer and extracts what it finds, instead of
-printing an offset and leaving you to `dd` it out.
-
-ZIP archives get a central directory walk that reports encrypted entries, size mismatches, and
-comment fields. PDFs get an object and stream walk.
-
-Windows registry hives are parsed by a hand-written reader aimed at USB device artifacts: `USBSTOR`
-entries, mounted device GUIDs, and the timestamps that place a specific device on a specific machine
-at a specific time.
-
-### How results are presented
-
-One drop runs everything. Detectors fire in parallel and results stream in as they finish.
-
-When an extraction produces something that verifies itself, Trawl puts the answer at the top.
-Printable ASCII above a length threshold, a match against common flag formats, or a valid file
-signature all count as verification.
-
-When nothing verifies, you get ranked findings instead of a guess. Each finding states what was
-measured and what it means, sorted by how suspicious it is, with routine results collapsed.
-"Chi-square indicates sequential LSB embedding in the first 34 percent of the image" belongs at the
-top. "File has an sRGB chunk" belongs at the bottom, collapsed.
-
-Trawl never asserts a flag it cannot verify. An empty result says what was checked and found clean.
+That also settles a rules question. Most competitions forbid passing challenge
+files to outside services, and Trawl has nowhere to send yours.
 
 ## How it works
 
-The analysis core is Rust compiled to WebAssembly, running in a Web Worker so the interface stays
-responsive while a sweep runs. RS analysis over a 12-megapixel image is on the order of 100 million
-pixel group evaluations, and the LSB sweep multiplies that across dozens of parameter combinations.
-This is genuine compute, not a stylistic choice.
+The analysis is written in Rust and compiled to WebAssembly, running in a
+background thread so the page stays responsive. Some of these checks are
+hundreds of millions of small calculations, so the speed is the point rather
+than a preference.
 
-### Zero runtime dependencies
+Nothing is borrowed. `package.json` lists no runtime dependencies and neither
+does the Rust core. Every parser, detector and attack here was written for this
+project, including the PNG, BMP, GIF, WAV and JPEG decoders and the Fourier
+transform behind the spectrogram.
 
-`package.json` lists no runtime dependencies, and neither does the Rust core. Every detector, cipher
-attack, and parser in this repository was written for this project.
+One thing worth knowing: the browser's own image decoder cannot be trusted with
+this. Ask a canvas for pixel values on an image with any transparency and it
+quietly alters the lowest bit of a fifth of them, through the arithmetic it uses
+to store transparent colour. That bit is the data being looked for. No canvas
+setting turns it off, so Trawl decodes images itself, and the test suite
+measures both paths: the browser one to record how it fails, ours to prove every
+sample comes back untouched.
 
-The browser supplies the plumbing, and platform APIs are not packages:
+## Running it locally
 
-- `ArrayBuffer` for raw bytes
-- `createImageBitmap` with `colorSpaceConversion` and `premultiplyAlpha` both set to `none`, so pixel
-  values arrive unmodified
-- `DecompressionStream` for inflate
-- `SubtleCrypto` for SHA
-- `BigInt` for RSA arithmetic
-
-Calling `DecompressionStream` is no more a dependency than calling `Math.sqrt`. There is no
-steganography package, no image library, no EXIF library, no crypto library, and no CyberChef.
-
-### Pixel fidelity
-
-Canvas `getImageData` quietly corrupts low bits through color management and alpha premultiplication,
-which for this tool destroys exactly the data being looked for. Trawl decodes through
-`createImageBitmap` with both conversions disabled, and the test suite round-trips a PNG carrying a
-known bit pattern to prove the bits survive the decode path.
-
-## What Trawl will not do
-
-No accounts, no cloud storage, no history, no sharing, no CLI.
-
-No pwn or web categories. Both need a live remote target, and a static page in a browser is the
-wrong shape for either one.
-
-No password cracking against steghide or encrypted archives. Wordlist attacks belong on hardware you
-control, running something built for it.
-
-Nothing is written back to your file.
-
-## Running locally
-
-Requires Rust with the `wasm32-unknown-unknown` target, `wasm-pack`, and Node 20 or newer.
+Needs Rust with the `wasm32-unknown-unknown` target, `wasm-pack`, and Node 20 or
+newer.
 
 ```bash
 git clone https://github.com/yuv1s/trawl
@@ -251,50 +114,28 @@ npm run build:wasm
 npm run dev
 ```
 
-Rust tests, including the steganalysis fixtures:
+Tests:
 
 ```bash
-cd trawl-core && cargo test --release
+npm test                              # the interface
+cd trawl-core && cargo test           # the analysis core
 ```
 
-Fixtures are produced by a generator script in `/fixtures`, so every detection result in the test
-suite can be reproduced from scratch.
+Test files are built from scratch by `fixtures/generate.mjs`, so every result the
+tests claim can be reproduced rather than taken on trust.
 
-## Roadmap
+## The names
 
-Steganography:
-
-- [ ] Container analysis: magic bytes, trailing data, PNG and JPEG walkers, entropy, strings, EXIF
-- [ ] Bit-plane wall and LSB parameter sweep
-- [ ] Chi-square attack with prefix sweep
-- [ ] RS analysis
-- [ ] Ranked triage panel
-- [ ] WAV support: LSB extraction and FFT spectrogram
-- [ ] JPEG DCT analysis for JSteg and F5
-
-Cryptography:
-
-- [ ] Encoding chain detection and automatic peeling
-- [ ] Classical cipher solvers with quadgram scoring
-- [ ] XOR key recovery
-- [ ] RSA attack set
-- [ ] Hash identification
-
-Forensics:
-
-- [ ] File carving and extraction
-- [ ] ZIP and PDF structure walkers
-- [ ] Registry hive parser for USB artifacts
-
-## Naming
-
-Trawling means dragging a net through a volume of water and sorting whatever comes up, which is
+Trawling is dragging a net through water and sorting whatever comes up, which is
 close to what this does with a dropped file.
 
-The steganography module is called Cuttlefish because cuttlefish hide by rewriting their own
-surface, which is what LSB embedding does to an image. Their ink is also where sepia comes from,
-since the pigment is named after _Sepia officinalis_.
+**Cuttlefish** is the steganography half. Cuttlefish hide by rewriting their own
+surface, which is what hiding a message in an image does to the picture. Their
+ink is also where the colour sepia comes from.
 
-## License
+**Cod-end** is the closed end of a trawl net, where the catch collects. In the
+app it is the panel holding everything the tools brought up.
+
+## Licence
 
 MIT.

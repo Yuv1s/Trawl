@@ -1,8 +1,11 @@
-//! Cuttlefish — steganography. Operates on decoded RGBA, never on file bytes.
+//! Cuttlefish — steganography. Works on decoded data, never on file bytes:
+//! RGBA here, and samples in the `audio` submodule.
 
 use crate::bytes;
 
+pub mod audio;
 pub mod chi;
+pub mod palette;
 pub mod rs;
 
 /// Channel orders worth sweeping. Index into an RGBA pixel.
@@ -147,7 +150,7 @@ const MIN_DISTINCT: usize = 6;
 /// through `extract_named`; this is the summary, and the UI says when it clipped.
 const PREVIEW_LIMIT: usize = 512;
 
-fn assess(stream: &[u8]) -> Option<(String, String, usize)> {
+pub(crate) fn assess(stream: &[u8]) -> Option<(String, String, usize)> {
     if let Some(format) = bytes::identify(stream) {
         let preview: String = String::from_utf8_lossy(&stream[..stream.len().min(48)])
             .chars()
@@ -412,16 +415,34 @@ pub fn plane_wall(
         })
         .collect();
 
-    (stats_json(&stats, tw, th, channels), tw, th, thumbnails)
+    (
+        stats_json(&stats, tw, th, channels, width, height),
+        tw,
+        th,
+        thumbnails,
+    )
 }
 
-fn stats_json(stats: &[PlaneStat], tw: usize, th: usize, channels: usize) -> String {
+fn stats_json(
+    stats: &[PlaneStat],
+    tw: usize,
+    th: usize,
+    channels: usize,
+    width: usize,
+    height: usize,
+) -> String {
     use crate::json::{push_number, push_string};
 
     let mut out = String::from("{");
     push_number(&mut out, "thumbWidth", tw);
     out.push(',');
     push_number(&mut out, "thumbHeight", th);
+    out.push(',');
+    // The source size, so a caller with no format header can still size the
+    // full-resolution view.
+    push_number(&mut out, "width", width);
+    out.push(',');
+    push_number(&mut out, "height", height);
     out.push(',');
     push_number(&mut out, "channels", channels);
     out.push(',');

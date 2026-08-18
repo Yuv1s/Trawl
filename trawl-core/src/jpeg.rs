@@ -6,6 +6,12 @@
 //! after SOS is raw entropy-coded bytes that must be skipped by hunting for the
 //! next real marker.
 
+pub mod dct;
+pub mod stego;
+
+#[cfg(test)]
+pub(crate) mod fixture;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Segment {
     pub marker: u8,

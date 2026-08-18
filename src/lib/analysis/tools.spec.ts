@@ -1,6 +1,6 @@
 ﻿import { describe, expect, it } from 'vitest';
 import { flagsOf, PLANNED, tools } from './tools';
-import type { Chunk, Structure, Survey } from '$lib/worker/protocol';
+import type { Chunk, Structure, Survey, WavStructure } from '$lib/worker/protocol';
 
 const chunk = (kind: string, offset: number, length = 0, crcOk = true): Chunk => ({
 	kind,
@@ -15,7 +15,7 @@ const survey: Survey = {
 	size: 1024,
 	format: 'PNG image',
 	flags: [],
-	magic: [{ offset: 0, label: 'PNG image', embedded: false }],
+	magic: [{ offset: 0, label: 'PNG image', length: 1024, bounded: true, embedded: false }],
 	exif: null,
 	jpegSegments: [],
 	jpegComments: [],
@@ -35,14 +35,14 @@ const structure: Structure = {
 };
 
 const status = (id: string, s = survey, st: Structure | null = structure) =>
-	tools(s, st).find((t) => t.id === id)?.status;
+	tools({ survey: s, structure: st }).find((t) => t.id === id)?.status;
 
 const tool = (id: string, s = survey, st: Structure | null = structure) =>
-	tools(s, st).find((t) => t.id === id);
+	tools({ survey: s, structure: st }).find((t) => t.id === id);
 
 describe('tools', () => {
 	it('reports every tool as clear on a clean PNG', () => {
-		expect(tools(survey, structure).some((t) => t.status === 'hit')).toBe(false);
+		expect(tools({ survey, structure }).some((t) => t.status === 'hit')).toBe(false);
 	});
 
 	it('marks the flag scan as a hit when a credible candidate exists', () => {
@@ -65,12 +65,12 @@ describe('tools', () => {
 		const s: Survey = {
 			...survey,
 			magic: [
-				{ offset: 0, label: 'PNG image', embedded: false },
-				{ offset: 9000, label: 'ZIP archive', embedded: true }
+				{ offset: 0, label: 'PNG image', length: 1024, bounded: true, embedded: false },
+				{ offset: 9000, label: 'ZIP archive', length: 512, bounded: true, embedded: true }
 			]
 		};
 		expect(status('magic', s)).toBe('hit');
-		expect(tool('magic', s)?.value).toBe('1 found');
+		expect(tool('magic', s)?.value).toBe('1 to extract');
 	});
 
 	it('does not treat the file own signature as an embedded file', () => {
@@ -144,13 +144,13 @@ describe('jpeg segments', () => {
 
 describe('format scope', () => {
 	it('runs the byte-level tools with no PNG structure', () => {
-		const byteLevel = tools(survey, null).filter((t) => t.scope === 'bytes');
+		const byteLevel = tools({ survey }).filter((t) => t.scope === 'bytes');
 		expect(byteLevel.length).toBeGreaterThan(0);
 		expect(byteLevel.every((t) => t.status !== 'pending')).toBe(true);
 	});
 
 	it('stands the PNG tools down rather than hiding them', () => {
-		const pngLevel = tools(survey, null).filter((t) => t.scope === 'png');
+		const pngLevel = tools({ survey }).filter((t) => t.scope === 'png');
 		expect(pngLevel.length).toBeGreaterThan(0);
 		expect(pngLevel.every((t) => t.status === 'pending')).toBe(true);
 		expect(pngLevel.every((t) => t.value === 'PNG only, for now')).toBe(true);
@@ -176,9 +176,110 @@ describe('format scope', () => {
 	});
 });
 
+describe('audio', () => {
+	const wav: WavStructure = {
+		encoding: '16-bit PCM',
+		channels: 2,
+		sampleRate: 44100,
+		bitsPerSample: 16,
+		frames: 44100,
+		seconds: 1,
+		dataOffset: 44,
+		dataLength: 176400,
+		chunks: [
+			{ id: 'fmt ', offset: 12, length: 16, complete: true },
+			{ id: 'data', offset: 36, length: 176400, complete: true }
+		],
+		text: [],
+		trailing: null
+	};
+
+	const audio = (found: Partial<Parameters<typeof tools>[0]>, id: string) =>
+		tools({ survey, structure: null, wav, ...found }).find((t) => t.id === id);
+
+	it('stands the audio tools down on a file with no samples', () => {
+		const level = tools({ survey, structure }).filter((t) => t.scope === 'audio');
+		expect(level.length).toBeGreaterThan(0);
+		expect(level.every((t) => t.status === 'pending')).toBe(true);
+		expect(level.every((t) => t.value === 'not an audio file')).toBe(true);
+	});
+
+	it('marks the sweep as a hit when a combination carried data', () => {
+		const sweep = {
+			samples: 88200,
+			combinations: 18,
+			candidates: [
+				{
+					channels: 'right',
+					channelIndex: 1,
+					bit: 0,
+					msbFirst: true,
+					reason: 'text at offset 0, 12 characters',
+					preview: 'flag{sounds}',
+					readable: 12,
+					bytesRead: 4096,
+					flags: ['flag{sounds}']
+				}
+			]
+		};
+		expect(audio({ audio: sweep }, 'audio-lsb')?.status).toBe('hit');
+		expect(audio({ audio: sweep }, 'audio-lsb')?.value).toBe('1 of 18 combinations');
+	});
+
+	it('says how much it swept when nothing came back', () => {
+		const sweep = { samples: 88200, combinations: 18, candidates: [] };
+		expect(audio({ audio: sweep }, 'audio-lsb')?.status).toBe('clear');
+		expect(audio({ audio: sweep }, 'audio-lsb')?.value).toBe('18 swept, none carried data');
+	});
+
+	it('flags text in a chunk a player would skip', () => {
+		const withText = { ...wav, text: [{ chunk: 'LIST', offset: 40, text: 'flag{riff}' }] };
+		const tool = tools({ survey, wav: withText }).find((t) => t.id === 'riff');
+		expect(tool?.status).toBe('hit');
+		expect(tool?.value).toBe('1 text string');
+	});
+
+	it('flags bytes past the length the header declares', () => {
+		const appended = { ...wav, trailing: { offset: 176444, length: 27 } };
+		const tool = tools({ survey, wav: appended }).find((t) => t.id === 'riff');
+		expect(tool?.status).toBe('hit');
+		expect(tool?.value).toBe('27 bytes past the end');
+	});
+
+	it('reports a plain sound file as ready rather than as a find', () => {
+		expect(audio({}, 'riff')?.status).toBe('ready');
+		expect(audio({}, 'riff')?.value).toBe('2 chunks');
+	});
+
+	it('stands the spectrogram down for a clip too short to draw', () => {
+		expect(audio({}, 'spectrogram')?.status).toBe('pending');
+		expect(audio({}, 'spectrogram')?.value).toBe('the clip is too short to draw');
+	});
+
+	it('reports the range it drew', () => {
+		const spectrogram = {
+			width: 600,
+			height: 512,
+			window: 1024,
+			hop: 256,
+			maxFrequency: 22050,
+			seconds: 3.5,
+			pixels: new Uint8Array()
+		};
+		expect(audio({ spectrogram }, 'spectrogram')?.value).toBe('3.5s up to 22.1 kHz');
+	});
+
+	it('does not claim a finding on a WAV it could not walk', () => {
+		const broken = { error: 'no fmt chunk, so the samples cannot be read', chunks: [] };
+		const level = tools({ survey, wav: broken }).filter((t) => t.scope === 'audio');
+		expect(level.every((t) => t.status === 'pending')).toBe(true);
+	});
+});
+
 describe('planned tools', () => {
 	it('no longer lists anything that has shipped', () => {
-		for (const id of ['lsb', 'planes', 'chi', 'rs', 'entropy', 'magic', 'exif', 'jpeg']) {
+		const shipped = ['lsb', 'planes', 'chi', 'rs', 'entropy', 'magic', 'exif', 'jpeg'];
+		for (const id of [...shipped, 'spectrogram', 'audio-lsb', 'riff']) {
 			expect(PLANNED.some((t) => t.id === id)).toBe(false);
 		}
 	});
@@ -189,7 +290,7 @@ describe('planned tools', () => {
 	});
 
 	it('keeps built and planned ids disjoint', () => {
-		const builtIds = new Set(tools(survey, structure).map((t) => t.id));
+		const builtIds = new Set(tools({ survey, structure }).map((t) => t.id));
 		expect(PLANNED.some((t) => builtIds.has(t.id))).toBe(false);
 	});
 });

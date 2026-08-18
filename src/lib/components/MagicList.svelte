@@ -1,12 +1,48 @@
 <script lang="ts">
 	import type { MagicHit } from '$lib/worker/protocol';
 
-	let { hits, size }: { hits: MagicHit[]; size: number } = $props();
+	let { hits, size, bytes }: { hits: MagicHit[]; size: number; bytes: Uint8Array } = $props();
 
 	const embedded = $derived(hits.filter((h) => h.embedded));
 	const header = $derived(hits.find((h) => !h.embedded) ?? null);
 
 	const hex = (n: number) => `0x${n.toString(16)}`;
+
+	const EXTENSIONS: Record<string, string> = {
+		'PNG image': 'png',
+		'JPEG image': 'jpg',
+		'GIF image': 'gif',
+		'BMP image': 'bmp',
+		'ZIP archive': 'zip',
+		'gzip stream': 'gz',
+		'bzip2 stream': 'bz2',
+		'7-Zip archive': '7z',
+		'RAR archive': 'rar',
+		'PDF document': 'pdf',
+		'ELF binary': 'elf',
+		'RIFF container': 'wav'
+	};
+
+	/**
+	 * Hands the carved bytes to the browser as a download.
+	 *
+	 * The object URL is revoked on the next frame rather than immediately, since
+	 * revoking before the browser has started reading cancels the save.
+	 */
+	function carve(hit: MagicHit) {
+		const slice = bytes.slice(hit.offset, hit.offset + hit.length);
+		const url = URL.createObjectURL(new Blob([slice as Uint8Array<ArrayBuffer>]));
+
+		const link = document.createElement('a');
+		link.href = url;
+		link.download = `carved-${hex(hit.offset)}.${EXTENSIONS[hit.label] ?? 'bin'}`;
+		link.click();
+
+		requestAnimationFrame(() => URL.revokeObjectURL(url));
+	}
+
+	const kb = (n: number) =>
+		n >= 1024 ? `${(n / 1024).toFixed(1)} KB` : `${n.toLocaleString()} bytes`;
 </script>
 
 {#if header}
@@ -25,17 +61,27 @@
 	<ul class="hits">
 		{#each embedded as hit (hit.offset)}
 			<li>
-				<span class="label-text">{hit.label}</span>
+				<div class="head">
+					<span class="label-text">{hit.label}</span>
+					<button type="button" onclick={() => carve(hit)}>Save this file</button>
+				</div>
 				<span class="mono muted">
-					at {hex(hit.offset)} · {((hit.offset / size) * 100).toFixed(1)}% into the file
+					{kb(hit.length)} at {hex(hit.offset)}, {((hit.offset / size) * 100).toFixed(1)}% into the
+					file
 				</span>
+				{#if !hit.bounded}
+					<span class="guess">
+						This format carries no end marker, so the length runs to whatever comes next. The saved
+						file may have a tail of unrelated bytes on it.
+					</span>
+				{/if}
 			</li>
 		{/each}
 	</ul>
 
 	<p class="caveat">
-		A file signature this far into another file did not get there by accident. What follows each
-		offset is usually a complete, extractable file. Carving them out to save is not built yet.
+		A file signature this far into another file did not get there by accident. Where the format
+		declares its own end, PNG, JPEG, ZIP and PDF, the saved bytes stop exactly there.
 	</p>
 {/if}
 
@@ -61,16 +107,21 @@
 		margin: 0;
 		padding: 0;
 		display: grid;
-		gap: var(--s3);
+		gap: var(--s4);
 	}
 
 	.hits li {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: var(--s2) var(--s4);
+		display: grid;
+		gap: var(--s2);
 		padding-bottom: var(--s3);
 		border-bottom: 1px solid var(--rule);
+	}
+
+	.head {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: var(--s3) var(--s4);
 	}
 
 	.label-text {
@@ -79,9 +130,33 @@
 		color: var(--signal);
 	}
 
+	.head button {
+		margin-left: auto;
+		background: none;
+		border: 1px solid var(--rule-bright);
+		border-radius: var(--radius);
+		color: var(--text);
+		font: inherit;
+		font-size: var(--t-label);
+		padding: var(--s1) var(--s3);
+		cursor: pointer;
+		transition: background-color 120ms var(--ease);
+	}
+
+	.head button:hover {
+		background: var(--panel-lift);
+	}
+
 	.muted {
 		color: var(--muted);
 		font-size: var(--t-data);
+	}
+
+	.guess {
+		font-size: var(--t-label);
+		color: var(--muted);
+		line-height: 1.6;
+		max-width: 72ch;
 	}
 
 	.caveat {

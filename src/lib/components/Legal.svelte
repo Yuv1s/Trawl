@@ -1,11 +1,12 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
+	import Logo from '$lib/components/Logo.svelte';
 
 	let { title, children }: { title: string; children: import('svelte').Snippet } = $props();
 </script>
 
 <main>
-	<a class="back" href={resolve('/')}>Back to Trawl</a>
+	<a class="back" href={resolve('/')}><Logo size={16} />Back to Trawl</a>
 	<h1>{title}</h1>
 	<div class="body">
 		{@render children()}
@@ -20,7 +21,9 @@
 	}
 
 	.back {
-		display: inline-block;
+		display: inline-flex;
+		align-items: center;
+		gap: var(--s2);
 		font-size: var(--t-label);
 		text-transform: uppercase;
 		letter-spacing: 0.14em;

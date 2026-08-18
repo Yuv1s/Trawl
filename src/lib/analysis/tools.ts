@@ -1,24 +1,54 @@
 import {
 	isHeaderError,
+	isJpegError,
+	isWavError,
+	type AudioSweep,
 	type ChiSquare,
 	type FlagHit,
+	type JpegError,
+	type JpegStego,
+	type PaletteStego,
 	type PlaneWall,
 	type RsAnalysis,
+	type Spectrogram,
 	type Structure,
 	type Survey,
-	type Sweep
+	type Sweep,
+	type WavError,
+	type WavStructure
 } from '$lib/worker/protocol';
 
 export type ToolStatus = 'hit' | 'clear' | 'ready' | 'pending';
 
-/** `bytes` tools read raw data and run on anything; `png` tools need the walker. */
-export type ToolScope = 'bytes' | 'png';
+/**
+ * `bytes` runs on anything. `pixels` needs a format with a decoder behind it.
+ * `png` needs the chunk walker, which no other format has. `audio` needs samples.
+ * `jpeg` needs the coefficient decoder.
+ */
+export type ToolScope = 'bytes' | 'pixels' | 'png' | 'audio' | 'jpeg';
+
+/**
+ * The two halves of the rack. Survey reads the file as it sits on disk;
+ * Cuttlefish goes after what is hidden inside the data itself.
+ */
+export type ToolGroup = 'survey' | 'cuttlefish';
+
+export const GROUP_LABEL: Record<ToolGroup, string> = {
+	survey: 'Survey',
+	cuttlefish: 'Cuttlefish'
+};
+
+export const GROUP_BLURB: Record<ToolGroup, string> = {
+	survey: 'What the file says about itself',
+	cuttlefish: 'What someone hid inside it'
+};
 
 export type Tool = {
 	id: string;
 	name: string;
 	measures: string;
 	scope: ToolScope;
+	group: ToolGroup;
 	status: ToolStatus;
 	value: string;
 };
@@ -46,7 +76,10 @@ export function flagsOf(survey: Survey, structure: Structure | null): FlagHit[] 
 	return [...structure.flags, ...survey.flags.filter((f) => !judged.has(f.offset))];
 }
 
-const UNAVAILABLE = 'PNG only, for now';
+const NO_WALKER = 'PNG only, for now';
+const NO_DECODER = 'no decoder for this format';
+const NO_AUDIO = 'not an audio file';
+const NO_COEFFICIENTS = 'no readable JPEG coefficients';
 
 /** Metadata fields a person types into, as opposed to ones a camera fills in. */
 export const WRITTEN_BY_HAND = new Set([
@@ -60,14 +93,28 @@ export const WRITTEN_BY_HAND = new Set([
 	'MakerNote'
 ]);
 
-export function tools(
-	survey: Survey,
-	structure: Structure | null = null,
-	sweep: Sweep | null = null,
-	wall: PlaneWall | null = null,
-	chi: ChiSquare | null = null,
-	rs: RsAnalysis | null = null
-): Tool[] {
+/** Everything the rack reads. All of it optional: a tool with nothing to read
+ *  stands down and says why. */
+export type Findings = {
+	survey: Survey;
+	structure?: Structure | null;
+	wav?: WavStructure | WavError | null;
+	jpeg?: JpegStego | JpegError | null;
+	paletteStego?: PaletteStego | null;
+	sweep?: Sweep | null;
+	wall?: PlaneWall | null;
+	chi?: ChiSquare | null;
+	rs?: RsAnalysis | null;
+	audio?: AudioSweep | null;
+	spectrogram?: Spectrogram | null;
+};
+
+export function tools(found: Findings): Tool[] {
+	const { survey, structure = null, sweep = null, wall = null, chi = null, rs = null } = found;
+	const { audio = null, spectrogram = null, paletteStego = null } = found;
+	const wav = found.wav && !isWavError(found.wav) ? found.wav : null;
+	const jpeg = found.jpeg && !isJpegError(found.jpeg) ? found.jpeg : null;
+
 	const credible = flagsOf(survey, structure).filter((f) => f.credible);
 	const embedded = survey.magic.filter((m) => m.embedded);
 	const peakEntropy = survey.entropy.values.length ? Math.max(...survey.entropy.values) : 0;
@@ -76,16 +123,40 @@ export function tools(
 	);
 	const jpegish = survey.jpegSegments.length > 0;
 	const duplicateColours = structure?.palette?.duplicates.length ?? 0;
+	// Any format we can turn into pixels unlocks the whole pixel half of the rack.
+	const decoded = wall !== null || sweep !== null;
 
 	const headerBroken = !structure || isHeaderError(structure.header);
 	const badCrc = structure?.chunks.filter((c) => !c.crcOk).length ?? 0;
 	const sweepHits = sweep?.candidates.length ?? 0;
 
+	const audioHits = audio?.candidates.length ?? 0;
+	const wavText = wav?.text.length ?? 0;
+	const jpegHits = jpeg?.candidates.length ?? 0;
+	const paletteHits = paletteStego?.candidates.length ?? 0;
+
 	/** Format-level tools report why they stood down rather than disappearing. */
-	const png = (tool: Omit<Tool, 'scope'>): Tool =>
+	type Partial = Omit<Tool, 'scope' | 'group'>;
+
+	const png = (tool: Partial, group: ToolGroup = 'survey'): Tool =>
 		structure
-			? { ...tool, scope: 'png' }
-			: { ...tool, scope: 'png', status: 'pending', value: UNAVAILABLE };
+			? { ...tool, scope: 'png', group }
+			: { ...tool, scope: 'png', group, status: 'pending', value: NO_WALKER };
+
+	const pixel = (tool: Partial): Tool =>
+		decoded
+			? { ...tool, scope: 'pixels', group: 'cuttlefish' }
+			: { ...tool, scope: 'pixels', group: 'cuttlefish', status: 'pending', value: NO_DECODER };
+
+	const coefficient = (tool: Partial): Tool =>
+		jpeg
+			? { ...tool, scope: 'jpeg', group: 'cuttlefish' }
+			: { ...tool, scope: 'jpeg', group: 'cuttlefish', status: 'pending', value: NO_COEFFICIENTS };
+
+	const sound = (tool: Partial, group: ToolGroup = 'cuttlefish'): Tool =>
+		wav
+			? { ...tool, scope: 'audio', group }
+			: { ...tool, scope: 'audio', group, status: 'pending', value: NO_AUDIO };
 
 	return [
 		{
@@ -93,6 +164,7 @@ export function tools(
 			name: 'Flag scan',
 			measures: 'Looks for flag{...} text in the file',
 			scope: 'bytes',
+			group: 'survey',
 			status: credible.length ? 'hit' : 'clear',
 			value: credible.length
 				? `${credible.length} candidate${credible.length === 1 ? '' : 's'}`
@@ -101,12 +173,13 @@ export function tools(
 		{
 			id: 'magic',
 			name: 'Embedded files',
-			measures: 'Finds other files hidden inside this one',
+			measures: 'Finds files hidden inside this one, and saves them',
 			scope: 'bytes',
+			group: 'survey',
 			status: embedded.length ? 'hit' : 'clear',
-			value: embedded.length ? `${embedded.length} found` : 'none'
+			value: embedded.length ? `${embedded.length} to extract` : 'none'
 		},
-		png({
+		pixel({
 			id: 'lsb',
 			name: 'LSB sweep',
 			measures: 'Tries every way of reading hidden bits',
@@ -117,7 +190,7 @@ export function tools(
 					? `${sweep.combinations} swept, none carried data`
 					: 'pixels unavailable'
 		}),
-		png({
+		pixel({
 			id: 'chi',
 			name: 'Chi-square attack',
 			measures: 'Statistical test for a hidden payload',
@@ -128,7 +201,7 @@ export function tools(
 					? `peak p ${chi.peakProbability.toFixed(2)}`
 					: 'pixels unavailable'
 		}),
-		png({
+		pixel({
 			id: 'rs',
 			name: 'RS analysis',
 			measures: 'Second opinion on how much is hidden',
@@ -141,7 +214,7 @@ export function tools(
 						? 'no fit on this image'
 						: 'pixels unavailable'
 		}),
-		png({
+		pixel({
 			id: 'planes',
 			name: 'Bit-plane wall',
 			measures: 'Shows each layer of bits as a picture',
@@ -153,6 +226,7 @@ export function tools(
 			name: 'Metadata',
 			measures: 'Camera details and notes saved with the photo',
 			scope: 'bytes',
+			group: 'survey',
 			status: writtenFields.length ? 'hit' : survey.exif?.length ? 'ready' : 'clear',
 			value: writtenFields.length
 				? `${writtenFields.length} written field${writtenFields.length === 1 ? '' : 's'}`
@@ -165,6 +239,7 @@ export function tools(
 			name: 'JPEG segments',
 			measures: 'Lists every part of a JPEG',
 			scope: 'bytes',
+			group: 'survey',
 			status:
 				survey.jpegComments.length || survey.jpegTrailing ? 'hit' : jpegish ? 'ready' : 'clear',
 			value: survey.jpegComments.length
@@ -175,11 +250,68 @@ export function tools(
 						? `${survey.jpegSegments.length} segments`
 						: 'not a JPEG'
 		},
+		coefficient({
+			id: 'jsteg',
+			name: 'JSteg sweep',
+			measures: 'Reads hidden bits out of a JPEG after compression',
+			status: jpegHits ? 'hit' : jpeg ? 'clear' : 'pending',
+			value: jpegHits
+				? `${jpegHits} of ${jpeg?.combinations} combinations`
+				: jpeg
+					? `${jpeg.combinations} swept, none carried data`
+					: 'coefficients unreadable'
+		}),
+		coefficient({
+			id: 'jpeg-chi',
+			name: 'Coefficient statistics',
+			measures: 'Statistical test on a JPEG, plus the value counts',
+			status: jpeg?.chi.detected ? 'hit' : jpeg ? 'ready' : 'pending',
+			value: jpeg?.chi.detected
+				? `${(jpeg.chi.embeddedFraction * 100).toFixed(0)}% embedded`
+				: jpeg
+					? `${jpeg.blocks.toLocaleString()} blocks over ${jpeg.scans} scan${jpeg.scans === 1 ? '' : 's'}`
+					: 'coefficients unreadable'
+		}),
+		sound({
+			id: 'spectrogram',
+			name: 'Spectrogram',
+			measures: 'Draws the sound, in case a picture is hiding in it',
+			status: spectrogram ? 'ready' : 'pending',
+			value: spectrogram
+				? `${spectrogram.seconds.toFixed(1)}s up to ${(spectrogram.maxFrequency / 1000).toFixed(1)} kHz`
+				: 'the clip is too short to draw'
+		}),
+		sound({
+			id: 'audio-lsb',
+			name: 'Audio LSB sweep',
+			measures: 'Tries every way of reading hidden bits from the samples',
+			status: audioHits ? 'hit' : audio ? 'clear' : 'pending',
+			value: audioHits
+				? `${audioHits} of ${audio?.combinations} combinations`
+				: audio
+					? `${audio.combinations} swept, none carried data`
+					: 'samples unreadable'
+		}),
+		sound(
+			{
+				id: 'riff',
+				name: 'RIFF chunks',
+				measures: 'Lists every part of the sound file',
+				status: wavText || wav?.trailing ? 'hit' : 'ready',
+				value: wavText
+					? `${wavText} text ${wavText === 1 ? 'string' : 'strings'}`
+					: wav?.trailing
+						? `${wav.trailing.length.toLocaleString()} bytes past the end`
+						: `${wav?.chunks.length} chunks`
+			},
+			'survey'
+		),
 		{
 			id: 'entropy',
 			name: 'Entropy window',
 			measures: 'Finds compressed or encrypted regions',
 			scope: 'bytes',
+			group: 'survey',
 			status: 'ready',
 			value: `peak ${peakEntropy.toFixed(2)} of 8`
 		},
@@ -197,17 +329,24 @@ export function tools(
 			status: structure?.text.length ? 'hit' : 'clear',
 			value: structure?.text.length ? `${structure.text.length} found` : 'none'
 		}),
-		png({
-			id: 'palette',
-			name: 'Palette',
-			measures: 'Repeated colours that could carry hidden bits',
-			status: duplicateColours ? 'hit' : structure?.palette ? 'ready' : 'clear',
-			value: duplicateColours
-				? `${duplicateColours} duplicated`
-				: structure?.palette
-					? `${structure.palette.entries} colours`
-					: 'not an indexed image'
-		}),
+		png(
+			{
+				id: 'palette',
+				name: 'Palette',
+				measures: 'Repeated colours that carry hidden bits',
+				// A duplicated colour is capacity, not a finding. Only a readable
+				// payload out of the index choices counts as a hit.
+				status: paletteHits ? 'hit' : duplicateColours || structure?.palette ? 'ready' : 'clear',
+				value: paletteHits
+					? `${paletteHits} of ${paletteStego?.combinations} combinations`
+					: duplicateColours
+						? `${duplicateColours} duplicated, nothing read`
+						: structure?.palette
+							? `${structure.palette.entries} colours`
+							: 'not an indexed image'
+			},
+			'cuttlefish'
+		),
 		png({
 			id: 'crc',
 			name: 'Chunk CRC',
@@ -227,12 +366,13 @@ export function tools(
 			name: 'Readable text',
 			measures: 'Text anywhere in the file, plain or wide',
 			scope: 'bytes',
+			group: 'survey',
 			status: 'ready',
 			value: survey.strings.wide
 				? `${survey.strings.total.toLocaleString()}, ${survey.strings.wide} wide`
 				: survey.strings.total.toLocaleString()
 		},
-		png({
+		pixel({
 			id: 'pixels',
 			name: 'Pixel decode',
 			measures: 'Reads exact pixel values, nothing altered',
@@ -245,18 +385,11 @@ export function tools(
 /** Named so the rack shows the whole instrument, not only the parts that work. */
 export const PLANNED: Tool[] = [
 	{
-		id: 'carve',
-		name: 'File carving',
-		measures: 'Pulls embedded files out to save',
+		id: 'zip',
+		name: 'Archive walk',
+		measures: 'Looks inside ZIP and PDF files',
 		scope: 'bytes',
-		status: 'pending',
-		value: ''
-	},
-	{
-		id: 'wav',
-		name: 'Audio analysis',
-		measures: 'Hidden data and pictures inside sound files',
-		scope: 'bytes',
+		group: 'survey',
 		status: 'pending',
 		value: ''
 	}

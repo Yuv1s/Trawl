@@ -1,70 +1,77 @@
 <script lang="ts">
-	import type { Sweep, SweepCandidate } from '$lib/worker/protocol';
+	type Row = {
+		key: string;
+		/** The channel selection, shown large. */
+		title: string;
+		/** Everything else about the read: bit plane, bit order, traversal. */
+		chips: string[];
+		reason: string;
+		preview: string;
+		/** True length of the readable run, which exceeds the preview when it clipped. */
+		readable: number;
+		flags: string[];
+		onextract: () => void;
+	};
 
 	let {
-		sweep,
+		rows,
+		combinations,
+		over,
+		blocked,
 		error,
-		extracted,
-		onextract
+		extracted
 	}: {
-		sweep: Sweep | null;
+		/** Null when the sweep could not run at all. */
+		rows: Row[] | null;
+		combinations: number;
+		/** What was swept, already counted: "480,000 pixels". */
+		over: string;
+		/** Why nothing ran, when nothing ran. */
+		blocked: string;
 		error: string | null;
 		extracted: { label: string; text: string } | null;
-		onextract: (channels: string, bit: number, msbFirst: boolean) => void;
 	} = $props();
-
-	const label = (c: Pick<SweepCandidate, 'channels' | 'bit' | 'msbFirst'>) =>
-		`${c.channels} · bit ${c.bit} · ${c.msbFirst ? 'msb' : 'lsb'} first`;
-
-	const clipped = (c: SweepCandidate) => c.readable > c.preview.length;
 </script>
 
-{#if !sweep}
+{#if !rows}
+	<p class="clear">{blocked}{error ? ` ${error}` : ''}</p>
+{:else if rows.length === 0}
 	<p class="clear">
-		Pixels could not be decoded, so no sweep ran.{error ? ` ${error}` : ''}
-	</p>
-{:else if sweep.candidates.length === 0}
-	<p class="clear">
-		Swept {sweep.combinations} parameter combinations across
-		{sweep.pixels.toLocaleString()} pixels. None produced a file signature, printable text, or a flag
-		shape. That does not rule out an encrypted or non-sequential payload.
+		Swept {combinations} parameter combinations across {over}. None produced a file signature,
+		printable text, or a flag shape. That does not rule out an encrypted or non-sequential payload.
 	</p>
 {:else}
 	<p class="lead">
-		{sweep.candidates.length} of {sweep.combinations} combinations carried something readable.
+		{rows.length} of {combinations} combinations carried something readable.
 	</p>
 
 	<ul class="hits">
-		{#each sweep.candidates as candidate (label(candidate))}
+		{#each rows as row (row.key)}
 			<li>
 				<div class="params">
-					<span class="mono channels">{candidate.channels}</span>
-					<span class="mono chip">bit {candidate.bit}</span>
-					<span class="mono chip">{candidate.msbFirst ? 'msb' : 'lsb'} first</span>
-					<button
-						type="button"
-						onclick={() => onextract(candidate.channels, candidate.bit, candidate.msbFirst)}
-					>
-						Extract everything
-					</button>
+					<span class="mono channels">{row.title}</span>
+					{#each row.chips as chip (chip)}
+						<span class="mono chip">{chip}</span>
+					{/each}
+					<button type="button" onclick={row.onextract}>Extract everything</button>
 				</div>
 
-				<p class="reason">{candidate.reason}</p>
+				<p class="reason">{row.reason}</p>
 
-				{#if candidate.flags.length}
+				{#if row.flags.length}
 					<ul class="flags">
-						{#each candidate.flags as flag (flag)}
+						{#each row.flags as flag (flag)}
 							<li class="mono flagged">{flag}</li>
 						{/each}
 					</ul>
 				{/if}
 
-				<pre class="preview mono">{candidate.preview}</pre>
+				<pre class="preview mono">{row.preview}</pre>
 
-				{#if clipped(candidate)}
+				{#if row.readable > row.preview.length}
 					<p class="clip">
-						Showing {candidate.preview.length.toLocaleString()} of
-						{candidate.readable.toLocaleString()} readable characters. Extract everything for the rest.
+						Showing {row.preview.length.toLocaleString()} of
+						{row.readable.toLocaleString()} readable characters. Extract everything for the rest.
 					</p>
 				{/if}
 			</li>

@@ -1,27 +1,43 @@
 import init, {
+	chi_square,
 	file_survey,
 	find_flags,
-	png_chi_square,
+	lsb_extract,
+	lsb_sweep,
+	plane,
+	plane_wall,
 	png_idat,
-	png_lsb_extract,
-	png_lsb_sweep,
 	png_palette,
-	png_plane,
-	png_plane_wall,
-	png_rs_analysis,
-	png_structure
+	png_structure,
+	jpeg_stego,
+	jpeg_stego_extract,
+	palette_extract,
+	palette_stego,
+	rs_analysis,
+	wav_lsb_extract,
+	wav_lsb_sweep,
+	wav_spectrogram,
+	wav_structure
 } from '$lib/wasm/trawl_core';
 import type {
 	AnalysisRequest,
 	AnalysisResponse,
+	AudioSweep,
 	ChiSquare,
 	Found,
+	JpegError,
+	JpegStego,
+	PaletteStego,
 	PlaneWall,
 	RsAnalysis,
+	Spectrogram,
 	Structure,
 	Survey,
-	Sweep
+	Sweep,
+	WavError,
+	WavStructure
 } from './protocol';
+import { isWavError } from './protocol';
 
 const ready = init();
 
@@ -29,7 +45,13 @@ const SWEEP_BYTES = 4096;
 const THUMB_WIDTH = 220;
 const CHI_STEPS = 64;
 
-/** Kept so a full-resolution plane request does not re-send the whole file. */
+/** 1024 samples is the usual compromise: fine enough in time to read letters,
+ *  fine enough in frequency to keep them from smearing together. */
+const FFT_WINDOW = 1024;
+const SPECTROGRAM_WIDTH = 900;
+const CHI_STEPS_JPEG = 64;
+
+/** Kept so a plane or extraction request does not re-send the whole file. */
 let cached: { bytes: Uint8Array; inflated: Uint8Array } | null = null;
 
 async function inflate(bytes: Uint8Array): Promise<Uint8Array> {
@@ -80,6 +102,19 @@ async function inflateTextChunks(bytes: Uint8Array, structure: Structure): Promi
 	}
 }
 
+function readSpectrogram(packed: Uint8Array): Spectrogram {
+	const headerLength = new DataView(packed.buffer, packed.byteOffset, 4).getUint32(0, true);
+	const json = new TextDecoder().decode(packed.subarray(4, 4 + headerLength));
+	const meta = JSON.parse(json) as Omit<Spectrogram, 'pixels'>;
+
+	return { ...meta, pixels: packed.slice(4 + headerLength) };
+}
+
+/** Only PNG hands its pixel data to a platform inflate; the rest carry their own. */
+async function pixelInput(bytes: Uint8Array, isPng: boolean): Promise<Uint8Array> {
+	return isPng ? inflate(png_idat(bytes)) : new Uint8Array();
+}
+
 async function analyse(id: number, name: string, bytes: Uint8Array): Promise<AnalysisResponse> {
 	await ready;
 
@@ -88,47 +123,66 @@ async function analyse(id: number, name: string, bytes: Uint8Array): Promise<Ana
 	const walked = JSON.parse(png_structure(bytes)) as Structure;
 	const structure = walked.signature ? walked : null;
 
-	if (!structure) {
-		cached = null;
-		return {
-			id,
-			status: 'ok',
-			name,
-			size: bytes.length,
-			survey,
-			structure: null,
-			sweep: null,
-			wall: null,
-			chi: null,
-			rs: null,
-			pixelError: null
-		};
-	}
+	if (structure) await inflateTextChunks(bytes, structure);
+
+	const wav = JSON.parse(wav_structure(bytes)) as WavStructure | WavError | null;
+	const jpeg = JSON.parse(jpeg_stego(bytes, SWEEP_BYTES, CHI_STEPS_JPEG)) as
+		JpegStego | JpegError | null;
 
 	let sweep: Sweep | null = null;
 	let wall: PlaneWall | null = null;
 	let chi: ChiSquare | null = null;
 	let rs: RsAnalysis | null = null;
+	let paletteStego: PaletteStego | null = null;
+	let audio: AudioSweep | null = null;
+	let spectrogram: Spectrogram | null = null;
 	let pixelError: string | null = null;
+	let audioError: string | null = null;
+
+	// Compressed and float WAVs parse but have no low bit worth reading, so the
+	// audio tools report why they stood down instead of vanishing.
+	if (wav && !isWavError(wav)) {
+		try {
+			audio = JSON.parse(wav_lsb_sweep(bytes, SWEEP_BYTES)) as AudioSweep;
+		} catch (error: unknown) {
+			audioError = error instanceof Error ? error.message : String(error);
+		}
+
+		try {
+			spectrogram = readSpectrogram(wav_spectrogram(bytes, FFT_WINDOW, SPECTROGRAM_WIDTH));
+		} catch (error: unknown) {
+			audioError ??= error instanceof Error ? error.message : String(error);
+		}
+	}
 
 	// The container walk is worth returning even when pixels cannot be decoded,
-	// so a broken IHDR or an interlaced image degrades rather than fails.
-	await inflateTextChunks(bytes, structure);
-
+	// and the pixel tools run on any format with a decoder behind it.
+	let inflated: Uint8Array = new Uint8Array();
 	try {
-		const inflated = await inflate(png_idat(bytes));
-		cached = { bytes, inflated };
-
-		const palette = JSON.parse(png_palette(bytes, inflated)) as Structure['palette'];
-		structure.palette = palette ?? null;
-
-		sweep = JSON.parse(png_lsb_sweep(bytes, inflated, SWEEP_BYTES)) as Sweep;
-		wall = readWall(png_plane_wall(bytes, inflated, THUMB_WIDTH));
-		chi = JSON.parse(png_chi_square(bytes, inflated, CHI_STEPS)) as ChiSquare;
-		rs = JSON.parse(png_rs_analysis(bytes, inflated)) as RsAnalysis;
+		inflated = await pixelInput(bytes, structure !== null);
 	} catch (error: unknown) {
-		cached = null;
 		pixelError = error instanceof Error ? error.message : String(error);
+	}
+
+	// Held whatever happened above: an audio extraction needs the bytes, not the
+	// pixels, and a WAV never gets past the decoder.
+	cached = { bytes, inflated };
+
+	if (pixelError === null) {
+		try {
+			if (structure) {
+				structure.palette = JSON.parse(png_palette(bytes, inflated)) as Structure['palette'];
+			}
+
+			paletteStego = JSON.parse(palette_stego(bytes, inflated, SWEEP_BYTES)) as PaletteStego | null;
+
+			sweep = JSON.parse(lsb_sweep(bytes, inflated, SWEEP_BYTES)) as Sweep;
+			wall = readWall(plane_wall(bytes, inflated, THUMB_WIDTH));
+			chi = JSON.parse(chi_square(bytes, inflated, CHI_STEPS)) as ChiSquare;
+			rs = JSON.parse(rs_analysis(bytes, inflated)) as RsAnalysis;
+		} catch (error: unknown) {
+			pixelError = error instanceof Error ? error.message : String(error);
+		}
 	}
 
 	return {
@@ -138,15 +192,21 @@ async function analyse(id: number, name: string, bytes: Uint8Array): Promise<Ana
 		size: bytes.length,
 		survey,
 		structure,
+		wav,
+		jpeg,
+		paletteStego,
 		sweep,
 		wall,
 		chi,
 		rs,
-		pixelError
+		audio,
+		spectrogram,
+		pixelError,
+		audioError
 	};
 }
 
-async function plane(id: number, channel: number, bit: number): Promise<AnalysisResponse> {
+async function requestPlane(id: number, channel: number, bit: number): Promise<AnalysisResponse> {
 	await ready;
 	if (!cached) throw new Error('No decoded image is loaded.');
 
@@ -155,7 +215,7 @@ async function plane(id: number, channel: number, bit: number): Promise<Analysis
 		status: 'plane',
 		channel,
 		bit,
-		pixels: png_plane(cached.bytes, cached.inflated, channel, bit)
+		pixels: plane(cached.bytes, cached.inflated, channel, bit)
 	};
 }
 
@@ -175,7 +235,55 @@ async function extract(
 		id,
 		status: 'extract',
 		label: `${channels} · bit ${bit} · ${msbFirst ? 'msb' : 'lsb'} first`,
-		bytes: png_lsb_extract(cached.bytes, cached.inflated, channels, bit, msbFirst, EXTRACT_LIMIT)
+		bytes: lsb_extract(cached.bytes, cached.inflated, channels, bit, msbFirst, EXTRACT_LIMIT)
+	};
+}
+
+async function extractPalette(id: number, msbFirst: boolean): Promise<AnalysisResponse> {
+	await ready;
+	if (!cached) throw new Error('No file is loaded.');
+
+	return {
+		id,
+		status: 'extract',
+		label: `palette indices · ${msbFirst ? 'msb' : 'lsb'} first`,
+		bytes: palette_extract(cached.bytes, cached.inflated, msbFirst, EXTRACT_LIMIT)
+	};
+}
+
+async function extractJpeg(
+	id: number,
+	includeDc: boolean,
+	msbFirst: boolean
+): Promise<AnalysisResponse> {
+	await ready;
+	if (!cached) throw new Error('No file is loaded.');
+
+	return {
+		id,
+		status: 'extract',
+		label: `coefficients${includeDc ? ' with DC' : ''} · ${msbFirst ? 'msb' : 'lsb'} first`,
+		bytes: jpeg_stego_extract(cached.bytes, includeDc, msbFirst, EXTRACT_LIMIT)
+	};
+}
+
+async function extractAudio(
+	id: number,
+	label: string,
+	channelIndex: number | null,
+	bit: number,
+	msbFirst: boolean
+): Promise<AnalysisResponse> {
+	await ready;
+	if (!cached) throw new Error('No file is loaded.');
+
+	return {
+		id,
+		status: 'extract',
+		label: `${label} · bit ${bit} · ${msbFirst ? 'msb' : 'lsb'} first`,
+		// Rust takes a negative index to mean every channel interleaved, since
+		// wasm-bindgen has no Option<usize> across the boundary.
+		bytes: wav_lsb_extract(cached.bytes, channelIndex ?? -1, bit, msbFirst, EXTRACT_LIMIT)
 	};
 }
 
@@ -184,10 +292,22 @@ self.addEventListener('message', (event: MessageEvent<AnalysisRequest>) => {
 
 	const work =
 		request.kind === 'plane'
-			? plane(request.id, request.channel, request.bit)
+			? requestPlane(request.id, request.channel, request.bit)
 			: request.kind === 'extract'
 				? extract(request.id, request.channels, request.bit, request.msbFirst)
-				: analyse(request.id, request.name, new Uint8Array(request.bytes));
+				: request.kind === 'extractPalette'
+					? extractPalette(request.id, request.msbFirst)
+					: request.kind === 'extractJpeg'
+						? extractJpeg(request.id, request.includeDc, request.msbFirst)
+						: request.kind === 'extractAudio'
+							? extractAudio(
+									request.id,
+									request.label,
+									request.channelIndex,
+									request.bit,
+									request.msbFirst
+								)
+							: analyse(request.id, request.name, new Uint8Array(request.bytes));
 
 	work
 		.then((response) => self.postMessage(response))
@@ -200,6 +320,5 @@ self.addEventListener('message', (event: MessageEvent<AnalysisRequest>) => {
 				size: 0,
 				detail
 			} satisfies AnalysisResponse);
-			return;
 		});
 });

@@ -1,21 +1,31 @@
 <script lang="ts">
 	import AnalysisWorker from '$lib/worker/analysis.worker?worker';
 	import DropSurface from '$lib/components/DropSurface.svelte';
+	import Logo from '$lib/components/Logo.svelte';
 	import ToolRack from '$lib/components/ToolRack.svelte';
 	import Recovered from '$lib/components/Recovered.svelte';
 	import ChunkList from '$lib/components/ChunkList.svelte';
 	import HexView from '$lib/components/HexView.svelte';
 	import StringsView from '$lib/components/StringsView.svelte';
 	import SweepView from '$lib/components/SweepView.svelte';
+	import SpectrogramView from '$lib/components/SpectrogramView.svelte';
+	import RiffView from '$lib/components/RiffView.svelte';
+	import CoefficientView from '$lib/components/CoefficientView.svelte';
 	import PlaneWall from '$lib/components/PlaneWall.svelte';
 	import ChiTrace from '$lib/components/ChiTrace.svelte';
 	import RsView from '$lib/components/RsView.svelte';
 	import EntropyTrace from '$lib/components/EntropyTrace.svelte';
 	import MagicList from '$lib/components/MagicList.svelte';
 	import ExifView from '$lib/components/ExifView.svelte';
+	import PaletteView from '$lib/components/PaletteView.svelte';
 	import JpegView from '$lib/components/JpegView.svelte';
 	import { flagsOf, PLANNED, tools, WRITTEN_BY_HAND } from '$lib/analysis/tools';
-	import { COLOR_TYPES, isHeaderError, type AnalysisResponse } from '$lib/worker/protocol';
+	import {
+		COLOR_TYPES,
+		isHeaderError,
+		isJpegError,
+		type AnalysisResponse
+	} from '$lib/worker/protocol';
 
 	/** Plane and extract responses update a panel; they never become the page state. */
 	type Analysis = Exclude<AnalysisResponse, { status: 'plane' } | { status: 'extract' }>;
@@ -75,24 +85,36 @@
 						(e) => e.textual && WRITTEN_BY_HAND.has(e.name) && e.value.trim() !== ''
 					);
 
-					// Open whichever tool found something, most conclusive first.
+					const isWav = analysis.wav !== null;
+
+					// Open whichever tool found something, most conclusive first. An
+					// audio file with nothing else to show lands on the spectrogram,
+					// since that is the one panel a person has to read themselves.
 					activeTool = flags.some((f) => f.credible)
 						? 'flags'
 						: analysis.sweep?.candidates.length
 							? 'lsb'
-							: written
-								? 'exif'
-								: analysis.survey.jpegComments.length
-									? 'jpeg'
-									: analysis.chi?.detected
-										? 'chi'
-										: analysis.rs?.detected
-											? 'rs'
-											: analysis.survey.magic.some((m) => m.embedded)
-												? 'magic'
-												: analysis.structure
-													? 'chunks'
-													: 'strings';
+							: analysis.audio?.candidates.length
+								? 'audio-lsb'
+								: analysis.jpeg && !isJpegError(analysis.jpeg) && analysis.jpeg.candidates.length
+									? 'jsteg'
+									: analysis.paletteStego?.candidates.length
+										? 'palette'
+										: written
+											? 'exif'
+											: analysis.survey.jpegComments.length
+												? 'jpeg'
+												: analysis.chi?.detected
+													? 'chi'
+													: analysis.rs?.detected
+														? 'rs'
+														: analysis.survey.magic.some((m) => m.embedded)
+															? 'magic'
+															: isWav
+																? 'spectrogram'
+																: analysis.structure
+																	? 'chunks'
+																	: 'strings';
 				});
 			});
 		}
@@ -116,6 +138,33 @@
 	function requestExtract(channels: string, bit: number, msbFirst: boolean) {
 		extracted = null;
 		ensureWorker().postMessage({ kind: 'extract', id: ticket, channels, bit, msbFirst });
+	}
+
+	function requestExtractPalette(msbFirst: boolean) {
+		extracted = null;
+		ensureWorker().postMessage({ kind: 'extractPalette', id: ticket, msbFirst });
+	}
+
+	function requestExtractJpeg(includeDc: boolean, msbFirst: boolean) {
+		extracted = null;
+		ensureWorker().postMessage({ kind: 'extractJpeg', id: ticket, includeDc, msbFirst });
+	}
+
+	function requestExtractAudio(
+		label: string,
+		channelIndex: number | null,
+		bit: number,
+		msbFirst: boolean
+	) {
+		extracted = null;
+		ensureWorker().postMessage({
+			kind: 'extractAudio',
+			id: ticket,
+			label,
+			channelIndex,
+			bit,
+			msbFirst
+		});
 	}
 
 	function reset() {
@@ -163,18 +212,126 @@
 		view.phase === 'done' && view.result.status === 'ok' ? view.result.pixelError : null
 	);
 
+	const wav = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.wav : null
+	);
+	const audio = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.audio : null
+	);
+	const spectrogram = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.spectrogram : null
+	);
+	const jpegRaw = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.jpeg : null
+	);
+	const jpeg = $derived(jpegRaw && !isJpegError(jpegRaw) ? jpegRaw : null);
+	const jpegError = $derived(jpegRaw && isJpegError(jpegRaw) ? jpegRaw.error : null);
+
+	const paletteStego = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.paletteStego : null
+	);
+
+	const audioError = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.audioError : null
+	);
+
+	/** The decoder knows the size for every format; the PNG header only for one. */
 	const dimensions = $derived.by(() => {
+		if (wall) return { width: wall.width, height: wall.height };
 		if (!structure || isHeaderError(structure.header)) return { width: 0, height: 0 };
 		return { width: structure.header.width, height: structure.header.height };
 	});
 
-	const built = $derived(survey ? tools(survey, structure, sweep, wall, chi, rs) : []);
+	const built = $derived(
+		survey
+			? tools({
+					survey,
+					structure,
+					wav,
+					jpeg: jpegRaw,
+					paletteStego,
+					sweep,
+					wall,
+					chi,
+					rs,
+					audio,
+					spectrogram
+				})
+			: []
+	);
 	const current = $derived(built.find((t) => t.id === activeTool) ?? null);
 
 	const allFlags = $derived(survey ? flagsOf(survey, structure) : []);
 	const credibleFlags = $derived(allFlags.filter((f) => f.credible));
 	const suppressedFlags = $derived(allFlags.filter((f) => !f.credible));
-	const sweepFlags = $derived(sweep?.candidates.flatMap((c) => c.flags) ?? []);
+	/** Every sweep find, each carrying the name of the sweep that turned it up. */
+	const sweepFlags = $derived([
+		...(sweep?.candidates.flatMap((c) =>
+			c.flags.map((text) => ({ text, origin: 'from the pixel sweep' }))
+		) ?? []),
+		...(audio?.candidates.flatMap((c) =>
+			c.flags.map((text) => ({ text, origin: 'from the audio sweep' }))
+		) ?? []),
+		...(jpeg?.candidates.flatMap((c) =>
+			c.flags.map((text) => ({ text, origin: 'from the JPEG coefficients' }))
+		) ?? []),
+		...(paletteStego?.candidates.flatMap((c) =>
+			c.flags.map((text) => ({ text, origin: 'from the palette indices' }))
+		) ?? [])
+	]);
+
+	/** Both sweeps feed one view, so a find looks the same wherever it came from. */
+	const pixelRows = $derived(
+		sweep?.candidates.map((c) => ({
+			key: `${c.channels}-${c.bit}-${c.msbFirst}`,
+			title: c.channels,
+			chips: [`bit ${c.bit}`, `${c.msbFirst ? 'msb' : 'lsb'} first`],
+			reason: c.reason,
+			preview: c.preview,
+			readable: c.readable,
+			flags: c.flags,
+			onextract: () => requestExtract(c.channels, c.bit, c.msbFirst)
+		})) ?? null
+	);
+
+	const jpegRows = $derived(
+		jpeg?.candidates.map((c) => ({
+			key: `${c.includeDc}-${c.msbFirst}`,
+			title: c.includeDc ? 'all coefficients' : 'skipping DC',
+			chips: [`${c.msbFirst ? 'msb' : 'lsb'} first`],
+			reason: c.reason,
+			preview: c.preview,
+			readable: c.readable,
+			flags: c.flags,
+			onextract: () => requestExtractJpeg(c.includeDc, c.msbFirst)
+		})) ?? null
+	);
+
+	const paletteRows = $derived(
+		paletteStego?.candidates.map((c) => ({
+			key: String(c.msbFirst),
+			title: 'palette indices',
+			chips: [`${c.msbFirst ? 'msb' : 'lsb'} first`],
+			reason: c.reason,
+			preview: c.preview,
+			readable: c.readable,
+			flags: c.flags,
+			onextract: () => requestExtractPalette(c.msbFirst)
+		})) ?? null
+	);
+
+	const audioRows = $derived(
+		audio?.candidates.map((c) => ({
+			key: `${c.channels}-${c.bit}-${c.msbFirst}`,
+			title: c.channels,
+			chips: [`bit ${c.bit}`, `${c.msbFirst ? 'msb' : 'lsb'} first`],
+			reason: c.reason,
+			preview: c.preview,
+			readable: c.readable,
+			flags: c.flags,
+			onextract: () => requestExtractAudio(c.channels, c.channelIndex, c.bit, c.msbFirst)
+		})) ?? null
+	);
 
 	const chunk = $derived(structure?.chunks.find((c) => c.offset === selectedChunk) ?? null);
 
@@ -238,13 +395,18 @@
 	>
 		<header>
 			<div class="identity">
+				<Logo size={22} />
 				<span class="name">{view.phase === 'working' ? view.name : view.result.name}</span>
 				{#if view.phase === 'done'}
 					<span class="meta mono">{view.result.size.toLocaleString()} B</span>
 					{#if summary}
 						<span class="meta mono">{summary}</span>
 					{:else if survey?.format}
-						<span class="meta mono">{survey.format}</span>
+						<span class="meta mono">
+							{survey.format}{dimensions.width
+								? ` · ${dimensions.width} × ${dimensions.height}`
+								: ''}
+						</span>
 					{/if}
 				{/if}
 			</div>
@@ -309,11 +471,61 @@
 					{#if current?.status === 'pending' && current.scope === 'png' && !structure}
 						<p class="clear">
 							This tool reads the PNG container, and this file is
-							{survey.format ? `a ${survey.format}` : 'not a PNG'}. The tools above it read raw
-							bytes and ran normally.
+							{survey.format ? `a ${survey.format}` : 'not a PNG'}. The byte-level tools ran
+							normally.
 						</p>
+					{:else if current?.status === 'pending' && current.scope === 'pixels'}
+						<p class="clear">
+							This tool needs pixels, and there is no decoder for
+							{survey.format ? `a ${survey.format}` : 'this format'} yet. PNG, BMP and GIF all decode.
+							{pixelError ?? ''}
+						</p>
+					{:else if current?.status === 'pending' && current.scope === 'audio' && !wav}
+						<p class="clear">
+							This tool reads sound, and this file is
+							{survey.format ? `a ${survey.format}` : 'not audio'}. WAV is the format it reads. The
+							byte-level tools ran normally.
+						</p>
+					{:else if current?.status === 'pending' && current.scope === 'jpeg'}
+						<p class="clear">
+							This tool reads the numbers a JPEG stores after compression, and
+							{jpegError
+								? `this file could not be read: ${jpegError}`
+								: survey.format
+									? `this file is a ${survey.format}`
+									: 'this file is not a JPEG'}. The byte-level tools ran normally.
+						</p>
+					{:else if activeTool === 'jsteg'}
+						<SweepView
+							rows={jpegRows}
+							combinations={jpeg?.combinations ?? 0}
+							over="{(jpeg?.blocks ?? 0).toLocaleString()} blocks"
+							blocked="The coefficients could not be read, so no sweep ran."
+							error={jpegError}
+							{extracted}
+						/>
+					{:else if activeTool === 'jpeg-chi' && jpeg}
+						<ChiTrace
+							chi={jpeg.chi}
+							error={jpegError}
+							blocked="The coefficients could not be read, so the test did not run."
+						/>
+						<CoefficientView {jpeg} />
+					{:else if activeTool === 'spectrogram'}
+						<SpectrogramView {spectrogram} error={audioError} />
+					{:else if activeTool === 'audio-lsb'}
+						<SweepView
+							rows={audioRows}
+							combinations={audio?.combinations ?? 0}
+							over="{(audio?.samples ?? 0).toLocaleString()} samples"
+							blocked="The samples could not be read, so no sweep ran."
+							error={audioError}
+							{extracted}
+						/>
+					{:else if activeTool === 'riff'}
+						<RiffView {wav} />
 					{:else if activeTool === 'magic'}
-						<MagicList hits={survey.magic} size={survey.size} />
+						<MagicList hits={survey.magic} size={survey.size} bytes={view.bytes} />
 					{:else if activeTool === 'exif'}
 						<ExifView entries={survey.exif} />
 					{:else if activeTool === 'jpeg'}
@@ -344,7 +556,14 @@
 							onclose={() => (openPlane = null)}
 						/>
 					{:else if activeTool === 'lsb'}
-						<SweepView {sweep} error={pixelError} {extracted} onextract={requestExtract} />
+						<SweepView
+							rows={pixelRows}
+							combinations={sweep?.combinations ?? 0}
+							over="{(sweep?.pixels ?? 0).toLocaleString()} pixels"
+							blocked="Pixels could not be decoded, so no sweep ran."
+							error={pixelError}
+							{extracted}
+						/>
 						{#if sweep?.candidates.length && chi && !chi.detected}
 							<p class="scale-note">
 								Chi-square and RS stayed quiet on this file, which is consistent rather than
@@ -429,32 +648,18 @@
 							</ul>
 						{/if}
 					{:else if activeTool === 'palette' && structure}
-						{#if !structure.palette}
-							<p class="clear">This image has no colour palette, so there is nothing to compare.</p>
-						{:else}
-							<p class="lead">
-								{structure.palette.entries} colours, {structure.palette.unused} of them used by no pixel.
-							</p>
-							{#if structure.palette.duplicates.length === 0}
-								<p class="clear">
-									Every entry is a different colour. A palette with two entries for the same colour
-									lets an encoder pick either one, which changes the file without changing the
-									picture, and there is none of that here.
-								</p>
-							{:else}
-								<ul class="findings">
-									{#each structure.palette.duplicates as dup (dup.colour)}
-										<li>
-											<span class="mono big flagged">{dup.colour}</span>
-											<span class="mono muted">appears {dup.count} times in the palette</span>
-										</li>
-									{/each}
-								</ul>
-								<p class="scale-note">
-									Roughly {structure.palette.capacityBits.toLocaleString()} bits could be hidden by choosing
-									between duplicate entries, and the picture would look identical.
-								</p>
-							{/if}
+						<PaletteView palette={structure.palette} stego={paletteStego} />
+						{#if paletteStego && paletteStego.groups.length > 0}
+							<div class="palette-read">
+								<SweepView
+									rows={paletteRows}
+									combinations={paletteStego.combinations}
+									over="{paletteStego.capacityBits.toLocaleString()} carried bits"
+									blocked="The pixel data could not be read, so the indices were not swept."
+									error={pixelError}
+									{extracted}
+								/>
+							</div>
 						{/if}
 					{:else if activeTool === 'strings'}
 						<StringsView total={survey.strings.total} sample={survey.strings.sample} />
@@ -512,9 +717,13 @@
 	.identity {
 		display: flex;
 		flex-wrap: wrap;
-		align-items: baseline;
+		align-items: center;
 		gap: var(--s2) var(--s4);
 		min-width: 0;
+	}
+
+	.identity :global(.logo) {
+		color: var(--muted);
 	}
 
 	.name {
@@ -632,6 +841,12 @@
 		font-size: var(--t-mid);
 		overflow-wrap: anywhere;
 		user-select: all;
+	}
+
+	.palette-read {
+		margin-top: var(--s5);
+		padding-top: var(--s4);
+		border-top: 1px solid var(--rule);
 	}
 
 	.scale-note {

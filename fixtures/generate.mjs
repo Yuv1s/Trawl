@@ -375,6 +375,129 @@ emit(
 	);
 }
 
+/** An uncompressed 24-bit BMP: bottom-up rows, blue first, padded to four bytes. */
+function bmp(width, height, pixels) {
+	const stride = Math.ceil((width * 24) / 32) * 4;
+	const body = Buffer.alloc(stride * height);
+
+	for (let y = 0; y < height; y++) {
+		const row = height - 1 - y; // bottom-up
+		for (let x = 0; x < width; x++) {
+			const src = (y * width + x) * 4;
+			const at = row * stride + x * 3;
+			body[at] = pixels[src + 2];
+			body[at + 1] = pixels[src + 1];
+			body[at + 2] = pixels[src];
+		}
+	}
+
+	const header = Buffer.alloc(54);
+	header.write('BM', 0, 'latin1');
+	header.writeUInt32LE(54 + body.length, 2);
+	header.writeUInt32LE(54, 10);
+	header.writeUInt32LE(40, 14);
+	header.writeInt32LE(width, 18);
+	header.writeInt32LE(height, 22);
+	header.writeUInt16LE(1, 26);
+	header.writeUInt16LE(24, 28);
+	header.writeInt32LE(2835, 38);
+	header.writeInt32LE(2835, 42);
+
+	return Buffer.concat([header, body]);
+}
+
+// BMP is uncompressed, so a payload in the low bits survives intact. Same cover
+// and the same message as the PNG sweep fixture, so the two are comparable.
+// Same dimensions as the PNG fixtures, so the two are directly comparable and
+// the statistical tools have the same number of samples to work with.
+{
+	const px = cover(W, H);
+	embedMessage(px, 'flag{bitmaps_hide_things_too}', { channels: 'rgb', bit: 0, order: 'msb' });
+	emit('lsb.bmp', bmp(W, H, px), 'message in the low bits of an uncompressed BMP');
+}
+
+emit('clean.bmp', bmp(W, H, cover(W, H)), 'untouched bitmap, nothing hidden');
+
+/** A GIF with a global colour table, LZW compressed, optionally commented. */
+function gif(width, height, indices, table, comment) {
+	const bits = Math.max(1, Math.ceil(Math.log2(table.length)) - 1);
+	const entries = 2 << bits;
+
+	const out = [Buffer.from('GIF89a', 'latin1')];
+	const screen = Buffer.alloc(7);
+	screen.writeUInt16LE(width, 0);
+	screen.writeUInt16LE(height, 2);
+	screen[4] = 0x80 | bits;
+	out.push(screen);
+
+	const palette = Buffer.alloc(entries * 3);
+	table.forEach(([r, g, b], i) => {
+		palette[i * 3] = r;
+		palette[i * 3 + 1] = g;
+		palette[i * 3 + 2] = b;
+	});
+	out.push(palette);
+
+	if (comment) {
+		out.push(Buffer.from([0x21, 0xfe]));
+		const text = Buffer.from(comment, 'latin1');
+		out.push(Buffer.from([text.length]), text, Buffer.from([0]));
+	}
+
+	const descriptor = Buffer.alloc(10);
+	descriptor[0] = 0x2c;
+	descriptor.writeUInt16LE(width, 5);
+	descriptor.writeUInt16LE(height, 7);
+	out.push(descriptor);
+
+	// LZW with the dictionary cleared before every code, which is valid and keeps
+	// this generator short. Codes stay at one bit above the minimum.
+	const minCodeSize = Math.max(2, bits + 1);
+	const clear = 1 << minCodeSize;
+	const end = clear + 1;
+	const codeWidth = minCodeSize + 1;
+
+	const bitsOut = [];
+	const push = (code) => {
+		for (let i = 0; i < codeWidth; i++) bitsOut.push((code >> i) & 1);
+	};
+	push(clear);
+	for (const index of indices) {
+		push(index);
+		push(clear);
+	}
+	push(end);
+
+	const packed = Buffer.alloc(Math.ceil(bitsOut.length / 8));
+	bitsOut.forEach((bit, i) => {
+		if (bit) packed[i >> 3] |= 1 << (i % 8);
+	});
+
+	out.push(Buffer.from([minCodeSize]));
+	for (let at = 0; at < packed.length; at += 255) {
+		const block = packed.subarray(at, at + 255);
+		out.push(Buffer.from([block.length]), block);
+	}
+	out.push(Buffer.from([0, 0x3b]));
+
+	return Buffer.concat(out);
+}
+
+{
+	const w = 64;
+	const h = 48;
+	const table = Array.from({ length: 16 }, (_, i) => [i * 16, 255 - i * 16, (i * 37) % 256]);
+	// Two entries painting the same colour, the GIF version of the PNG trick.
+	table[9] = [...table[3]];
+	const indices = Array.from({ length: w * h }, (_, i) => (i * 5) % 16);
+
+	emit(
+		'comment.gif',
+		gif(w, h, indices, table, 'flag{gif_comment_block}'),
+		'flag in a GIF comment block, with a duplicated palette entry'
+	);
+}
+
 /** A little-endian TIFF block, the same structure JPEG and PNG both carry. */
 function tiff(fields) {
 	const count = fields.length;
@@ -451,6 +574,593 @@ function tiff(fields) {
 	const block = tiff([[0x9286, 'flag{png_carries_exif_too}']]);
 	const px = cover(120, 90);
 	emit('exif-in-png.png', encode(120, 90, px, [chunk('eXIf', block)]), 'flag in a PNG eXIf chunk');
+}
+
+/** A RIFF/WAVE file from 16-bit signed frames, interleaved by channel. */
+function wav(frames, channels, rate, extraChunks = []) {
+	const data = Buffer.alloc(frames.length * 2);
+	frames.forEach((s, i) => data.writeInt16LE(Math.max(-32768, Math.min(32767, s | 0)), i * 2));
+
+	const fmt = Buffer.alloc(16);
+	fmt.writeUInt16LE(1, 0); // PCM
+	fmt.writeUInt16LE(channels, 2);
+	fmt.writeUInt32LE(rate, 4);
+	fmt.writeUInt32LE(rate * channels * 2, 8);
+	fmt.writeUInt16LE(channels * 2, 12);
+	fmt.writeUInt16LE(16, 14);
+
+	const riffChunk = (id, payload) => {
+		const head = Buffer.alloc(8);
+		head.write(id, 0, 'latin1');
+		head.writeUInt32LE(payload.length, 4);
+		const pad = payload.length % 2 === 1 ? Buffer.from([0]) : Buffer.alloc(0);
+		return Buffer.concat([head, payload, pad]);
+	};
+
+	const body = Buffer.concat([
+		Buffer.from('WAVE', 'latin1'),
+		riffChunk('fmt ', fmt),
+		...extraChunks.map(([id, payload]) => riffChunk(id, payload)),
+		riffChunk('data', data)
+	]);
+
+	const head = Buffer.alloc(8);
+	head.write('RIFF', 0, 'latin1');
+	head.writeUInt32LE(body.length, 4);
+	return Buffer.concat([head, body]);
+}
+
+const RATE = 22050;
+const SECONDS = 3;
+
+/** A chord plus a little dither, so the low bits move the way a recording's do. */
+function music(count, channels, seed) {
+	const noise = rng(seed);
+	const out = new Array(count * channels);
+
+	for (let i = 0; i < count; i++) {
+		const t = i / RATE;
+		const envelope = Math.min(1, t * 4) * Math.min(1, (SECONDS - t) * 4);
+		for (let c = 0; c < channels; c++) {
+			const detune = c === 0 ? 1 : 1.005;
+			const value =
+				Math.sin(2 * Math.PI * 220 * detune * t) * 0.4 +
+				Math.sin(2 * Math.PI * 330 * detune * t) * 0.25 +
+				Math.sin(2 * Math.PI * 440 * detune * t) * 0.15;
+			out[i * channels + c] = Math.round(value * envelope * 12000 + (noise() % 5) - 2);
+		}
+	}
+
+	return out;
+}
+
+/** Writes a message into one bit plane of the samples, in place. */
+function embedSamples(
+	samples,
+	text,
+	{ channels = 1, channel = null, bit = 0, order = 'msb' } = {}
+) {
+	const bytes = Buffer.from(text, 'latin1');
+	const step = channel === null ? 1 : channels;
+	const start = channel === null ? 0 : channel;
+
+	for (let i = 0; i < bytes.length * 8; i++) {
+		const at = start + i * step;
+		if (at >= samples.length) break;
+		const shift = order === 'msb' ? 7 - (i % 8) : i % 8;
+		const b = (bytes[i >> 3] >> shift) & 1;
+		samples[at] = (samples[at] & ~(1 << bit)) | (b << bit);
+	}
+}
+
+emit('clean.wav', wav(music(RATE * SECONDS, 1, 5), 1, RATE), 'untouched audio, nothing hidden');
+
+{
+	const samples = music(RATE * SECONDS, 1, 6);
+	embedSamples(samples, 'flag{the_low_bits_of_the_waveform}', { bit: 0, order: 'msb' });
+	emit('lsb.wav', wav(samples, 1, RATE), 'message in the low bit of every sample');
+}
+
+{
+	const samples = music(RATE * SECONDS, 2, 7);
+	embedSamples(samples, 'flag{right_channel_carries_it}', { channels: 2, channel: 1, bit: 0 });
+	emit('lsb-right.wav', wav(samples, 2, RATE), 'message in the right channel only');
+}
+
+// A picture drawn straight into the frequency domain: nothing statistical will
+// ever find this, which is exactly why the spectrogram exists.
+{
+	const glyphs = {
+		T: ['#####', '..#..', '..#..', '..#..', '..#..'],
+		R: ['####.', '#...#', '####.', '#..#.', '#...#'],
+		A: ['.###.', '#...#', '#####', '#...#', '#...#'],
+		W: ['#...#', '#...#', '#.#.#', '##.##', '#...#'],
+		L: ['#....', '#....', '#....', '#....', '#####']
+	};
+
+	const word = 'TRAWL';
+	const cellW = 5;
+	const cols = word.length * (cellW + 1);
+	const rows = 5;
+
+	const count = RATE * SECONDS;
+	const samples = new Array(count).fill(0);
+
+	// One tone per lit cell, held for the slice of time that column covers.
+	for (let c = 0; c < cols; c++) {
+		const letter = glyphs[word[Math.floor(c / (cellW + 1))]];
+		const column = c % (cellW + 1);
+		if (column === cellW) continue;
+
+		for (let r = 0; r < rows; r++) {
+			if (letter[r][column] !== '#') continue;
+
+			// Rows run top to bottom, so the top row is the highest frequency.
+			// Spread wide, or five rows land in the bottom tenth of the image.
+			const hz = 900 + (rows - 1 - r) * 1900;
+			const from = Math.floor((c / cols) * count);
+			const to = Math.floor(((c + 1) / cols) * count);
+
+			for (let i = from; i < to; i++) {
+				const t = i / RATE;
+				// A cell that switches on abruptly is a click, and a click is
+				// broadband: it draws a vertical line through every row.
+				const envelope = 0.5 - 0.5 * Math.cos((2 * Math.PI * (i - from)) / (to - from));
+				samples[i] += Math.sin(2 * Math.PI * hz * t) * 5000 * envelope;
+			}
+		}
+	}
+
+	emit('spectrogram.wav', wav(samples, 1, RATE), 'the word TRAWL drawn in the spectrogram');
+}
+
+{
+	// A real LIST/INFO: the type, then a tag with its own length, then the text.
+	const text = Buffer.from('flag{riff_comment_chunk}\0', 'latin1');
+	const size = Buffer.alloc(4);
+	size.writeUInt32LE(text.length, 0);
+	const list = Buffer.concat([Buffer.from('INFOICMT', 'latin1'), size, text]);
+
+	const samples = music(RATE * SECONDS, 1, 8);
+	emit(
+		'comment.wav',
+		wav(samples, 1, RATE, [['LIST', list]]),
+		'flag in a LIST chunk a player skips'
+	);
+}
+
+{
+	const samples = music(RATE * SECONDS, 1, 9);
+	const file = wav(samples, 1, RATE);
+	emit(
+		'appended.wav',
+		Buffer.concat([file, Buffer.from('flag{past_the_declared_end}', 'latin1')]),
+		'bytes past the length the RIFF header declares'
+	);
+}
+
+/** Standard JPEG Huffman tables, Annex K. Real variable-length codes, so the
+ *  decoder's canonical builder is exercised rather than a flat stand-in. */
+const DC_LUMA_COUNTS = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+const DC_LUMA_VALUES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+
+const AC_LUMA_COUNTS = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d];
+const AC_LUMA_VALUES = [
+	0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+	0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0,
+	0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28,
+	0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+	0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+	0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+	0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+	0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5,
+	0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2,
+	0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
+	0xf9, 0xfa
+];
+
+/** Canonical code assignment: the same walk the decoder does, in reverse. */
+function codes(counts, values) {
+	const table = new Map();
+	let code = 0;
+	let k = 0;
+
+	for (let length = 1; length <= 16; length++) {
+		for (let i = 0; i < counts[length - 1]; i++) {
+			table.set(values[k++], { code, length });
+			code++;
+		}
+		code <<= 1;
+	}
+
+	return table;
+}
+
+const DC_CODES = codes(DC_LUMA_COUNTS, DC_LUMA_VALUES);
+const AC_CODES = codes(AC_LUMA_COUNTS, AC_LUMA_VALUES);
+
+class Bits {
+	constructor() {
+		this.out = [];
+		this.byte = 0;
+		this.filled = 0;
+	}
+
+	push(bit) {
+		this.byte = ((this.byte << 1) | (bit & 1)) & 0xff;
+		if (++this.filled === 8) {
+			this.out.push(this.byte);
+			if (this.byte === 0xff) this.out.push(0x00);
+			this.byte = 0;
+			this.filled = 0;
+		}
+	}
+
+	write(value, length) {
+		for (let i = length - 1; i >= 0; i--) this.push((value >> i) & 1);
+	}
+
+	symbol(table, key) {
+		const entry = table.get(key);
+		if (!entry) throw new Error(`no Huffman code for 0x${key.toString(16)}`);
+		this.write(entry.code, entry.length);
+	}
+
+	flush() {
+		while (this.filled !== 0) this.push(1);
+	}
+}
+
+function magnitude(value) {
+	if (value === 0) return [0, 0];
+	const size = 32 - Math.clz32(Math.abs(value));
+	return [size, value > 0 ? value : value + (1 << size) - 1];
+}
+
+function encodeBlock(bits, block, state) {
+	const [size, value] = magnitude(block[0] - state.dc);
+	state.dc = block[0];
+	bits.symbol(DC_CODES, size);
+	bits.write(value, size);
+
+	let last = 0;
+	for (let k = 63; k > 0; k--) {
+		if (block[k] !== 0) {
+			last = k;
+			break;
+		}
+	}
+
+	let run = 0;
+	for (let k = 1; k <= last; k++) {
+		if (block[k] === 0) {
+			run++;
+			continue;
+		}
+		while (run >= 16) {
+			bits.symbol(AC_CODES, 0xf0);
+			run -= 16;
+		}
+		const [s, v] = magnitude(block[k]);
+		bits.symbol(AC_CODES, (run << 4) | s);
+		bits.write(v, s);
+		run = 0;
+	}
+
+	if (last < 63) bits.symbol(AC_CODES, 0x00);
+}
+
+function seg(code, payload) {
+	const head = Buffer.alloc(4);
+	head[0] = 0xff;
+	head[1] = code;
+	head.writeUInt16BE(payload.length + 2, 2);
+	return Buffer.concat([head, Buffer.from(payload)]);
+}
+
+/**
+ * A baseline grayscale JPEG carrying exactly these coefficient blocks.
+ *
+ * No forward DCT: the coefficients are the point, and writing them directly is
+ * what makes the fixture's contents knowable rather than a guess about what an
+ * encoder produced. The result is a structurally valid JPEG any decoder opens.
+ */
+function encodeJpeg(blocks, width, height) {
+	const dqt = [0x00, ...new Array(64).fill(1)];
+
+	const sof = [8, height >> 8, height & 0xff, width >> 8, width & 0xff, 1, 1, 0x11, 0];
+
+	const dht = [
+		0x00,
+		...DC_LUMA_COUNTS,
+		...DC_LUMA_VALUES,
+		0x10,
+		...AC_LUMA_COUNTS,
+		...AC_LUMA_VALUES
+	];
+
+	const sos = [1, 1, 0x00, 0, 63, 0];
+
+	const bits = new Bits();
+	const state = { dc: 0 };
+	for (const block of blocks) encodeBlock(bits, block, state);
+	bits.flush();
+
+	return Buffer.concat([
+		Buffer.from([0xff, 0xd8]),
+		seg(0xdb, dqt),
+		seg(0xc0, sof),
+		seg(0xc4, dht),
+		seg(0xda, sos),
+		Buffer.from(bits.out),
+		Buffer.from([0xff, 0xd9])
+	]);
+}
+
+/** Coefficients that behave like a photograph: a wandering DC and AC magnitudes
+ *  that decay geometrically away from zero. A uniform spread would already look
+ *  embedded to the chi-square test, which is the trap this generator has fallen
+ *  into before on other formats. */
+function jpegCover(count, seed) {
+	const rand = rng(seed);
+	const blocks = [];
+	let dc = 0;
+
+	for (let i = 0; i < count; i++) {
+		const block = new Int32Array(64);
+		dc += (rand() % 21) - 10;
+		block[0] = Math.max(-500, Math.min(500, dc));
+
+		for (let k = 1; k < 40; k++) {
+			const reach = 40 - k;
+			if (rand() % 64 >= reach) continue;
+
+			let magnitude = 1;
+			while (magnitude < 30 && rand() % 100 < 60) magnitude++;
+			block[k] = rand() % 2 === 0 ? magnitude : -magnitude;
+		}
+
+		blocks.push(block);
+	}
+
+	return blocks;
+}
+
+/** JSteg: the low bit of every coefficient except those equal to 0 or 1. */
+function embedJsteg(blocks, text) {
+	const bytes = Buffer.from(text, 'latin1');
+	let written = 0;
+
+	for (const block of blocks) {
+		for (let k = 1; k < 64; k++) {
+			if (written === bytes.length * 8) return written;
+			const value = block[k];
+			if (value === 0 || value === 1) continue;
+			const bit = (bytes[written >> 3] >> (7 - (written % 8))) & 1;
+			block[k] = (value & ~1) | bit;
+			written++;
+		}
+	}
+
+	return written;
+}
+
+{
+	const BLOCKS = 1200;
+	const W = 8 * 40;
+	const H = 8 * 30;
+
+	emit(
+		'clean.jpg',
+		encodeJpeg(jpegCover(BLOCKS, 11), W, H),
+		'untouched coefficients, nothing hidden'
+	);
+
+	const carrying = jpegCover(BLOCKS, 12);
+	embedJsteg(carrying, 'flag{jsteg_lives_in_the_coefficients}');
+	emit('jsteg.jpg', encodeJpeg(carrying, W, H), 'message in the low bits of the DCT coefficients');
+
+	// Every usable coefficient filled, which is what chi-square is built to see.
+	// The filler has to be bit-balanced: a structured one skews the pairs and
+	// makes the detector look weaker than it is.
+	const saturated = jpegCover(BLOCKS, 13);
+	const capacity = saturated.reduce(
+		(n, b) => n + b.slice(1).filter((v) => v !== 0 && v !== 1).length,
+		0
+	);
+	const noise = rng(14);
+	const filler = Array.from({ length: Math.floor(capacity / 8) }, () =>
+		String.fromCharCode(noise() & 0xff)
+	).join('');
+	embedJsteg(saturated, filler);
+	emit('jsteg-full.jpg', encodeJpeg(saturated, W, H), 'every usable coefficient carries a bit');
+}
+
+// An indexed image carrying a message in the choice between identical entries.
+// The picture is unchanged by construction: every choice paints the same colour.
+{
+	const width = 128;
+	const height = 128;
+
+	const palette = Buffer.alloc(256 * 3);
+	for (let i = 0; i < 256; i++) {
+		palette[i * 3] = (i * 3) % 256;
+		palette[i * 3 + 1] = (i * 5) % 256;
+		palette[i * 3 + 2] = (i * 11) % 256;
+	}
+
+	// Four pairs, each pair painting one colour, so a pixel using any of them
+	// carries one bit.
+	const pairs = [
+		[8, 190],
+		[9, 191],
+		[10, 192],
+		[11, 193]
+	];
+	for (const [a, b] of pairs) {
+		for (const c of [0, 1, 2]) palette[b * 3 + c] = palette[a * 3 + c];
+	}
+
+	const message = Buffer.from('flag{the_palette_chose_these_bits}\0', 'latin1');
+	const noise = rng(0x9a11);
+	const indices = Buffer.alloc(width * height);
+	let written = 0;
+
+	for (let i = 0; i < indices.length; i++) {
+		// Roughly half the picture uses a duplicated colour, the rest does not,
+		// which is what an ordinary image with a redundant palette looks like.
+		if (noise() % 2 === 0) {
+			indices[i] = 20 + (noise() % 100);
+			continue;
+		}
+
+		const pair = pairs[written % pairs.length];
+		if (written < message.length * 8) {
+			const bit = (message[written >> 3] >> (7 - (written % 8))) & 1;
+			indices[i] = pair[bit];
+			written++;
+		} else {
+			indices[i] = pair[0];
+			written++;
+		}
+	}
+
+	const stride = width;
+	const raw = Buffer.alloc((stride + 1) * height);
+	for (let y = 0; y < height; y++) {
+		raw[y * (stride + 1)] = 0;
+		indices.copy(raw, y * (stride + 1) + 1, y * stride, (y + 1) * stride);
+	}
+
+	const ihdr = Buffer.alloc(13);
+	ihdr.writeUInt32BE(width, 0);
+	ihdr.writeUInt32BE(height, 4);
+	ihdr[8] = 8;
+	ihdr[9] = 3;
+
+	emit(
+		'palette-payload.png',
+		Buffer.concat([
+			SIGNATURE,
+			chunk('IHDR', ihdr),
+			chunk('PLTE', palette),
+			chunk('IDAT', deflateSync(raw, { level: 9 })),
+			chunk('IEND', Buffer.alloc(0))
+		]),
+		'message hidden in the choice between identical palette entries'
+	);
+}
+
+/**
+ * A progressive JPEG: the DC coefficients in one scan, then the AC coefficients
+ * in another. Spectral selection only, which is the simplest shape a real
+ * encoder emits and enough to prove the multi-scan path end to end.
+ */
+function encodeProgressiveJpeg(blocks, width, height) {
+	const dqt = [0x00, ...new Array(64).fill(1)];
+	const sof = [8, height >> 8, height & 0xff, width >> 8, width & 0xff, 1, 1, 0x11, 0];
+	const dht = [
+		0x00,
+		...DC_LUMA_COUNTS,
+		...DC_LUMA_VALUES,
+		0x10,
+		...AC_LUMA_COUNTS,
+		...AC_LUMA_VALUES
+	];
+
+	// DC scan: one symbol per block, no AC at all.
+	const dcBits = new Bits();
+	let predictor = 0;
+	for (const block of blocks) {
+		const [size, value] = magnitude(block[0] - predictor);
+		predictor = block[0];
+		dcBits.symbol(DC_CODES, size);
+		dcBits.write(value, size);
+	}
+	dcBits.flush();
+
+	// AC scan: indices 1 to 63, with empty blocks folded into end-of-band runs.
+	const acBits = new Bits();
+	let eobRun = 0;
+
+	const flushEob = () => {
+		if (eobRun === 0) return;
+		const r = 31 - Math.clz32(eobRun);
+		acBits.symbol(AC_CODES, r << 4);
+		if (r > 0) acBits.write(eobRun - (1 << r), r);
+		eobRun = 0;
+	};
+
+	for (const block of blocks) {
+		let last = 0;
+		for (let k = 63; k > 0; k--) {
+			if (block[k] !== 0) {
+				last = k;
+				break;
+			}
+		}
+
+		if (last === 0) {
+			eobRun++;
+			if (eobRun === (1 << 14) - 1) flushEob();
+			continue;
+		}
+
+		flushEob();
+
+		let run = 0;
+		for (let k = 1; k <= last; k++) {
+			if (block[k] === 0) {
+				run++;
+				continue;
+			}
+			while (run >= 16) {
+				acBits.symbol(AC_CODES, 0xf0);
+				run -= 16;
+			}
+			const [s, v] = magnitude(block[k]);
+			acBits.symbol(AC_CODES, (run << 4) | s);
+			acBits.write(v, s);
+			run = 0;
+		}
+
+		if (last < 63) eobRun = 1;
+	}
+
+	flushEob();
+	acBits.flush();
+
+	return Buffer.concat([
+		Buffer.from([0xff, 0xd8]),
+		seg(0xdb, dqt),
+		seg(0xc2, sof), // SOF2 marks it progressive
+		seg(0xc4, dht),
+		seg(0xda, [1, 1, 0x00, 0, 0, 0]),
+		Buffer.from(dcBits.out),
+		seg(0xda, [1, 1, 0x00, 1, 63, 0]),
+		Buffer.from(acBits.out),
+		Buffer.from([0xff, 0xd9])
+	]);
+}
+
+{
+	const BLOCKS = 1200;
+	const W = 8 * 40;
+	const H = 8 * 30;
+
+	const carrying = jpegCover(BLOCKS, 21);
+	embedJsteg(carrying, 'flag{progressive_still_reads}');
+	emit(
+		'jsteg-progressive.jpg',
+		encodeProgressiveJpeg(carrying, W, H),
+		'the same payload, in a progressive JPEG split across two scans'
+	);
+
+	emit(
+		'clean-progressive.jpg',
+		encodeProgressiveJpeg(jpegCover(BLOCKS, 22), W, H),
+		'progressive JPEG with nothing hidden'
+	);
 }
 
 const width = Math.max(...made.map((m) => m.name.length));

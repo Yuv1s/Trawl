@@ -111,6 +111,10 @@ pub fn json(data: &[u8]) -> String {
         out.push(',');
         push_field(&mut out, "label", hit.label);
         out.push(',');
+        push_number(&mut out, "length", hit.length);
+        out.push(',');
+        push_bool(&mut out, "bounded", hit.bounded);
+        out.push(',');
         push_bool(&mut out, "embedded", hit.offset > 0);
         out.push('}');
     }

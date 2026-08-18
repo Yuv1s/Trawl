@@ -91,7 +91,46 @@ pub fn utf16le_strings(data: &[u8], min_len: usize) -> Vec<Found> {
 }
 
 fn tag_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Characters a person would type inside a flag.
+fn body_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b' ' | b'.' | b'!' | b'?')
+}
+
+/// How much of a body has to look like writing rather than punctuation soup.
+///
+/// Uncompressed pixel data is not high-entropy enough for the region rule to
+/// suppress it, but it is random enough to throw this shape constantly. A run of
+/// bytes that happens to sit between braces is not a flag unless it also reads
+/// like something a person typed.
+const MIN_BODY_WRITTEN: f32 = 0.85;
+
+/// Shortest tag worth trusting.
+///
+/// Two-character tags are where the noise lives: a bitmap threw two dozen of
+/// them per image, `iJ{eHzcJ}` and the like, all pure alphanumeric so no
+/// character test separates them. Real prefixes are `flag`, `picoCTF`, `HTB`.
+/// A two-letter competition prefix would be missed, and that is the trade.
+const MIN_TAG: usize = 3;
+
+const MIN_BODY: usize = 4;
+
+/// How lopsided the letter case has to be.
+///
+/// People write flags in one case, usually lower with underscores. Bytes pulled
+/// out of a photograph alternate case at random, which is the one property that
+/// separates `eLwaGqDnYDoZHt` from `bitmaps_hide_things_too`.
+const MIN_CASE_AGREEMENT: f32 = 0.75;
+
+fn case_is_consistent(body: &[u8]) -> bool {
+    let lower = body.iter().filter(|b| b.is_ascii_lowercase()).count();
+    let upper = body.iter().filter(|b| b.is_ascii_uppercase()).count();
+    let letters = lower + upper;
+
+    // Digits and underscores carry no case, so a body without letters passes.
+    letters < 3 || lower.max(upper) as f32 / letters as f32 >= MIN_CASE_AGREEMENT
 }
 
 /// Scans for the `tag{payload}` shape every competition uses: picoCTF{...},
@@ -101,7 +140,8 @@ fn tag_byte(b: u8) -> bool {
 /// A match is a candidate, never an assertion. The caller decides what to do
 /// with it.
 pub fn flag_candidates(data: &[u8]) -> Vec<Found> {
-    const MAX_TAG: usize = 24;
+    // Real prefixes are short: flag, picoCTF, HTB, testCTF. Nothing near twelve.
+    const MAX_TAG: usize = 12;
     const MAX_BODY: usize = 256;
 
     let mut out = Vec::new();
@@ -113,8 +153,11 @@ pub fn flag_candidates(data: &[u8]) -> Vec<Found> {
             continue;
         }
 
+        // Take the whole run and reject it if it overruns, rather than trimming
+        // it to the limit. Trimming turned any long stretch of alphanumerics
+        // into a maximum-length tag, which passed every check by construction.
         let mut tag_start = i;
-        while tag_start > 0 && tag_byte(data[tag_start - 1]) && i - tag_start < MAX_TAG {
+        while tag_start > 0 && tag_byte(data[tag_start - 1]) {
             tag_start -= 1;
         }
 
@@ -129,10 +172,21 @@ pub fn flag_candidates(data: &[u8]) -> Vec<Found> {
         };
 
         let tag_len = i - tag_start;
-        let body_len = close - i - 1;
-        let body_printable = data[i + 1..close].iter().all(|&b| printable(b));
+        let body = &data[i + 1..close];
+        let body_len = body.len();
 
-        if (2..=MAX_TAG).contains(&tag_len) && body_len >= 3 && body_printable {
+        // A real tag starts with a letter: picoCTF, flag, HTB. A run of bytes
+        // ending in something tag-shaped by accident usually does not.
+        let tag_ok =
+            (MIN_TAG..=MAX_TAG).contains(&tag_len) && data[tag_start].is_ascii_alphabetic();
+
+        let written = body.iter().filter(|&&b| body_byte(b)).count();
+        let body_ok = body_len >= MIN_BODY
+            && body.iter().all(|&b| printable(b))
+            && written as f32 / body_len as f32 >= MIN_BODY_WRITTEN
+            && case_is_consistent(body);
+
+        if tag_ok && body_ok {
             out.push(Found {
                 offset: tag_start,
                 text: String::from_utf8_lossy(&data[tag_start..=close]).into_owned(),
@@ -173,6 +227,49 @@ pub fn identify(data: &[u8]) -> Option<&'static str> {
 pub struct MagicHit {
     pub offset: usize,
     pub label: &'static str,
+    /// How many bytes to carve out.
+    pub length: usize,
+    /// True when a real end marker was found. False means the length is a guess,
+    /// running to the next signature or the end of the file, and the carved
+    /// result may carry a tail of whatever followed.
+    pub bounded: bool,
+}
+
+fn find(data: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    data.get(from..)?
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| from + p)
+}
+
+/// Where an embedded file ends, for the formats that say so.
+///
+/// Carving without this is guesswork: you get the file plus everything after it.
+/// Each of these terminators is defined by the format, so the extraction is
+/// exact rather than approximate.
+fn extent(data: &[u8], at: usize, label: &str) -> Option<usize> {
+    match label {
+        // The IEND chunk is the last thing in a PNG: type, then a four-byte CRC.
+        "PNG image" => find(data, at, b"IEND").map(|p| p + 8),
+        // End of image.
+        "JPEG image" => find(data, at + 2, &[0xff, 0xd9]).map(|p| p + 2),
+        // End of central directory, then a variable-length comment.
+        "ZIP archive" => find(data, at, b"PK\x05\x06").and_then(|p| {
+            let comment = data.get(p + 20..p + 22)?;
+            Some(p + 22 + u16::from_le_bytes([comment[0], comment[1]]) as usize)
+        }),
+        "PDF document" => {
+            // A PDF may be appended to several times, so the last one wins.
+            let mut last = None;
+            let mut from = at;
+            while let Some(p) = find(data, from, b"%%EOF") {
+                last = Some(p + 5);
+                from = p + 5;
+            }
+            last
+        }
+        _ => None,
+    }
 }
 
 /// A signature plus whatever extra check keeps it from firing on noise.
@@ -250,21 +347,39 @@ const SCANNABLE: [Scannable; 12] = [
 /// This is the binwalk move: a container appended to or embedded inside another
 /// file announces itself with its own magic, wherever it happens to sit.
 pub fn magic_scan(data: &[u8]) -> Vec<MagicHit> {
-    let mut out = Vec::new();
+    let mut found = Vec::new();
 
     for at in 0..data.len() {
         for candidate in &SCANNABLE {
             if data[at..].starts_with(candidate.magic) && (candidate.validate)(data, at) {
-                out.push(MagicHit {
-                    offset: at,
-                    label: candidate.label,
-                });
+                found.push((at, candidate.label));
                 break;
             }
         }
     }
 
-    out
+    // A second pass, because an unbounded file runs until the next one starts.
+    found
+        .iter()
+        .enumerate()
+        .map(|(i, &(at, label))| {
+            let next = found.get(i + 1).map(|&(o, _)| o).unwrap_or(data.len());
+            match extent(data, at, label) {
+                Some(end) if end > at && end <= data.len() => MagicHit {
+                    offset: at,
+                    label,
+                    length: end - at,
+                    bounded: true,
+                },
+                _ => MagicHit {
+                    offset: at,
+                    label,
+                    length: next - at,
+                    bounded: false,
+                },
+            }
+        })
+        .collect()
 }
 
 /// Shannon entropy of a byte run, in bits per byte, so 8.0 is incompressible.
@@ -430,6 +545,108 @@ mod tests {
         }
     }
 
+    /// Carving without a real terminator gives you the file plus everything that
+    /// followed it. These four formats say where they end, so the extraction is
+    /// exact rather than approximate.
+    #[test]
+    fn magic_scan_measures_a_png_to_its_iend_chunk() {
+        let mut data = vec![0u8; 100];
+        let png_at = data.len();
+        data.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        data.extend_from_slice(&[0u8; 40]);
+        data.extend_from_slice(b"IEND");
+        data.extend_from_slice(&[1, 2, 3, 4]); // CRC
+        data.extend_from_slice(b"trailing junk that must not be carved");
+
+        let hit = magic_scan(&data).into_iter().find(|h| h.offset == png_at).unwrap();
+        assert!(hit.bounded);
+        assert_eq!(hit.length, 8 + 40 + 4 + 4);
+    }
+
+    #[test]
+    fn magic_scan_measures_a_jpeg_to_its_end_of_image_marker() {
+        let mut data = vec![0u8; 32];
+        let at = data.len();
+        data.extend_from_slice(&[0xff, 0xd8, 0xff, 0xe0]);
+        data.extend_from_slice(&[0u8; 20]);
+        data.extend_from_slice(&[0xff, 0xd9]);
+        data.extend_from_slice(b"after the image");
+
+        let hit = magic_scan(&data).into_iter().find(|h| h.offset == at).unwrap();
+        assert!(hit.bounded);
+        assert_eq!(hit.length, 4 + 20 + 2);
+    }
+
+    #[test]
+    fn magic_scan_measures_a_zip_including_its_trailing_comment() {
+        let comment = b"a comment";
+        let mut data = vec![0u8; 16];
+        let at = data.len();
+        data.extend_from_slice(b"PK\x03\x04");
+        data.extend_from_slice(&[0u8; 30]);
+        data.extend_from_slice(b"PK\x05\x06");
+        data.extend_from_slice(&[0u8; 16]);
+        data.extend_from_slice(&(comment.len() as u16).to_le_bytes());
+        data.extend_from_slice(comment);
+        data.extend_from_slice(b"and then some noise");
+
+        let hit = magic_scan(&data).into_iter().find(|h| h.offset == at).unwrap();
+        assert!(hit.bounded);
+        assert_eq!(hit.length, 4 + 30 + 22 + comment.len());
+    }
+
+    #[test]
+    fn magic_scan_takes_the_last_pdf_terminator_because_pdfs_get_appended_to() {
+        let mut data = b"%PDF-1.7 first revision %%EOF then an update %%EOF".to_vec();
+        let tail = data.len();
+        data.extend_from_slice(b" junk");
+
+        let hit = &magic_scan(&data)[0];
+        assert!(hit.bounded);
+        assert_eq!(hit.length, tail);
+    }
+
+    /// A format with no terminator is measured to the next signature, and says so
+    /// rather than presenting a guess as exact.
+    #[test]
+    fn a_format_with_no_terminator_is_marked_as_a_guess() {
+        let mut data = vec![0u8; 8];
+        data.extend_from_slice(b"BZh9");
+        data.extend_from_slice(&[0u8; 50]);
+        let png_at = data.len();
+        data.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        data.extend_from_slice(&[0u8; 10]);
+
+        let hits = magic_scan(&data);
+        let bzip = hits.iter().find(|h| h.label == "bzip2 stream").unwrap();
+
+        assert!(!bzip.bounded, "there is no bzip2 end marker to find");
+        assert_eq!(bzip.offset + bzip.length, png_at, "runs up to the next file");
+    }
+
+    #[test]
+    fn the_last_unbounded_file_runs_to_the_end_of_the_buffer() {
+        let mut data = vec![0u8; 8];
+        data.extend_from_slice(b"BZh1");
+        data.extend_from_slice(&[0u8; 40]);
+
+        let hit = &magic_scan(&data)[0];
+        assert!(!hit.bounded);
+        assert_eq!(hit.offset + hit.length, data.len());
+    }
+
+    #[test]
+    fn a_truncated_container_falls_back_to_a_guess_rather_than_overrunning() {
+        // A PNG signature with no IEND anywhere after it.
+        let mut data = vec![0u8; 8];
+        data.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        data.extend_from_slice(&[0u8; 30]);
+
+        let hit = &magic_scan(&data)[0];
+        assert!(!hit.bounded);
+        assert!(hit.offset + hit.length <= data.len());
+    }
+
     #[test]
     fn magic_scan_rejects_a_bitmap_whose_declared_size_cannot_fit() {
         let mut data = b"BM".to_vec();
@@ -560,15 +777,15 @@ mod tests {
 
     #[test]
     fn flag_candidates_finds_the_common_shapes() {
-        let data = b"junk picoCTF{n0t_s0_h1dd3n} more flag{a_b_c} end";
+        let data = b"junk picoCTF{n0t_s0_h1dd3n} more flag{a_b_c_d} end";
         let found = flag_candidates(data);
         let texts: Vec<&str> = found.iter().map(|f| f.text.as_str()).collect();
-        assert_eq!(texts, vec!["picoCTF{n0t_s0_h1dd3n}", "flag{a_b_c}"]);
+        assert_eq!(texts, vec!["picoCTF{n0t_s0_h1dd3n}", "flag{a_b_c_d}"]);
     }
 
     #[test]
     fn flag_candidates_records_the_offset_of_the_tag_not_the_brace() {
-        let found = flag_candidates(b"..HTB{abc}");
+        let found = flag_candidates(b"..HTB{abcd}");
         assert_eq!(found[0].offset, 2);
     }
 
@@ -580,6 +797,59 @@ mod tests {
     #[test]
     fn flag_candidates_rejects_a_body_of_binary() {
         assert!(flag_candidates(b"flag{\x00\x01\x02\x03}").is_empty());
+    }
+
+    /// Regression: uncompressed pixel data threw this shape roughly fifty times
+    /// per bitmap, because the region rule only suppresses compressed streams.
+    #[test]
+    fn flag_candidates_rejects_punctuation_soup() {
+        for junk in [
+            &b"yW0{X.xV+tR)rP+tR-yV0~Y/}"[..],
+            b"wT-{W-zV)uR&pM$mK&pM)wS-}",
+            b"cD{_?tY;oT;nT?rWDx]G|`Fz}",
+            b"b7{[3uV2sT5vW8{[:}",
+        ] {
+            assert!(
+                flag_candidates(junk).is_empty(),
+                "{} was reported as a flag",
+                String::from_utf8_lossy(junk)
+            );
+        }
+    }
+
+    /// Regression: the walk-back used to trim an over-long run to the maximum
+    /// tag length, so a stretch of random alphanumerics before a brace always
+    /// produced a tag that passed.
+    #[test]
+    fn flag_candidates_rejects_an_over_long_run_rather_than_trimming_it() {
+        assert!(flag_candidates(b"uJYxMWvKRqGNlCLkBPoEUuJZ{NZOWyLTtIStHVwKZ}").is_empty());
+        assert!(flag_candidates(b"abcdefghijklmnopqrstuvwxyz{payload}").is_empty());
+        assert_eq!(flag_candidates(b"a picoCTF{payload} b").len(), 1);
+    }
+
+    #[test]
+    fn flag_candidates_requires_a_tag_that_starts_with_a_letter() {
+        assert!(flag_candidates(b"7fx{abcdef}").is_empty());
+        assert!(flag_candidates(b"_xy{abcdef}").is_empty());
+        assert_eq!(flag_candidates(b"f7x{abcdef}").len(), 1);
+    }
+
+    #[test]
+    fn flag_candidates_still_accepts_the_shapes_competitions_use() {
+        for real in [
+            &b"flag{bitmaps_hide_things_too}"[..],
+            b"picoCTF{n0t_s0_h1dd3n}",
+            b"HTB{a-b-c-d}",
+            b"testCTF{rgb msb first}",
+            b"CTF{what_now?}",
+        ] {
+            assert_eq!(
+                flag_candidates(real).len(),
+                1,
+                "{} was rejected",
+                String::from_utf8_lossy(real)
+            );
+        }
     }
 
     #[test]

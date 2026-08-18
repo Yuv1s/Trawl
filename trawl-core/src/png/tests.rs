@@ -436,12 +436,14 @@ fn located_flags_does_not_credit_a_match_inside_idat() {
     let mut file = Vec::new();
     file.extend_from_slice(&SIGNATURE);
     file.extend_from_slice(&ihdr(2, 2, 8, 2, 0));
-    file.extend_from_slice(&chunk(b"IDAT", b"\x78\x01noise BM{GEBF} more noise"));
+    // A perfectly plausible flag, which is the point: the region rule has to
+    // demote it on where it sits, not on how it reads.
+    file.extend_from_slice(&chunk(b"IDAT", b"\x78\x01noise flag{looks_real_here} more"));
     file.extend_from_slice(&chunk(b"IEND", &[]));
 
     let found = located_flags(&file);
     assert_eq!(found.len(), 1);
-    assert_eq!(found[0].text, "BM{GEBF}");
+    assert_eq!(found[0].text, "flag{looks_real_here}");
     assert_eq!(found[0].region, "inside IDAT");
     assert!(!found[0].credible, "a match in a deflate stream is a coincidence");
 }
@@ -450,7 +452,7 @@ fn located_flags_does_not_credit_a_match_inside_idat() {
 fn located_flags_does_not_credit_a_match_inside_ztxt() {
     let mut data = b"Secret".to_vec();
     data.extend_from_slice(&[0, 0]);
-    data.extend_from_slice(b"zz{abcd}");
+    data.extend_from_slice(b"flag{inside_ztxt}");
 
     let file = png(2, 2, 8, 2, &[chunk(b"zTXt", &data)]);
     let found = located_flags(&file);

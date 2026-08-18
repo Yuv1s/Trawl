@@ -1,7 +1,11 @@
 <script lang="ts">
 	import type { ChiSquare } from '$lib/worker/protocol';
 
-	let { chi, error }: { chi: ChiSquare | null; error: string | null } = $props();
+	let {
+		chi,
+		error,
+		blocked = 'Pixels could not be decoded, so the test did not run.'
+	}: { chi: ChiSquare | null; error: string | null; blocked?: string } = $props();
 
 	const W = 720;
 	const H = 220;
@@ -23,9 +27,7 @@
 </script>
 
 {#if !chi}
-	<p class="clear">
-		Pixels could not be decoded, so the test did not run.{error ? ` ${error}` : ''}
-	</p>
+	<p class="clear">{blocked}{error ? ` ${error}` : ''}</p>
 {:else if usable.length === 0}
 	<p class="clear">
 		Too few samples to support the approximation. The test drops value pairs with fewer than four

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
+	import Logo from '$lib/components/Logo.svelte';
 	import { PLANNED } from '$lib/analysis/tools';
 
 	let { onfile }: { onfile: (file: File) => void } = $props();
@@ -66,7 +67,7 @@
 	ondrop={drop}
 >
 	<header>
-		<h1>Trawl</h1>
+		<h1><Logo size={44} /><span>Trawl</span></h1>
 		<p class="lede">
 			Every tool for a file-based CTF challenge, running at once, in this tab. Nothing is uploaded.
 		</p>
@@ -140,11 +141,21 @@
 	}
 
 	h1 {
+		display: flex;
+		align-items: center;
+		gap: var(--s4);
 		margin: 0;
 		font-size: clamp(2.75rem, 7vw, 5rem);
 		font-weight: 600;
 		letter-spacing: -0.03em;
 		line-height: 0.95;
+	}
+
+	/* The mark scales with the wordmark rather than sitting at a fixed size. */
+	h1 :global(.logo) {
+		width: 0.72em;
+		height: 0.72em;
+		color: var(--muted);
 	}
 
 	.lede {

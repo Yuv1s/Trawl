@@ -2,3 +2,6 @@
 # acceptable; run `npm run fixtures` to rebuild these from source.
 *.png
 *.jpg
+*.bmp
+*.gif
+*.wav

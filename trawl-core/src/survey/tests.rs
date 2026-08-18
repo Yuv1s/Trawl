@@ -27,10 +27,10 @@ fn a_flag_in_readable_data_is_credited() {
 #[test]
 fn a_flag_shape_inside_compressed_bytes_is_not_credited() {
     let mut data = noise(64 * 1024, 0x1234);
-    data[30_000..30_011].copy_from_slice(b"zz{abcdefg}");
+    data[30_000..30_011].copy_from_slice(b"flag{abcde}");
 
     let text = json(&data);
-    assert!(text.contains("zz{abcdefg}"));
+    assert!(text.contains("flag{abcde}"));
     assert!(text.contains("\"credible\":false"));
     assert!(text.contains("high-entropy region"));
 }

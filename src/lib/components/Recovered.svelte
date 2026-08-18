@@ -5,14 +5,19 @@
 		candidates,
 		sources,
 		fromPixels = []
-	}: { candidates: Found[]; sources: Record<number, string>; fromPixels?: string[] } = $props();
+	}: {
+		candidates: Found[];
+		sources: Record<number, string>;
+		/** Finds from a sweep, each naming which sweep turned it up. */
+		fromPixels?: { text: string; origin: string }[];
+	} = $props();
 
 	const total = $derived(candidates.length + fromPixels.length);
 </script>
 
-<section class="recovered" aria-label="Recovered candidates">
+<section class="recovered" aria-label="Cod-end, recovered candidates">
 	<div class="head">
-		<h2 class="label">Recovered</h2>
+		<h2 class="label">Cod-end</h2>
 		<span class="count mono">
 			{total} candidate{total === 1 ? '' : 's'}
 		</span>
@@ -28,16 +33,17 @@
 				</span>
 			</li>
 		{/each}
-		{#each fromPixels as text (text)}
+		{#each fromPixels as found (found.origin + found.text)}
 			<li>
-				<output class="value mono">{text}</output>
-				<span class="origin mono">from the LSB sweep</span>
+				<output class="value mono">{found.text}</output>
+				<span class="origin mono">{found.origin}</span>
 			</li>
 		{/each}
 	</ul>
 
 	<p class="caveat">
-		Matched on shape alone. Trawl has not verified that any of these is the answer.
+		The cod-end is the closed end of a trawl net, where the catch collects. Everything here matched
+		on shape alone, so Trawl has not verified that any of it is the answer.
 	</p>
 </section>
 

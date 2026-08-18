@@ -13,3 +13,6 @@ bun.lockb
 
 # Cargo build artifacts
 /trawl-core/target/
+
+# Licence text is verbatim by definition
+LICENCE.md
