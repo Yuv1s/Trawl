@@ -183,6 +183,10 @@ pub fn flag_candidates(data: &[u8]) -> Vec<Found> {
         let written = body.iter().filter(|&&b| body_byte(b)).count();
         let body_ok = body_len >= MIN_BODY
             && body.iter().all(|&b| printable(b))
+            // A second opening brace means the match began at the wrong one, so
+            // this is a longer run that happens to span a brace rather than a
+            // flag. The written-byte allowance alone lets one through.
+            && !body.contains(&b'{')
             && written as f32 / body_len as f32 >= MIN_BODY_WRITTEN
             && case_is_consistent(body);
 

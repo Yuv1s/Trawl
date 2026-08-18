@@ -140,3 +140,21 @@ fn every_codec_declines_ordinary_english() {
     assert!(html_entities(prose).is_none());
     assert!(morse(prose).is_none());
 }
+
+#[test]
+fn refuses_a_long_single_case_run_as_base64() {
+    // Eighty lowercase letters are legal base64 and decode to noise. Real
+    // base64 output spans both cases and the digits, so words of the right
+    // length are the likelier explanation.
+    let words = b"qxzjvbkwmpfdghlrntscyaeiouqxzjvbkwmpfdghlrntscyaeiouqxzjvbkwmpfdghlrntscyaeiouxy";
+    assert_eq!(words.len() % 4, 0, "the fixture has to be a legal length");
+    assert!(base64(words).is_none());
+
+    // Short enough that the case mix proves nothing, so the rule stands aside.
+    assert!(looks_encoded(b"aGVsbG8="));
+    assert!(looks_encoded(b"abcdefgh"));
+
+    // Real base64 spans the alphabet, so it is unaffected either way.
+    assert!(looks_encoded(b"SGVsbG8sIHdvcmxkIQ=="));
+    assert_eq!(base64(b"SGVsbG8sIHdvcmxkIQ==").unwrap(), b"Hello, world!");
+}

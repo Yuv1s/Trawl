@@ -114,6 +114,39 @@ h3 {
 	color: var(--signal);
 }
 
+/* Scrollbars, in the same language as everything else: square, hairline, and
+   derived from the panel hue rather than whatever the operating system paints.
+   Nine panes in this app scroll, so they are styled once here. */
+/* Both properties inherit, so the root is enough and every pane picks them up. */
+html {
+	scrollbar-width: thin;
+	scrollbar-color: var(--rule-bright) transparent;
+}
+
+::-webkit-scrollbar {
+	width: 10px;
+	height: 10px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+	background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+	/* background-color rather than the shorthand, which would reset the clip. */
+	background-color: var(--rule-bright);
+	border-radius: var(--radius);
+	/* A transparent border rather than one matching the surface, so the thumb
+	   sits inset on every panel shade without knowing which it is on. */
+	border: 2px solid transparent;
+	background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+	background-color: var(--muted);
+}
+
 @media (prefers-reduced-motion: reduce) {
 	*,
 	*::before,

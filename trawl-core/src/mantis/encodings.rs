@@ -95,13 +95,42 @@ fn base_n(data: &[u8], alphabet: &[u8], bits: u32) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Long enough that the case mix below stops being luck.
+const MIXED_CASE_FROM: usize = 16;
+
+/// True when this looks like something a base64 encoder produced.
+///
+/// The alphabet spans both cases and the digits, so real output of any length
+/// uses all three. A long run of nothing but lowercase letters is words, and
+/// words of the right length are legal base64 that decodes to noise.
+fn looks_encoded(data: &[u8]) -> bool {
+    let body: Vec<u8> = data
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
+        .collect();
+
+    if body.len() < MIXED_CASE_FROM {
+        return true;
+    }
+
+    let lower = body.iter().any(|b| b.is_ascii_lowercase());
+    let upper = body.iter().any(|b| b.is_ascii_uppercase());
+    let other = body.iter().any(|b| !b.is_ascii_alphabetic());
+
+    (lower && upper) || other
+}
+
 pub fn base64(data: &[u8]) -> Option<Vec<u8>> {
+    if !looks_encoded(data) {
+        return None;
+    }
     base_n(data, BASE64, 6)
 }
 
 pub fn base64_url(data: &[u8]) -> Option<Vec<u8>> {
     // Only worth trying when it actually differs from the standard alphabet.
-    if !data.iter().any(|&b| b == b'-' || b == b'_') {
+    if !data.iter().any(|&b| b == b'-' || b == b'_') || !looks_encoded(data) {
         return None;
     }
     base_n(data, BASE64_URL, 6)

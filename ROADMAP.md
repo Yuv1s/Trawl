@@ -4,12 +4,14 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 
 ## Done
 
-### Reading files
+### Reading things
 
 - [x] PNG, all colour types and bit depths, interlaced or not
 - [x] BMP and GIF
 - [x] WAV, 8 through 32-bit, mono or multichannel
-- [x] JPEG structure, and the compressed numbers underneath it, baseline or progressive
+- [x] JPEG structure, and the compressed numbers underneath it, baseline or
+      progressive
+- [x] A string you paste, which needs no file at all
 - [x] Finding files buried inside other files, and saving them out
 - [x] Text, metadata, entropy, and checksums on anything you drop
 
@@ -25,17 +27,24 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 - [x] JSteg extraction from JPEG coefficients
 - [x] Coefficient statistics, with the value counts shown
 
-## Next
-
 ### Mantis, the cryptography half
 
 - [x] Spot an encoding and peel it, over and over, until plain text falls out
-- [x] Caesar, solved rather than applied: every shift tried, the readable one kept
+- [x] Thirteen encodings: base64, base32, ascii85, hex, morse, binary and the
+      rest
+- [x] Caesar, solved rather than applied: every shift tried, the readable one
+      kept
+- [x] XOR key recovery, single byte and repeating key, with the key length
+      worked out rather than asked for
+
+## Next
+
+### Mantis
+
+- [ ] Hash identification, from length and alphabet
 - [ ] Vigenère and substitution, which need a stronger language model than the
       word list the peeler uses
-- [ ] XOR key recovery
 - [ ] RSA weaknesses that turn up in competitions
-- [ ] Hash identification
 
 ### Forensics
 

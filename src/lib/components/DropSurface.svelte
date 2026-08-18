@@ -200,7 +200,10 @@
 		display: grid;
 		grid-template-columns: minmax(0, 1fr) minmax(0, 32rem);
 		grid-template-rows: minmax(0, 1fr) auto;
-		gap: 0 var(--s7);
+		/* A row gap as well as a column one. Without it the rack's bottom border
+		   lands exactly on the footer's top border, and the two 1px rules read
+		   as one thick line dividing nothing. */
+		gap: var(--s5) var(--s7);
 		padding: var(--s5) var(--s6) var(--s3);
 		transition: background-color 160ms var(--ease);
 	}

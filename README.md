@@ -1,13 +1,14 @@
-# Trawl
+![Trawl](src/lib/assets/TrawlBanner.png)
 
-Drop a file into the page and Trawl looks for whatever is hidden in it. Nothing
-leaves your computer.
+Drop a file into the page, or paste a string, and Trawl looks for whatever is
+hidden in it. Nothing leaves your computer.
 
 It is built for capture-the-flag competitions, where a puzzle often arrives as
-an ordinary-looking image or sound file with a message buried inside it.
+an ordinary-looking image, a sound file, or a line of text with a message buried
+inside it.
 
-**Status: in development.** [ROADMAP.md](ROADMAP.md) has the current state. The
-steganography half works. Cryptography and forensics are not started.
+**Status: in development.** [ROADMAP.md](ROADMAP.md) has the current state.
+Steganography is done. Cryptography has started. Forensics has not.
 
 ## What it is for
 
@@ -42,6 +43,13 @@ which is where JPEG payloads live, whether the file is an ordinary one or the
 progressive kind that loads in passes. Images that paint by numbers get their
 palette read too, since two entries holding the same colour let a pixel pick
 either one and that choice carries a message no viewer can show you.
+
+Paste a string instead of dropping a file and Mantis takes over, the
+cryptography half. It works out what the string has been through and undoes it,
+layer by layer: base64 wrapped around hex wrapped around a rotation, unwound
+until something readable falls out. If what is underneath turns out to be
+encrypted rather than encoded, it tries XOR against it and recovers the key,
+whether that key is one byte or a repeated word.
 
 Everything found collects in the Cod-end, the panel at the top of the page.
 
@@ -132,6 +140,10 @@ close to what this does with a dropped file.
 **Cuttlefish** is the steganography half. Cuttlefish hide by rewriting their own
 surface, which is what hiding a message in an image does to the picture. Their
 ink is also where the colour sepia comes from.
+
+**Mantis** is the cryptography half. The mantis shrimp cracks armoured shells
+with the fastest strike in the animal kingdom, and sees a range of colour we are
+blind to. Force and perception, which is the whole of code breaking.
 
 **Cod-end** is the closed end of a trawl net, where the catch collects. In the
 app it is the panel holding everything the tools brought up.

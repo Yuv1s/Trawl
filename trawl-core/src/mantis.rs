@@ -15,6 +15,7 @@
 //! person would read than what went into it.
 
 pub mod encodings;
+pub mod xor;
 
 use crate::bytes;
 
@@ -148,6 +149,12 @@ pub struct Step {
     pub gain: f32,
     /// Why it was kept, in words.
     pub reason: String,
+    /// True when the input's own form justified this, rather than the result.
+    ///
+    /// A long even-length run of nothing but hex digits is hex, whatever it
+    /// decodes to. A rotation is never like that: every shift applies, so only
+    /// the result can argue for it.
+    pub structural: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -158,25 +165,32 @@ pub struct Peel {
     pub score: f32,
 }
 
-type Codec = (&'static str, fn(&[u8]) -> Option<Vec<u8>>);
+/// Name, decoder, and whether the input's own form justifies the peel.
+type Codec = (&'static str, fn(&[u8]) -> Option<Vec<u8>>, bool);
 
 /// Everything Mantis will try, in the order it tries them.
 ///
 /// Order matters only for tie-breaking: the peel takes whichever candidate
 /// improves things most, and this decides a draw. Narrower codecs come first so
 /// a blob that is unambiguously one thing is not claimed by a looser one.
+/// Ordered narrowest alphabet first, so when several accept the same input the
+/// most specific reading wins. A run of hex digits is legal base64 too, and hex
+/// is the honest answer.
+///
+/// ROT13 sits here for convenience but is not structural: it accepts any text at
+/// all, so it can only ever be justified by its result.
 pub const CODECS: [Codec; 11] = [
-    ("morse", encodings::morse),
-    ("binary", encodings::binary),
-    ("decimal bytes", encodings::decimal),
-    ("hex", encodings::hex),
-    ("base32", encodings::base32),
-    ("base64", encodings::base64),
-    ("base64url", encodings::base64_url),
-    ("ascii85", encodings::ascii85),
-    ("percent-encoding", encodings::percent),
-    ("HTML entities", encodings::html_entities),
-    ("ROT13", encodings::rot13),
+    ("morse", encodings::morse, true),
+    ("binary", encodings::binary, true),
+    ("decimal bytes", encodings::decimal, true),
+    ("hex", encodings::hex, true),
+    ("base32", encodings::base32, true),
+    ("base64", encodings::base64, true),
+    ("base64url", encodings::base64_url, true),
+    ("ascii85", encodings::ascii85, true),
+    ("percent-encoding", encodings::percent, true),
+    ("HTML entities", encodings::html_entities, true),
+    ("ROT13", encodings::rot13, false),
 ];
 
 /// A chain has to end up this much more readable than it started.
@@ -199,6 +213,14 @@ const CONCLUSIVE: f32 = 2.0;
 /// will take it. Charging for every step means a longer chain has to be clearly
 /// better rather than accidentally better.
 const STEP_COST: f32 = 0.06;
+
+/// How readable a rotation has to leave things before it is taken.
+///
+/// An absolute bar rather than a relative one, because a rotation is a cipher
+/// being solved and a solved cipher reads. Asking only for an improvement lets
+/// the search wander over encrypted bytes, where some shift always scores a
+/// fraction higher than the last, and report the wandering as progress.
+const ROTATION_BAR: f32 = 0.45;
 
 /// Longest run of bytes worth searching. Beyond this it is a file, not a pasted
 /// string, and the byte-level tools are the right place for it.
@@ -232,12 +254,12 @@ fn rate(data: &[u8]) -> f32 {
 /// explored. Rotations are only taken when they improve things on the spot,
 /// because a rotation applied to an encoded blob breaks the blob rather than
 /// setting up the next layer, so it is never a useful middle step.
-fn candidates(data: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
+fn candidates(data: &[u8]) -> Vec<(&'static str, Vec<u8>, bool)> {
     let mut out = Vec::new();
 
-    for (name, decode) in CODECS {
+    for (name, decode, structural) in CODECS {
         if let Some(decoded) = decode(data).filter(|d| !d.is_empty() && d != data) {
-            out.push((name, decoded));
+            out.push((name, decoded, structural));
         }
     }
 
@@ -245,8 +267,12 @@ fn candidates(data: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
     // scan and this runs twenty-six times per node.
     let here = plainness(data);
     let mut rotation = |name: &'static str, rotated: Vec<u8>| {
-        if rotated != data && plainness(&rotated) >= here + MIN_GAIN {
-            out.push((name, rotated));
+        if rotated == data {
+            return;
+        }
+        let score = plainness(&rotated);
+        if (score >= ROTATION_BAR && score >= here + MIN_GAIN) || conclusive(&rotated).is_some() {
+            out.push((name, rotated, false));
         }
     };
 
@@ -278,7 +304,7 @@ fn explore(data: &[u8], seen: &mut Vec<Vec<u8>>, depth: usize) -> (f32, Vec<Step
 
     let mut best = (here, Vec::new());
 
-    for (encoding, output) in candidates(data) {
+    for (encoding, output, structural) in candidates(data) {
         if seen.contains(&output) {
             continue;
         }
@@ -305,6 +331,7 @@ fn explore(data: &[u8], seen: &mut Vec<Vec<u8>>, depth: usize) -> (f32, Vec<Step
             output,
             gain,
             reason,
+            structural,
         }];
         steps.extend(rest);
         best = (score, steps);
@@ -313,17 +340,81 @@ fn explore(data: &[u8], seen: &mut Vec<Vec<u8>>, depth: usize) -> (f32, Vec<Step
     best
 }
 
+/// Unwraps layers that only one codec will accept at all.
+///
+/// A separate pass, because it answers a different question. The search asks
+/// "does this get me somewhere readable"; this asks "is this unambiguously an
+/// encoding". A hundred characters of nothing but hex digits, at an even length,
+/// is hex whatever it decodes to, and when what it decodes to is a cipher the
+/// search will never take the step because the ciphertext reads no better than
+/// the hex did. Refusing to unwrap it would leave the cipher invisible.
+fn unwrap_structural(data: &[u8]) -> Vec<Step> {
+    let mut steps = Vec::new();
+    let mut current = data.to_vec();
+
+    while steps.len() < MAX_DEPTH {
+        // Already readable, so this is the answer rather than a wrapper. Pure
+        // hex reads as hex, and "deadbeefdeadbeef" should be left as it is.
+        if plainness(&current) >= ROTATION_BAR {
+            break;
+        }
+
+        let found = CODECS.iter().filter(|(_, _, structural)| *structural).find_map(
+            |(name, decode, _)| {
+                decode(&current)
+                    .filter(|d| !d.is_empty() && *d != current)
+                    .map(|d| (*name, d))
+            },
+        );
+
+        let Some((encoding, output)) = found else {
+            break;
+        };
+        let gain = rate(&output) - rate(&current);
+
+        current = output.clone();
+        steps.push(Step {
+            encoding,
+            output,
+            gain,
+            reason: "the only thing this could be".to_string(),
+            structural: true,
+        });
+
+        if conclusive(&current).is_some() {
+            break;
+        }
+    }
+
+    steps
+}
+
 /// Peels layer after layer until nothing improves.
 pub fn peel(data: &[u8]) -> Peel {
     let mut seen = vec![data.to_vec()];
     let (score, steps) = explore(data, &mut seen, 0);
 
     // The whole chain has to be worth it, not just the last step of it.
-    let worth_it = score == CONCLUSIVE || score >= plainness(data) + MIN_GAIN;
+    //
+    // A chain of purely structural peels counts even when it ends somewhere
+    // unreadable. That is the shape of a cipher wrapped for transport: the hex
+    // comes off cleanly and what is underneath is still encrypted. Demanding a
+    // readability gain there would refuse to unwrap it and leave the cipher
+    // invisible.
+    let structural_only = steps.iter().all(|step| step.structural);
+    let worth_it = score == CONCLUSIVE || score >= plainness(data) + MIN_GAIN || structural_only;
 
-    if !worth_it || steps.is_empty() {
+    let steps = if worth_it && !steps.is_empty() {
+        steps
+    } else {
+        // Nothing scored its way through, so fall back to what the form alone
+        // justifies. Usually that is nothing at all.
+        unwrap_structural(data)
+    };
+
+    if steps.is_empty() {
         return Peel {
-            steps: Vec::new(),
+            steps,
             score: plainness(data),
             result: data.to_vec(),
         };
@@ -337,11 +428,45 @@ pub fn peel(data: &[u8]) -> Peel {
     }
 }
 
-/// The peel as JSON, ready to leave the worker.
+/// Everything Mantis makes of a pasted string.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reading {
+    pub peel: Peel,
+    /// XOR run against whatever the peel ended with.
+    pub xor: xor::Recovery,
+}
+
+/// Peels the encodings, then attacks what is left with XOR.
+///
+/// In that order, because that is the order challenges are built in. Bytes get
+/// XORed and the result is unreadable, so it gets hex or base64 wrapped to
+/// survive being pasted around. Unwrapping first is what makes the cipher
+/// visible at all.
+pub fn read(data: &[u8]) -> Reading {
+    let peel = peel(data);
+    let inner = if peel.steps.is_empty() {
+        data
+    } else {
+        &peel.result
+    };
+
+    Reading {
+        // Nothing to recover if the peel already arrived somewhere readable.
+        xor: if conclusive(inner).is_some() || plainness(inner) >= 0.5 {
+            xor::Recovery::default()
+        } else {
+            xor::recover(inner)
+        },
+        peel,
+    }
+}
+
+/// The reading as JSON, ready to leave the worker.
 pub fn json(data: &[u8]) -> String {
     use crate::json::{push_field, push_number, push_string};
 
-    let peeled = peel(data);
+    let reading = read(data);
+    let peeled = &reading.peel;
     let mut out = String::from("{");
 
     push_number(&mut out, "depth", peeled.steps.len());
@@ -365,6 +490,40 @@ pub fn json(data: &[u8]) -> String {
         out.push(',');
         push_field(&mut out, "output", &crate::json::latin1(&step.output));
         out.push('}');
+    }
+    out.push_str("],");
+
+    let candidate = |out: &mut String, kind: &str, c: &xor::Candidate| {
+        out.push('{');
+        push_field(out, "kind", kind);
+        out.push(',');
+        push_field(out, "key", &c.key_text());
+        out.push(',');
+        push_number(out, "keyLength", c.key.len());
+        out.push(',');
+        push_string(out, "score");
+        out.push_str(&format!(":{:.3}", c.score));
+        out.push(',');
+        push_field(out, "plaintext", &crate::json::latin1(&c.plaintext));
+        out.push(',');
+        push_string(out, "flags");
+        out.push_str(":[");
+        for (j, flag) in c.flags.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            push_string(out, flag);
+        }
+        out.push_str("]}");
+    };
+
+    push_string(&mut out, "xor");
+    out.push_str(":[");
+    for (i, (kind, found)) in reading.xor.best_first().iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        candidate(&mut out, kind, found);
     }
     out.push_str("]}");
 

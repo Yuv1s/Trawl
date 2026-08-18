@@ -8,11 +8,15 @@
 	const conclusive = (reason: string) =>
 		reason.includes('flag shape') || reason.includes('signature');
 
-	const flags = $derived(
-		peel.steps
+	const flags = $derived([
+		...peel.steps
 			.filter((step) => step.reason.startsWith('flag shape, '))
-			.map((step) => step.reason.slice('flag shape, '.length))
-	);
+			.map((step) => step.reason.slice('flag shape, '.length)),
+		...peel.xor.flatMap((c) => c.flags)
+	]);
+
+	/** True when the peel alone got nowhere and the cipher attack found nothing. */
+	const empty = $derived(peel.depth === 0 && peel.xor.length === 0);
 
 	const PREVIEW = 240;
 	const clip = (text: string) => (text.length > PREVIEW ? `${text.slice(0, PREVIEW)}…` : text);
@@ -66,7 +70,7 @@
 	{/if}
 
 	<main class="pane">
-		{#if peel.depth === 0}
+		{#if empty}
 			<div class="pane-head">
 				<h2>Nothing to peel</h2>
 				<p>Mantis tried every encoding it knows and none of them made this more readable.</p>
@@ -116,6 +120,34 @@
 				</div>
 				<pre class="answer mono" class:flagged={flags.length > 0}>{peel.result}</pre>
 			</section>
+
+			{#if peel.xor.length > 0}
+				<section class="cipher">
+					<h3 class="label">XOR underneath</h3>
+					<p class="clear">
+						What the layers came off to was not readable, so Mantis tried XOR against it. These keys
+						produced something that was.
+					</p>
+
+					<ul class="keys">
+						{#each peel.xor as found (found.kind + found.key)}
+							<li>
+								<div class="key-head">
+									<span class="mono key">{found.key}</span>
+									<span class="mono chip">{found.kind}</span>
+									<span class="mono chip">
+										{found.keyLength}
+										{found.keyLength === 1 ? 'byte' : 'bytes'}
+									</span>
+								</div>
+								<pre class="excerpt mono" class:flagged={found.flags.length > 0}>{clip(
+										found.plaintext
+									)}</pre>
+							</li>
+						{/each}
+					</ul>
+				</section>
+			{/if}
 
 			<p class="footnote">
 				Mantis reads {(peel.score * 100).toFixed(0)}% of this as ordinary text. That number decided
@@ -418,6 +450,49 @@
 	}
 
 	.answer.flagged {
+		color: var(--signal);
+	}
+
+	.cipher {
+		margin-top: var(--s5);
+		padding-top: var(--s4);
+		border-top: 1px solid var(--rule);
+	}
+
+	.cipher h3 {
+		margin: 0 0 var(--s2);
+	}
+
+	.keys {
+		list-style: none;
+		margin: var(--s4) 0 0;
+		padding: 0;
+		display: grid;
+		gap: var(--s4);
+	}
+
+	.key-head {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: var(--s2) var(--s3);
+	}
+
+	.key {
+		font-size: var(--t-mid);
+		font-weight: 500;
+		user-select: all;
+	}
+
+	.chip {
+		font-size: var(--t-label);
+		color: var(--muted);
+		border: 1px solid var(--rule);
+		border-radius: var(--radius);
+		padding: 1px var(--s2);
+	}
+
+	.excerpt.flagged {
 		color: var(--signal);
 	}
 

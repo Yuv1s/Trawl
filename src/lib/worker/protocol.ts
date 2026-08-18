@@ -155,12 +155,26 @@ export type PeelStep = {
 	output: string;
 };
 
+/** A recovered XOR key and what it decrypted to. */
+export type XorCandidate = {
+	/** "single byte" or "repeating key". */
+	kind: string;
+	/** Quoted when the key is text, hex bytes when it is not. */
+	key: string;
+	keyLength: number;
+	score: number;
+	plaintext: string;
+	flags: string[];
+};
+
 export type PeelResult = {
 	depth: number;
 	/** How much the final answer reads like ordinary text, 0 to 1. */
 	score: number;
 	result: string;
 	steps: PeelStep[];
+	/** Run against whatever the peel ended with, which is where a cipher hides. */
+	xor: XorCandidate[];
 };
 
 export type PaletteGroup = {

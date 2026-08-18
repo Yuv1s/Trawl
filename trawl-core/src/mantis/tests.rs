@@ -232,3 +232,66 @@ fn json_reports_a_string_it_could_not_peel() {
     assert!(out.contains("\"depth\":0"), "{out}");
     assert!(out.contains("\"steps\":[]"), "{out}");
 }
+
+#[test]
+fn attacks_the_cipher_hiding_under_an_encoding() {
+    // Hex around XOR, which is how these are actually built: the cipher output
+    // is unreadable bytes, so it gets wrapped to survive being pasted.
+    let message = b"the treasure is buried under the old oak tree at the north end";
+    let encrypted = xor::apply(message, b"KEY");
+    let wrapped: String = encrypted.iter().map(|b| format!("{b:02x}")).collect();
+
+    let reading = read(wrapped.as_bytes());
+
+    assert_eq!(
+        reading.peel.steps.iter().map(|s| s.encoding).collect::<Vec<_>>(),
+        vec!["hex"],
+        "the wrapper should come off first"
+    );
+
+    let found = reading.xor.repeating.expect("the cipher underneath was missed");
+    assert_eq!(found.key, b"KEY".to_vec());
+    assert_eq!(found.plaintext, message.to_vec());
+}
+
+#[test]
+fn does_not_attack_something_the_peel_already_solved() {
+    // The answer is in hand, so running a cipher attack over it would only
+    // produce noise with a confident label on it.
+    let reading = read(b"dGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIHRoZSBsYXp5IGRvZw==");
+
+    assert_eq!(reading.peel.result, b"the quick brown fox jumps over the lazy dog");
+    assert!(!reading.xor.found());
+}
+
+#[test]
+fn finds_a_single_byte_key_in_a_pasted_string() {
+    let flag = b"flag{xor_is_not_encryption}";
+    let encrypted = xor::apply(flag, &[0x5a]);
+    let wrapped: String = encrypted.iter().map(|b| format!("{b:02x}")).collect();
+
+    let reading = read(wrapped.as_bytes());
+    let found = &reading.xor.single;
+
+    assert!(!found.is_empty(), "nothing came back");
+    assert_eq!(found[0].plaintext, flag.to_vec());
+    assert_eq!(found[0].key, vec![0x5a]);
+}
+
+#[test]
+fn stays_quiet_on_a_string_with_nothing_in_it() {
+    let reading = read(b"this is an ordinary sentence with nothing hidden in it");
+    assert!(reading.peel.steps.is_empty());
+    assert!(!reading.xor.found());
+}
+
+#[test]
+fn json_carries_the_cipher_alongside_the_chain() {
+    let encrypted = xor::apply(b"meet me at the docks at midnight tonight", &[0x33]);
+    let wrapped: String = encrypted.iter().map(|b| format!("{b:02x}")).collect();
+
+    let out = json(wrapped.as_bytes());
+    assert!(out.contains("\"encoding\":\"hex\""), "{out}");
+    assert!(out.contains("\"kind\":\"single byte\""), "{out}");
+    assert!(out.contains("meet me at the docks"), "{out}");
+}
