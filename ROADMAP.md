@@ -99,6 +99,19 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 - [x] RSA: small exponent, close primes, a shared prime between two keys, and a
       private exponent chosen too small
 
+### Remora, the web-exploration half
+
+- [x] A guard on where the scanner may reach, refusing loopback, private and
+      link-local addresses, the cloud metadata endpoint among them, resolved once
+      and connected to the vetted address so a name cannot answer public and turn
+      private a moment later
+- [x] A guarded fetch that follows redirects by hand, so every hop meets the
+      guard again instead of being trusted by the HTTP client
+- [x] A scanner started with one line per system, which downloads a prebuilt
+      binary and runs it on your own machine; the page finds it on its own and
+      switches to a box for the target. No repository, no toolchain, nothing
+      uploaded
+
 ## Next
 
 ### Mantis
@@ -107,6 +120,20 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
       on something above
 - [ ] Columnar transposition wider than eight columns, which needs the column
       order built up rather than tried exhaustively
+
+### Remora
+
+- [ ] Pages: every route the site gives up, crawled from its own links and
+      scripts, read out of robots and sitemaps, and guessed from a wordlist of the
+      places flags hide, grouped by what the server says about each
+- [ ] Images and media, each one collected into a tab and handed to Cuttlefish,
+      since a flag in a picture is Cuttlefish's problem whether the picture came
+      off a disk or a URL
+- [ ] Code and secrets: the source read for comments, keys and tokens, with
+      anything that looks encoded run back through Mantis and only what decodes
+      into something surfaced
+- [ ] Headers, cookies and exposed files: the strange header, the cookie that
+      decodes to a flag, and the /.git or /.env left where it should not be
 
 ### Forensics
 
@@ -125,8 +152,10 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 
 No accounts, no cloud storage, no history, no sharing.
 
-No pwn or web challenges. Both need a live server to talk to, and Trawl is a
-page in your browser.
+No pwn. It needs a live server to hold onto, which a page in your browser cannot
+give it. Web challenges are in reach now, through Remora, but only because Remora
+is a separate scanner you run yourself: reaching a site is the one thing the
+browser will not do for you.
 
 No password cracking. That belongs on hardware you control, running something
 built for it.

@@ -8,7 +8,7 @@ an ordinary-looking image, a sound file, or a line of text with a message buried
 inside it.
 
 **Status: in development.** [ROADMAP.md](ROADMAP.md) has the current state.
-Steganography is done. Cryptography has started. Forensics has not.
+Steganography is done. Cryptography is well along. Forensics and web exploration have just begun.
 
 ## What it is for
 
@@ -58,6 +58,18 @@ saying so beats picking one at random and sounding sure.
 
 Everything found collects in the Cod-end, the panel at the top of the page.
 
+A link is the newest kind of input, and the one still being built. Remora, the
+web-exploration half, is for a challenge that lives on a site rather than in a
+file you were handed. A browser tab cannot reach a site it was not served from,
+so Remora runs as a small program you start on your own machine with one line the
+page hands you; once it is running, the page finds it and switches to a box for
+the target address. That handshake works today. What comes next is the point of
+it: retrieve every part of a site and give each piece to the tool that already
+reads it. A website is only ever made of the things Trawl reads anyway, so an
+image it pulls down goes to Cuttlefish, an encoded string in the source goes to
+Mantis, and a file buried in the page goes to the same extractor a dropped file
+uses.
+
 ## What it will not tell you
 
 Trawl never claims to have found a flag it has not actually checked. When a
@@ -93,6 +105,11 @@ never changed.
 
 That also settles a rules question. Most competitions forbid passing challenge
 files to outside services, and Trawl has nowhere to send yours.
+
+Web exploration is the one part that touches the network, because reaching a site
+is the whole job. It is kept honest by where it runs. There is still no server of
+ours; Remora is a program on your own machine, and it talks only to the target you
+named and to your own browser. The page uploads nothing, the same as ever.
 
 ## How it works
 
@@ -137,6 +154,11 @@ cd trawl-core && cargo test           # the analysis core
 Test files are built from scratch by `fixtures/generate.mjs`, so every result the
 tests claim can be reproduced rather than taken on trust.
 
+Remora, the web scanner, is a separate crate under `trawl-scan`. It is the one
+part that reaches the network, so it is kept apart from the offline core. From a
+clone, `npm run scanner` builds and starts it; users never do this, they run the
+one line the page gives them.
+
 ## The names
 
 Trawling is dragging a net through water and sorting whatever comes up, which is
@@ -149,6 +171,11 @@ ink is also where the colour sepia comes from.
 **Mantis** is the cryptography half. The mantis shrimp cracks armoured shells
 with the fastest strike in the animal kingdom, and sees a range of colour we are
 blind to. Force and perception, which is the whole of code breaking.
+
+**Remora** is the web-exploration half. A remora attaches to a larger host and
+rides it, going everywhere the host goes and seeing what it sees. This attaches to
+a live site, which in web terms is a host too, and brings back every part of it
+for the other tools to read.
 
 **Cod-end** is the closed end of a trawl net, where the catch collects. In the
 app it is the panel holding everything the tools brought up.
