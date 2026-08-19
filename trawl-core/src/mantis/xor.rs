@@ -78,7 +78,10 @@ fn best_byte(data: &[u8]) -> (u8, f32) {
             let decoded: Vec<u8> = data.iter().map(|&b| b ^ key).collect();
             (key, score_run(&decoded))
         })
-        .fold((0, f32::MIN), |best, next| if next.1 > best.1 { next } else { best })
+        .fold(
+            (0, f32::MIN),
+            |best, next| if next.1 > best.1 { next } else { best },
+        )
 }
 
 pub fn apply(data: &[u8], key: &[u8]) -> Vec<u8> {
@@ -158,6 +161,17 @@ pub fn key_of_length(data: &[u8], length: usize) -> Vec<u8> {
     shortest_period(&key)
 }
 
+/// What each extra key byte costs when weighing two candidates.
+///
+/// Any multiple of the real key deciphers exactly as well, so "KEY" and
+/// "KEYKEYKEY" come out within a thousandth of each other and the longer one
+/// wins about half the time on noise alone. Worse, a multiple splits the text
+/// into more columns than the key needs, and the last of those columns can be
+/// short enough that its byte is recovered wrongly: the answer comes back as
+/// nine bytes of which one is rubbish, which `shortest_period` cannot then
+/// collapse. A multiple is never the answer, so length has to cost something.
+const LENGTH_COST: f32 = 0.002;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
     pub key: Vec<u8>,
@@ -174,7 +188,20 @@ impl Candidate {
     /// English; a flag is the answer, and on a short string the guess is noisy
     /// enough to rank real finds below nonsense without this.
     fn rank(&self) -> (bool, f32) {
-        (self.flags.iter().any(|f| tag_is_known(f)), self.score)
+        (
+            self.flags.iter().any(|f| bytes::tag_is_known(f)),
+            self.score - self.key.len() as f32 * LENGTH_COST,
+        )
+    }
+
+    /// Strictly better than another candidate, flags first then readability.
+    fn beats(&self, other: &Self) -> bool {
+        let (mine, theirs) = (self.rank(), other.rank());
+        mine.0.cmp(&theirs.0).then(
+            mine.1
+                .partial_cmp(&theirs.1)
+                .unwrap_or(core::cmp::Ordering::Equal),
+        ) == core::cmp::Ordering::Greater
     }
 
     /// The key as something a person can read, quoted when it is text.
@@ -204,16 +231,6 @@ const MIN_SCORE: f32 = 0.5;
 /// Not a filter: an unrecognised tag is still reported. But XOR output is
 /// printable noise with braces scattered through it, so `ssb6{s6wb6b~s6ryu}`
 /// turns up constantly and would otherwise be promoted above the real answer.
-const KNOWN_TAGS: [&str; 6] = ["flag", "ctf", "key", "htb", "thm", "pico"];
-
-fn tag_is_known(text: &str) -> bool {
-    let Some(tag) = text.split('{').next() else {
-        return false;
-    };
-    let lower = tag.to_ascii_lowercase();
-    KNOWN_TAGS.iter().any(|known| lower.contains(known))
-}
-
 /// Longest repeating key worth hunting for.
 const MAX_KEY: usize = 32;
 
@@ -224,7 +241,7 @@ fn assess(key: Vec<u8>, plaintext: Vec<u8>) -> Option<Candidate> {
         .collect();
 
     let score = plainness(&plaintext);
-    let convincing = flags.iter().any(|f| tag_is_known(f));
+    let convincing = flags.iter().any(|f| bytes::tag_is_known(f));
     if score < MIN_SCORE && !convincing {
         return None;
     }
@@ -246,9 +263,11 @@ pub fn single_byte(data: &[u8]) -> Vec<Candidate> {
     found.sort_by(|a, b| {
         let (a_flag, a_score) = a.rank();
         let (b_flag, b_score) = b.rank();
-        b_flag
-            .cmp(&a_flag)
-            .then(b_score.partial_cmp(&a_score).unwrap_or(core::cmp::Ordering::Equal))
+        b_flag.cmp(&a_flag).then(
+            b_score
+                .partial_cmp(&a_score)
+                .unwrap_or(core::cmp::Ordering::Equal),
+        )
     });
     found.truncate(3);
     found
@@ -268,12 +287,11 @@ pub fn repeating(data: &[u8]) -> Option<Candidate> {
             let key = key_of_length(data, length);
             assess(key.clone(), apply(data, &key))
         })
-        .max_by(|a, b| {
-            let (a_flag, a_score) = a.rank();
-            let (b_flag, b_score) = b.rank();
-            a_flag
-                .cmp(&b_flag)
-                .then(a_score.partial_cmp(&b_score).unwrap_or(core::cmp::Ordering::Equal))
+        // Strictly better, so a tie keeps the earlier candidate. Key lengths
+        // arrive shortest first and a multiple decrypts just as well.
+        .fold(None::<Candidate>, |best, next| match best {
+            Some(current) if !next.beats(&current) => Some(current),
+            _ => Some(next),
         })
 }
 
@@ -304,9 +322,11 @@ impl Recovery {
         all.sort_by(|a, b| {
             let (a_flag, a_score) = a.1.rank();
             let (b_flag, b_score) = b.1.rank();
-            b_flag
-                .cmp(&a_flag)
-                .then(b_score.partial_cmp(&a_score).unwrap_or(core::cmp::Ordering::Equal))
+            b_flag.cmp(&a_flag).then(
+                b_score
+                    .partial_cmp(&a_score)
+                    .unwrap_or(core::cmp::Ordering::Equal),
+            )
         });
         all.truncate(3);
         all

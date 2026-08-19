@@ -67,7 +67,11 @@ pub fn utf16le_strings(data: &[u8], min_len: usize) -> Vec<Found> {
                 if run >= min_len {
                     out.push(Found {
                         offset: start,
-                        text: data[start..at].iter().step_by(2).map(|&b| b as char).collect(),
+                        text: data[start..at]
+                            .iter()
+                            .step_by(2)
+                            .map(|&b| b as char)
+                            .collect(),
                     });
                 }
                 run = 0;
@@ -79,7 +83,11 @@ pub fn utf16le_strings(data: &[u8], min_len: usize) -> Vec<Found> {
         if run >= min_len {
             out.push(Found {
                 offset: start,
-                text: data[start..].iter().step_by(2).map(|&b| b as char).collect(),
+                text: data[start..]
+                    .iter()
+                    .step_by(2)
+                    .map(|&b| b as char)
+                    .collect(),
             });
         }
     }
@@ -139,6 +147,28 @@ fn case_is_consistent(body: &[u8]) -> bool {
 ///
 /// A match is a candidate, never an assertion. The caller decides what to do
 /// with it.
+/// Tags a capture-the-flag answer is usually wrapped in.
+pub const KNOWN_TAGS: [&str; 6] = ["flag", "ctf", "key", "htb", "thm", "pico"];
+
+/// True when a flag candidate is wrapped in a tag anyone would recognise.
+///
+/// A brace shape on its own proves little: no cipher here enciphers
+/// punctuation, so the braces of a flag survive being encrypted and any
+/// ciphertext that had them still has them. The tag is what makes it evidence.
+///
+/// Matched at the end rather than anywhere inside. Tags are built by putting a
+/// competition's name in front of a common ending, which is how picoCTF and
+/// testCTF are built, so the ending is where the evidence lives. Looking
+/// anywhere inside instead calls `ethtBAN` a flag, because it happens to contain
+/// the letters of HTB, and on a list of decryptions that is not a rare accident.
+pub fn tag_is_known(text: &str) -> bool {
+    let Some(tag) = text.split('{').next() else {
+        return false;
+    };
+    let lower = tag.to_ascii_lowercase();
+    KNOWN_TAGS.iter().any(|known| lower.ends_with(known))
+}
+
 pub fn flag_candidates(data: &[u8]) -> Vec<Found> {
     // Real prefixes are short: flag, picoCTF, HTB, testCTF. Nothing near twelve.
     const MAX_TAG: usize = 12;
@@ -332,18 +362,66 @@ fn bzip_level(data: &[u8], at: usize) -> bool {
 }
 
 const SCANNABLE: [Scannable; 12] = [
-    Scannable { magic: b"RIFF", label: "RIFF container", validate: riff_type },
-    Scannable { magic: b"\x89PNG\r\n\x1a\n", label: "PNG image", validate: always },
-    Scannable { magic: b"PK\x03\x04", label: "ZIP archive", validate: always },
-    Scannable { magic: b"%PDF", label: "PDF document", validate: always },
-    Scannable { magic: b"\x7fELF", label: "ELF binary", validate: always },
-    Scannable { magic: b"7z\xbc\xaf\x27\x1c", label: "7-Zip archive", validate: always },
-    Scannable { magic: b"Rar!\x1a\x07", label: "RAR archive", validate: always },
-    Scannable { magic: b"GIF8", label: "GIF image", validate: gif_version },
-    Scannable { magic: b"BZh", label: "bzip2 stream", validate: bzip_level },
-    Scannable { magic: b"\xff\xd8\xff", label: "JPEG image", validate: jpeg_marker },
-    Scannable { magic: b"\x1f\x8b", label: "gzip stream", validate: gzip_flags },
-    Scannable { magic: b"BM", label: "BMP image", validate: bmp_size },
+    Scannable {
+        magic: b"RIFF",
+        label: "RIFF container",
+        validate: riff_type,
+    },
+    Scannable {
+        magic: b"\x89PNG\r\n\x1a\n",
+        label: "PNG image",
+        validate: always,
+    },
+    Scannable {
+        magic: b"PK\x03\x04",
+        label: "ZIP archive",
+        validate: always,
+    },
+    Scannable {
+        magic: b"%PDF",
+        label: "PDF document",
+        validate: always,
+    },
+    Scannable {
+        magic: b"\x7fELF",
+        label: "ELF binary",
+        validate: always,
+    },
+    Scannable {
+        magic: b"7z\xbc\xaf\x27\x1c",
+        label: "7-Zip archive",
+        validate: always,
+    },
+    Scannable {
+        magic: b"Rar!\x1a\x07",
+        label: "RAR archive",
+        validate: always,
+    },
+    Scannable {
+        magic: b"GIF8",
+        label: "GIF image",
+        validate: gif_version,
+    },
+    Scannable {
+        magic: b"BZh",
+        label: "bzip2 stream",
+        validate: bzip_level,
+    },
+    Scannable {
+        magic: b"\xff\xd8\xff",
+        label: "JPEG image",
+        validate: jpeg_marker,
+    },
+    Scannable {
+        magic: b"\x1f\x8b",
+        label: "gzip stream",
+        validate: gzip_flags,
+    },
+    Scannable {
+        magic: b"BM",
+        label: "BMP image",
+        validate: bmp_size,
+    },
 ];
 
 /// Every file signature anywhere in the buffer, not only at offset zero.
@@ -562,7 +640,10 @@ mod tests {
         data.extend_from_slice(&[1, 2, 3, 4]); // CRC
         data.extend_from_slice(b"trailing junk that must not be carved");
 
-        let hit = magic_scan(&data).into_iter().find(|h| h.offset == png_at).unwrap();
+        let hit = magic_scan(&data)
+            .into_iter()
+            .find(|h| h.offset == png_at)
+            .unwrap();
         assert!(hit.bounded);
         assert_eq!(hit.length, 8 + 40 + 4 + 4);
     }
@@ -576,7 +657,10 @@ mod tests {
         data.extend_from_slice(&[0xff, 0xd9]);
         data.extend_from_slice(b"after the image");
 
-        let hit = magic_scan(&data).into_iter().find(|h| h.offset == at).unwrap();
+        let hit = magic_scan(&data)
+            .into_iter()
+            .find(|h| h.offset == at)
+            .unwrap();
         assert!(hit.bounded);
         assert_eq!(hit.length, 4 + 20 + 2);
     }
@@ -594,7 +678,10 @@ mod tests {
         data.extend_from_slice(comment);
         data.extend_from_slice(b"and then some noise");
 
-        let hit = magic_scan(&data).into_iter().find(|h| h.offset == at).unwrap();
+        let hit = magic_scan(&data)
+            .into_iter()
+            .find(|h| h.offset == at)
+            .unwrap();
         assert!(hit.bounded);
         assert_eq!(hit.length, 4 + 30 + 22 + comment.len());
     }
@@ -625,7 +712,11 @@ mod tests {
         let bzip = hits.iter().find(|h| h.label == "bzip2 stream").unwrap();
 
         assert!(!bzip.bounded, "there is no bzip2 end marker to find");
-        assert_eq!(bzip.offset + bzip.length, png_at, "runs up to the next file");
+        assert_eq!(
+            bzip.offset + bzip.length,
+            png_at,
+            "runs up to the next file"
+        );
     }
 
     #[test]
@@ -755,7 +846,10 @@ mod tests {
         assert_eq!(found[0].text, "flag{wide}");
         assert_eq!(found[0].offset, 8);
 
-        assert!(ascii_strings(&data, 6).is_empty(), "the ascii scan misses it");
+        assert!(
+            ascii_strings(&data, 6).is_empty(),
+            "the ascii scan misses it"
+        );
     }
 
     #[test]

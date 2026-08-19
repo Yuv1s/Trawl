@@ -7,6 +7,7 @@
 		"dev": "vite dev",
 		"build:wasm": "cd trawl-core && wasm-pack build --target web --out-dir ../src/lib/wasm",
 		"fixtures": "node fixtures/generate.mjs",
+		"trigrams": "node fixtures/trigrams.mjs",
 		"demo": "node fixtures/duplicate-palette.mjs",
 		"demo:wav": "node fixtures/sound-picture.mjs",
 		"build": "npm run build:wasm && vite build",

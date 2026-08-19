@@ -147,7 +147,10 @@ pub fn ascii85(data: &[u8]) -> Option<Vec<u8>> {
         .strip_prefix(b"<~".as_slice())
         .unwrap_or(&clean)
         .to_vec();
-    let body = body.strip_suffix(b"~>".as_slice()).unwrap_or(&body).to_vec();
+    let body = body
+        .strip_suffix(b"~>".as_slice())
+        .unwrap_or(&body)
+        .to_vec();
 
     if body.len() < MIN_LENGTH {
         return None;
@@ -378,7 +381,10 @@ pub fn rot13(data: &[u8]) -> Option<Vec<u8>> {
 
 /// Rotates every printable character rather than only the letters.
 pub fn rot47(data: &[u8]) -> Option<Vec<u8>> {
-    if !data.iter().all(|&b| (b'!'..=b'~').contains(&b) || b.is_ascii_whitespace()) {
+    if !data
+        .iter()
+        .all(|&b| (b'!'..=b'~').contains(&b) || b.is_ascii_whitespace())
+    {
         return None;
     }
 
@@ -393,6 +399,152 @@ pub fn rot47(data: &[u8]) -> Option<Vec<u8>> {
             })
             .collect(),
     )
+}
+
+/// Bitcoin's base58 alphabet: no zero, capital O, capital I or lowercase l,
+/// because those are the pairs people mistype when copying by hand.
+const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+/// Base58, which cannot be done by shifting bits.
+///
+/// Every other base here divides the byte evenly: base64 takes six bits at a
+/// time, base32 five. 58 is not a power of two, so there is no bit boundary to
+/// cut on and the whole string has to be treated as one long number in base 58
+/// and divided back down into bytes.
+///
+/// Leading zero bytes are the exception, because a number does not remember how
+/// many zeroes preceded it. They are carried separately, as leading `1`s.
+pub fn base58(data: &[u8]) -> Option<Vec<u8>> {
+    let clean = unwrap_lines(data);
+    if clean.len() < MIN_LENGTH || !looks_encoded(&clean) {
+        return None;
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(clean.len());
+
+    for &byte in &clean {
+        let mut carry = value_in(BASE58, byte)?;
+
+        for digit in out.iter_mut().rev() {
+            carry += *digit as u32 * 58;
+            *digit = (carry & 0xff) as u8;
+            carry >>= 8;
+        }
+
+        while carry > 0 {
+            out.insert(0, (carry & 0xff) as u8);
+            carry >>= 8;
+        }
+    }
+
+    let zeroes = clean.iter().take_while(|&&b| b == b'1').count();
+    let mut result = vec![0u8; zeroes];
+    result.extend(out.iter().skip_while(|&&b| b == 0));
+
+    (!result.is_empty()).then_some(result)
+}
+
+/// Quoted-printable, as email bodies carry text that is almost but not quite
+/// ASCII.
+///
+/// `=` starts an escape: two hex digits for a byte, or an end of line for a
+/// break that the encoder inserted and the reader should not see.
+pub fn quoted_printable(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < MIN_LENGTH || !data.contains(&b'=') {
+        return None;
+    }
+
+    let hex = |b: u8| (b as char).to_digit(16);
+    let mut out = Vec::with_capacity(data.len());
+    let mut at = 0usize;
+    let mut escapes = 0usize;
+
+    while at < data.len() {
+        if data[at] != b'=' {
+            out.push(data[at]);
+            at += 1;
+            continue;
+        }
+
+        escapes += 1;
+
+        match data.get(at + 1) {
+            // A soft break: the encoder wrapped the line, so drop it.
+            Some(b'\r') if data.get(at + 2) == Some(&b'\n') => at += 3,
+            Some(b'\n') => at += 2,
+            Some(&high) => {
+                let low = *data.get(at + 2)?;
+                out.push((hex(high)? * 16 + hex(low)?) as u8);
+                at += 3;
+            }
+            // A trailing `=` with nothing after it is not an encoding.
+            None => return None,
+        }
+    }
+
+    // Text with no escapes in it is not evidence of anything: this codec would
+    // otherwise accept any sentence containing an equals sign and hand it back
+    // unchanged.
+    (escapes > 0).then_some(out)
+}
+
+/// uuencode, which predates base64 and still turns up wrapped around mail
+/// attachments.
+///
+/// Each line begins with its own decoded length, offset by 32 so it prints, and
+/// then encodes three bytes into four characters six bits at a time, each also
+/// offset by 32. A `begin` header and an `end` footer are optional here, since
+/// what usually gets pasted is the body alone.
+pub fn uuencode(data: &[u8]) -> Option<Vec<u8>> {
+    let text = core::str::from_utf8(data).ok()?;
+    let mut out = Vec::new();
+    let mut lines = 0usize;
+
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        let raw = line.as_bytes();
+
+        if line.starts_with("begin ") || line == "end" || raw.is_empty() {
+            continue;
+        }
+
+        // A backtick and a space both mean nought, which is how a zero-length
+        // line survives being trimmed by a mail client.
+        let length = match raw[0] {
+            b'`' => 0,
+            byte @ 0x20..=0x60 => (byte - 0x20) as usize,
+            _ => return None,
+        };
+
+        if length == 0 {
+            continue;
+        }
+
+        let quads = length.div_ceil(3);
+        if raw.len() < 1 + quads * 4 {
+            return None;
+        }
+
+        let mut decoded = Vec::with_capacity(quads * 3);
+        for quad in raw[1..1 + quads * 4].chunks(4) {
+            let mut bits = 0u32;
+            for &byte in quad {
+                let value = match byte {
+                    b'`' => 0,
+                    0x20..=0x60 => (byte - 0x20) as u32,
+                    _ => return None,
+                };
+                bits = (bits << 6) | value;
+            }
+            decoded.extend_from_slice(&[(bits >> 16) as u8, (bits >> 8) as u8, bits as u8]);
+        }
+
+        decoded.truncate(length);
+        out.extend_from_slice(&decoded);
+        lines += 1;
+    }
+
+    (lines > 0 && !out.is_empty()).then_some(out)
 }
 
 const MORSE: [(&str, u8); 36] = [
@@ -464,3 +616,71 @@ pub fn morse(data: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests;
+
+/// Standard base64, for building test material and nothing else.
+#[cfg(test)]
+pub fn base64_of(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    for chunk in data.chunks(3) {
+        let mut packed = 0u32;
+        for (i, &byte) in chunk.iter().enumerate() {
+            packed |= (byte as u32) << (16 - 8 * i);
+        }
+        for i in 0..4 {
+            out.push(if i <= chunk.len() {
+                BASE64[((packed >> (18 - 6 * i)) & 63) as usize]
+            } else {
+                b'='
+            });
+        }
+    }
+
+    out
+}
+
+/// The alphabet a rotation runs over when digits are part of the ring.
+const BASE36: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/// Rotation over digits and letters together, thirty-six positions round.
+///
+/// Encoder sites offer this as a Caesar with a custom alphabet, and it is a
+/// different cipher from the twenty-six letter one: shifting `Y` by eleven lands
+/// on `9` rather than wrapping straight back into the letters. A text rotated
+/// this way and then read with the letter alphabet comes out as nonsense, which
+/// is why it needs its own pass rather than a wider ring on the existing one.
+///
+/// Case survives letters but not digits, because a digit has none to remember.
+/// A lowercase letter that rotates onto one comes back uppercase.
+pub fn rot_base36(data: &[u8], shift: u8) -> Vec<u8> {
+    data.iter()
+        .map(|&byte| {
+            let upper = byte.to_ascii_uppercase();
+            match BASE36.iter().position(|&c| c == upper) {
+                Some(at) => {
+                    let moved = BASE36[(at + shift as usize) % 36];
+                    if byte.is_ascii_lowercase() {
+                        moved.to_ascii_lowercase()
+                    } else {
+                        moved
+                    }
+                }
+                None => byte,
+            }
+        })
+        .collect()
+}
+
+/// Atbash: the alphabet read backwards, so A becomes Z.
+///
+/// Its own inverse, and it has no key, so there is nothing to search. It is here
+/// because it is common enough in puzzles that its absence is noticeable.
+pub fn atbash(data: &[u8]) -> Vec<u8> {
+    data.iter()
+        .map(|&byte| match byte {
+            b'a'..=b'z' => b'z' - (byte - b'a'),
+            b'A'..=b'Z' => b'Z' - (byte - b'A'),
+            _ => byte,
+        })
+        .collect()
+}

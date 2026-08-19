@@ -206,6 +206,18 @@ pub fn peel_encodings(data: &[u8]) -> String {
     mantis::json(data)
 }
 
+/// Applies a key somebody already has, across every cipher that takes one.
+///
+/// Separate from `peel_encodings` because it answers a different question.
+/// That one asks what the text is; this one is told, and reports what each
+/// cipher makes of the key without judging any of it. Recovering a key needs
+/// enough text to count letters in, and plenty of puzzles have neither that nor
+/// an answer a scorer could recognise.
+#[wasm_bindgen]
+pub fn mantis_with_key(data: &[u8], key: &str) -> String {
+    mantis::keyed::json(&mantis::keyed::with_key(data, key))
+}
+
 /// JPEG coefficient analysis as JSON: the chi-square attack, the coefficient
 /// histogram, and any JSteg extraction that produced something readable.
 ///
@@ -322,7 +334,11 @@ pub fn wav_lsb_extract(
 /// Packed the same way as [`plane_wall`]: a u32 length, that many bytes of JSON,
 /// then one grayscale byte per pixel with row 0 at the top.
 #[wasm_bindgen]
-pub fn wav_spectrogram(file: &[u8], window: usize, target_width: usize) -> Result<Vec<u8>, JsError> {
+pub fn wav_spectrogram(
+    file: &[u8],
+    window: usize,
+    target_width: usize,
+) -> Result<Vec<u8>, JsError> {
     let parsed = wav::parse(file).map_err(|e| JsError::new(&e.to_string()))?;
     let samples = wav::mono(file, &parsed).map_err(|e| JsError::new(&e.to_string()))?;
 

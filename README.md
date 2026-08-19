@@ -48,8 +48,13 @@ Paste a string instead of dropping a file and Mantis takes over, the
 cryptography half. It works out what the string has been through and undoes it,
 layer by layer: base64 wrapped around hex wrapped around a rotation, unwound
 until something readable falls out. If what is underneath turns out to be
-encrypted rather than encoded, it tries XOR against it and recovers the key,
-whether that key is one byte or a repeated word.
+encrypted rather than encoded, it attacks it: XOR, Caesar, Vigenère, affine,
+rail fence and columnar transposition, and simple substitution, each recovering
+its own key rather than asking you for one. When none of them fires it shows the
+letter counts it was working from, and lays out every rotation it knows with the
+ones that decode onward first, so you can finish by eye. It will not guess: an
+answer that is a token rather than a sentence reads like nothing to a scorer, and
+saying so beats picking one at random and sounding sure.
 
 Everything found collects in the Cod-end, the panel at the top of the page.
 

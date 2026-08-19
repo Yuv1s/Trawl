@@ -1,7 +1,6 @@
 use super::*;
 
-const PROSE: &[u8] =
-    b"the treasure is buried under the old oak tree at the north end of the field";
+const PROSE: &[u8] = b"the treasure is buried under the old oak tree at the north end of the field";
 
 fn best(found: &[Candidate]) -> String {
     String::from_utf8_lossy(&found[0].plaintext).into_owned()
@@ -102,7 +101,9 @@ fn reports_nothing_on_random_bytes() {
         found
             .single
             .first()
-            .map(|c| String::from_utf8_lossy(&c.plaintext[..40.min(c.plaintext.len())]).into_owned())
+            .map(
+                |c| String::from_utf8_lossy(&c.plaintext[..40.min(c.plaintext.len())]).into_owned()
+            )
     );
 }
 

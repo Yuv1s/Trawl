@@ -167,6 +167,16 @@ export type XorCandidate = {
 	flags: string[];
 };
 
+/** What a pasted string turned out to be, when it is a digest. */
+export type HashMatch = {
+	/** True when the string declares its own format rather than merely fitting. */
+	certain: boolean;
+	shape: string;
+	bits: number | null;
+	/** More than one whenever the shape cannot separate them. */
+	candidates: string[];
+};
+
 export type PeelResult = {
 	depth: number;
 	/** How much the final answer reads like ordinary text, 0 to 1. */
@@ -175,6 +185,141 @@ export type PeelResult = {
 	steps: PeelStep[];
 	/** Run against whatever the peel ended with, which is where a cipher hides. */
 	xor: XorCandidate[];
+	/** Set when the string is a digest, which is nothing to unwrap or attack. */
+	hash: HashMatch | null;
+	/** Set when the text turned out to be Vigenère. */
+	vigenere: { key: string; score: number; plaintext: string } | null;
+	/** Set when the text turned out to be affine, which includes Caesar. */
+	affine: AffineBreak | null;
+	/** Set when the letters were the right ones in the wrong order. */
+	transposition: TranspositionBreak | null;
+	/** Set when the alphabet was replaced wholesale. */
+	substitution: SubstitutionBreak | null;
+	/** The counts themselves, for when nothing above settled it. */
+	frequency: FrequencyTable;
+	/**
+	 * Every rotation laid out, best first, when nothing else read the text.
+	 *
+	 * Empty whenever an attack landed. A great many answers are not English — a
+	 * token, a key, a flag with no marker on it — and against those the scorer
+	 * is blind rather than wrong, so the honest fallback is to hand over the
+	 * readings and let the eye finish.
+	 */
+	shortlist: Rotation[];
+	/** Set when a key from Mantis's own short wordlist read the text. */
+	dictionary: KeyAttempt | null;
+	/**
+	 * Keys worked out of this text, one per assumed key length, best first.
+	 *
+	 * Nothing here is a list of common keys. Each entry is what falls out of
+	 * splitting the letters into that many columns and counting each column,
+	 * so a different ciphertext yields entirely different keys.
+	 */
+	derivedKeys: DerivedKey[];
+};
+
+/** A key recovered from the ciphertext at one assumed key length. */
+export type DerivedKey = {
+	key: string;
+	/**
+	 * Letters each key position had to work from.
+	 *
+	 * The whole story about how much the key is worth. Around twelve it becomes
+	 * reliable; at two it is a shape the text suggested rather than a key.
+	 */
+	perColumn: number;
+	score: number;
+	/** The start of what this key deciphers to. */
+	preview: string;
+};
+
+/**
+ * What one cipher made of a key.
+ *
+ * Nothing filters these when the key came from a person: recovering a key needs
+ * enough text to count letters in, and plenty of answers are tokens no scorer
+ * could confirm, so the person who supplied the key is the one who judges it.
+ */
+export type KeyAttempt = {
+	cipher: string;
+	key: string;
+	plaintext: string;
+	score: number;
+	flags: string[];
+	/**
+	 * Keys for the layer underneath, when this one did not reach the bottom.
+	 *
+	 * Enciphering twice is one cipher with a longer key, so two keys can never
+	 * be recovered separately from the text alone. Given the first, the second
+	 * is an ordinary problem again. Empty once the result reads.
+	 */
+	next: DerivedKey[];
+};
+
+/** One way of reading the input, and where that reading leads. */
+export type Rotation = {
+	/** What was done, in the words a person would use: "ROT 13", "base36 +21". */
+	how: string;
+	text: string;
+	score: number;
+	/** Set when this reading, or what it decodes to, carries a flag or signature. */
+	found: string | null;
+	/** What a further peel makes of it, when the shape alone justifies one. */
+	then: { through: string[]; result: string; score: number } | null;
+};
+
+/** A recovered affine key, where each letter became `a * x + b` modulo 26. */
+export type AffineBreak = {
+	a: number;
+	b: number;
+	score: number;
+	plaintext: string;
+};
+
+/**
+ * A recovered transposition, which moved the letters without changing them.
+ *
+ * `rails` is set for a rail fence and `order` for a columnar, never both.
+ */
+export type TranspositionBreak = {
+	kind: 'rail fence' | 'columnar';
+	rails?: number;
+	width?: number;
+	/** Grid columns in the order the key read them. */
+	order?: number[];
+	score: number;
+	plaintext: string;
+};
+
+/** A recovered substitution key: the plaintext letter for each of A to Z. */
+export type SubstitutionBreak = {
+	key: string;
+	score: number;
+	plaintext: string;
+};
+
+/** How often a letter appears, against what English would give it. */
+export type LetterCount = {
+	letter: string;
+	count: number;
+	/** Share of all letters, as a percentage. */
+	share: number;
+	/** English's share of the same letter, to compare against. */
+	english: number;
+};
+
+/**
+ * Letter counts and repeated runs, reported whether or not an attack landed.
+ *
+ * `coincidence` is the chance two letters drawn from the text match: English
+ * runs near 0.067, and text spread across several alphabets flattens to 0.038.
+ */
+export type FrequencyTable = {
+	total: number;
+	coincidence: number;
+	letters: LetterCount[];
+	bigrams: { text: string; count: number }[];
+	trigrams: { text: string; count: number }[];
 };
 
 export type PaletteGroup = {
@@ -317,6 +462,7 @@ export type AnalysisRequest =
 			includeDc: boolean;
 			msbFirst: boolean;
 	  }
+	| { kind: 'withKey'; id: number; text: string; key: string }
 	| {
 			kind: 'extractAudio';
 			id: number;
@@ -351,6 +497,7 @@ export type AnalysisResponse =
 			audioError: string | null;
 	  }
 	| { id: number; status: 'peel'; input: string; peel: PeelResult }
+	| { id: number; status: 'keyed'; key: string; attempts: KeyAttempt[] }
 	| { id: number; status: 'plane'; channel: number; bit: number; pixels: Uint8Array }
 	| { id: number; status: 'extract'; label: string; bytes: Uint8Array }
 	| { id: number; status: 'error'; name: string; size: number; detail: string };

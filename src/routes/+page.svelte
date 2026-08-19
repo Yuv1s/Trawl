@@ -2,6 +2,7 @@
 	import AnalysisWorker from '$lib/worker/analysis.worker?worker';
 	import DropSurface from '$lib/components/DropSurface.svelte';
 	import PeelPanel from '$lib/components/PeelPanel.svelte';
+	import { attack as attackRsa, looksLikeRsa, type Report } from '$lib/analysis/rsa';
 	import Logo from '$lib/components/Logo.svelte';
 	import ToolRack from '$lib/components/ToolRack.svelte';
 	import Recovered from '$lib/components/Recovered.svelte';
@@ -26,6 +27,7 @@
 		isHeaderError,
 		isJpegError,
 		type AnalysisResponse,
+		type KeyAttempt,
 		type PeelResult
 	} from '$lib/worker/protocol';
 
@@ -33,7 +35,7 @@
 	 *  none of them become the file-analysis state. */
 	type Analysis = Exclude<
 		AnalysisResponse,
-		{ status: 'plane' } | { status: 'extract' } | { status: 'peel' }
+		{ status: 'plane' } | { status: 'extract' } | { status: 'peel' } | { status: 'keyed' }
 	>;
 
 	type View =
@@ -41,13 +43,15 @@
 		| { phase: 'working'; name: string }
 		| { phase: 'done'; result: Analysis; bytes: Uint8Array }
 		/** A pasted string, which has no file behind it and no tool rack. */
-		| { phase: 'text'; input: string; peel: PeelResult };
+		| { phase: 'text'; input: string; peel: PeelResult; rsa: Report | null };
 
 	let view = $state<View>({ phase: 'idle' });
 	let activeTool = $state('flags');
 	let selectedChunk = $state(-1);
 	let openPlane = $state<{ channel: number; bit: number; pixels: Uint8Array | null } | null>(null);
 	let extracted = $state<{ label: string; text: string } | null>(null);
+	/** A key somebody typed, and what each cipher made of it. */
+	let keyed = $state<{ key: string; attempts: KeyAttempt[] } | null>(null);
 
 	let worker: Worker | null = null;
 	let ticket = 0;
@@ -60,8 +64,20 @@
 				const result = event.data;
 				if (result.id !== ticket) return;
 
+				if (result.status === 'keyed') {
+					keyed = { key: result.key, attempts: result.attempts };
+					return;
+				}
+
 				if (result.status === 'peel') {
-					view = { phase: 'text', input: result.input, peel: result.peel };
+					// RSA runs here rather than in the worker: it needs bignum
+					// arithmetic, and the platform's BigInt is the only one there is.
+					view = {
+						phase: 'text',
+						input: result.input,
+						peel: result.peel,
+						rsa: looksLikeRsa(result.input) ? attackRsa(result.input) : null
+					};
 					return;
 				}
 
@@ -136,8 +152,16 @@
 
 	function acceptText(text: string) {
 		const id = ++ticket;
+		keyed = null;
 		view = { phase: 'working', name: 'pasted text' };
 		ensureWorker().postMessage({ kind: 'peel', id, text });
+	}
+
+	/** Applies a key the reader already has, which no amount of text would give up. */
+	function requestKey(key: string) {
+		if (view.phase !== 'text') return;
+		keyed = null;
+		ensureWorker().postMessage({ kind: 'withKey', id: ticket, text: view.input, key });
 	}
 
 	async function accept(file: File) {
@@ -187,6 +211,7 @@
 	}
 
 	function reset() {
+		keyed = null;
 		view = { phase: 'idle' };
 	}
 
@@ -405,7 +430,14 @@
 {#if view.phase === 'idle'}
 	<DropSurface onfile={accept} ontext={acceptText} />
 {:else if view.phase === 'text'}
-	<PeelPanel input={view.input} peel={view.peel} onreset={reset} />
+	<PeelPanel
+		input={view.input}
+		peel={view.peel}
+		rsa={view.rsa}
+		{keyed}
+		onkey={requestKey}
+		onreset={reset}
+	/>
 {:else}
 	<div
 		class="shell"

@@ -13,6 +13,7 @@ import init, {
 	jpeg_stego_extract,
 	palette_extract,
 	palette_stego,
+	mantis_with_key,
 	peel_encodings,
 	rs_analysis,
 	wav_lsb_extract,
@@ -29,6 +30,7 @@ import type {
 	JpegError,
 	JpegStego,
 	PaletteStego,
+	KeyAttempt,
 	PeelResult,
 	PlaneWall,
 	RsAnalysis,
@@ -301,29 +303,42 @@ async function extractAudio(
 	};
 }
 
+async function applyKey(id: number, text: string, key: string): Promise<AnalysisResponse> {
+	await ready;
+
+	return {
+		id,
+		status: 'keyed',
+		key,
+		attempts: JSON.parse(mantis_with_key(new TextEncoder().encode(text), key)) as KeyAttempt[]
+	};
+}
+
 self.addEventListener('message', (event: MessageEvent<AnalysisRequest>) => {
 	const request = event.data;
 
 	const work =
 		request.kind === 'peel'
 			? peelText(request.id, request.text)
-			: request.kind === 'plane'
-				? requestPlane(request.id, request.channel, request.bit)
-				: request.kind === 'extract'
-					? extract(request.id, request.channels, request.bit, request.msbFirst)
-					: request.kind === 'extractPalette'
-						? extractPalette(request.id, request.msbFirst)
-						: request.kind === 'extractJpeg'
-							? extractJpeg(request.id, request.includeDc, request.msbFirst)
-							: request.kind === 'extractAudio'
-								? extractAudio(
-										request.id,
-										request.label,
-										request.channelIndex,
-										request.bit,
-										request.msbFirst
-									)
-								: analyse(request.id, request.name, new Uint8Array(request.bytes));
+			: request.kind === 'withKey'
+				? applyKey(request.id, request.text, request.key)
+				: request.kind === 'plane'
+					? requestPlane(request.id, request.channel, request.bit)
+					: request.kind === 'extract'
+						? extract(request.id, request.channels, request.bit, request.msbFirst)
+						: request.kind === 'extractPalette'
+							? extractPalette(request.id, request.msbFirst)
+							: request.kind === 'extractJpeg'
+								? extractJpeg(request.id, request.includeDc, request.msbFirst)
+								: request.kind === 'extractAudio'
+									? extractAudio(
+											request.id,
+											request.label,
+											request.channelIndex,
+											request.bit,
+											request.msbFirst
+										)
+									: analyse(request.id, request.name, new Uint8Array(request.bytes));
 
 	work
 		.then((response) => self.postMessage(response))

@@ -14,7 +14,16 @@
 //! justify itself: the result is kept only when it looks more like something a
 //! person would read than what went into it.
 
+pub mod affine;
 pub mod encodings;
+pub mod frequency;
+pub mod hashes;
+pub mod keyed;
+pub mod ngram;
+pub mod shortlist;
+pub mod substitution;
+pub mod transposition;
+pub mod vigenere;
 pub mod xor;
 
 use crate::bytes;
@@ -37,8 +46,24 @@ const COMMON: [&str; 40] = [
     "she", "or", "an", "will", "my", "one", "all", "would", "there", "their", "is", "are",
 ];
 
-/// Fraction of words that are recognisably English, scaled so that a sentence
-/// with a couple of them counts as convincing.
+/// How much of a run is spelled out of words Mantis recognises, scaled so that
+/// an ordinary sentence counts as a full match.
+///
+/// Measured by letter rather than by word, which matters more than it sounds.
+/// Counting words, a string with four tokens in it and the word "a" among them
+/// scores 0.25, and so does a real sentence where one word in four is common.
+/// They are not comparable, and the short one was being read as half English:
+///
+/// ```text
+/// sample              by token   by letter
+/// english prose          0.484       0.345
+/// english short          0.222       0.171
+/// a lucky "a" in noise   0.250       0.040
+/// ```
+///
+/// `tests::probe_word_fit_by_length` redraws that. Matching "a" is worth one
+/// letter of evidence, matching "the" is worth three, and noise stops being able
+/// to buy a good score with a single stray article.
 fn word_fit(data: &[u8]) -> f32 {
     let Ok(text) = core::str::from_utf8(data) else {
         return 0.0;
@@ -57,9 +82,10 @@ fn word_fit(data: &[u8]) -> f32 {
         if word.is_empty() {
             continue;
         }
-        total += 1.0;
+
+        total += word.len() as f32;
         if COMMON.contains(&word.as_str()) {
-            known += 1.0;
+            known += word.len() as f32;
         }
     }
 
@@ -67,9 +93,11 @@ fn word_fit(data: &[u8]) -> f32 {
         return 0.0;
     }
 
-    // Roughly a third of ordinary prose is these words, so treat that as a full
-    // match rather than demanding every word be on the list.
-    ((known / total) * 2.5).clamp(0.0, 1.0)
+    // Prose spends 0.345 of its letters on these words, measured above, so that
+    // is what a full match means. Counting by word the same threshold sat at
+    // 2.5, and carrying it over unchanged would have quietly marked all English
+    // down: the multiplier has to follow the thing being counted.
+    ((known / total) * 2.9).clamp(0.0, 1.0)
 }
 
 fn printable(byte: u8) -> bool {
@@ -136,7 +164,18 @@ pub fn plainness(data: &[u8]) -> f32 {
         (1.0 - (space_ratio - 0.17).abs() / 0.17).clamp(0.0, 1.0)
     };
 
-    readable * (0.35 * letter_fit + 0.2 * spacing + 0.35 * word_fit(data) + 0.1)
+    // Letter counts and spacing describe the shape of a text. Words and trigrams
+    // are the two that read it, and they carry most of the weight because the
+    // other two can be perfect while the text says nothing: rearranging English
+    // leaves the letter mix exactly English and the spacing untouched. Scrambled
+    // prose has to land well clear of 0.5, because that is where the rest of
+    // Mantis stops looking.
+    readable
+        * (0.15 * letter_fit
+            + 0.1 * spacing
+            + 0.35 * word_fit(data)
+            + 0.3 * ngram::fitness(data)
+            + 0.1)
 }
 
 /// One layer removed.
@@ -179,16 +218,24 @@ type Codec = (&'static str, fn(&[u8]) -> Option<Vec<u8>>, bool);
 ///
 /// ROT13 sits here for convenience but is not structural: it accepts any text at
 /// all, so it can only ever be justified by its result.
-pub const CODECS: [Codec; 11] = [
+///
+/// Base58 is not structural either, for the same reason and less obviously. Its
+/// alphabet is 58 of the 62 alphanumerics, so very nearly every alphanumeric
+/// string is valid base58 and decodes to something. Treating that as evidence
+/// lets it fire on an answer that was already correct and hand back noise.
+pub const CODECS: [Codec; 14] = [
     ("morse", encodings::morse, true),
     ("binary", encodings::binary, true),
     ("decimal bytes", encodings::decimal, true),
     ("hex", encodings::hex, true),
     ("base32", encodings::base32, true),
+    ("base58", encodings::base58, false),
     ("base64", encodings::base64, true),
     ("base64url", encodings::base64_url, true),
     ("ascii85", encodings::ascii85, true),
+    ("uuencode", encodings::uuencode, true),
     ("percent-encoding", encodings::percent, true),
+    ("quoted-printable", encodings::quoted_printable, true),
     ("HTML entities", encodings::html_entities, true),
     ("ROT13", encodings::rot13, false),
 ];
@@ -254,12 +301,45 @@ fn rate(data: &[u8]) -> f32 {
 /// explored. Rotations are only taken when they improve things on the spot,
 /// because a rotation applied to an encoded blob breaks the blob rather than
 /// setting up the next layer, so it is never a useful middle step.
+/// How much of a run has to be letters before a letter rotation is worth trying.
+///
+/// Halfway between ciphertext and prose, which are not close together. See
+/// [`candidates`] for the measurements.
+const ROTATABLE: f32 = 0.5;
+
+/// Whether a base-N reading is justified by the input's own shape, or merely
+/// possible.
+///
+/// Base64 packs three bytes into four characters, so real output arrives in
+/// whole groups: a length that is a multiple of four, or padding saying where
+/// the last group stopped. Anything else still decodes, dropping the leftover
+/// bits, but its length vouches for nothing. That distinction only starts to
+/// matter when the answer is not English. An eleven-character token is valid
+/// base64, and a peel that treats "valid" as "justified" will unwrap the right
+/// answer into noise and report it as a layer.
+fn grouped(name: &str, data: &[u8]) -> bool {
+    let group = match name {
+        "base64" | "base64url" => 4,
+        "base32" => 8,
+        // Ascii85 takes 85 of the 95 printable characters and allows a short
+        // final group, so neither its alphabet nor its length rules anything
+        // out: very nearly every printable run "is" ascii85 and decodes to
+        // bytes. Only the wrapper it is normally shipped inside is evidence.
+        "ascii85" => return data.windows(2).any(|pair| pair == b"<~"),
+        _ => return true,
+    };
+
+    // Padding counts towards the length rather than excusing it: real output
+    // divides by the group whether it was padded or not.
+    data.iter().filter(|b| !b.is_ascii_whitespace()).count() % group == 0
+}
+
 fn candidates(data: &[u8]) -> Vec<(&'static str, Vec<u8>, bool)> {
     let mut out = Vec::new();
 
     for (name, decode, structural) in CODECS {
         if let Some(decoded) = decode(data).filter(|d| !d.is_empty() && d != data) {
-            out.push((name, decoded, structural));
+            out.push((name, decoded, structural && grouped(name, data)));
         }
     }
 
@@ -276,13 +356,32 @@ fn candidates(data: &[u8]) -> Vec<(&'static str, Vec<u8>, bool)> {
         }
     };
 
+    // ROT47 works across the whole printable range, so it is judged on its
+    // result alone. A letter rotation is different: it only touches letters, so
+    // on data that is mostly not letters it cannot decipher anything and can
+    // only corrupt. Wrapped ciphertext is exactly that, and a rotation applied
+    // to it destroys the key before XOR recovery ever sees it.
+    //
+    // Letters as a share of printable bytes, measured in
+    // `tests::probe_letter_density`:
+    //
+    // ```text
+    //   english 0.81   base64 blob 0.88   random token 0.91
+    //   xor ciphertext 0.19   hex 0.06
+    // ```
     if let Some(rotated) = encodings::rot47(data) {
         rotation("ROT47", rotated);
     }
-    for shift in 1..26u8 {
-        if shift != 13 {
-            // Thirteen is already in the table, and naming it reads better.
-            rotation("ROT", encodings::rot_n(data, shift));
+
+    let printable = data.iter().filter(|&&b| (0x20..0x7f).contains(&b)).count();
+    let letters = data.iter().filter(|b| b.is_ascii_alphabetic()).count();
+
+    if printable > 0 && letters as f32 / printable as f32 >= ROTATABLE {
+        for shift in 1..26u8 {
+            if shift != 13 {
+                // Thirteen is already in the table, and naming it reads better.
+                rotation("ROT", encodings::rot_n(data, shift));
+            }
         }
     }
 
@@ -359,13 +458,21 @@ fn unwrap_structural(data: &[u8]) -> Vec<Step> {
             break;
         }
 
-        let found = CODECS.iter().filter(|(_, _, structural)| *structural).find_map(
-            |(name, decode, _)| {
+        // A digest is the end of the road. Thirty-two hex digits unwrap
+        // perfectly well into sixteen bytes that were never text, and before
+        // this the peeler did exactly that and presented the noise as a result.
+        if hashes::is_digest(&current) {
+            break;
+        }
+
+        let found = CODECS
+            .iter()
+            .filter(|(name, _, structural)| *structural && grouped(name, &current))
+            .find_map(|(name, decode, _)| {
                 decode(&current)
                     .filter(|d| !d.is_empty() && *d != current)
                     .map(|d| (*name, d))
-            },
-        );
+            });
 
         let Some((encoding, output)) = found else {
             break;
@@ -434,6 +541,27 @@ pub struct Reading {
     pub peel: Peel,
     /// XOR run against whatever the peel ended with.
     pub xor: xor::Recovery,
+    /// Set when the string is a digest rather than something to unwrap.
+    pub hash: Option<hashes::Identified>,
+    /// Set when the text turned out to be Vigenère.
+    pub vigenere: Option<vigenere::Candidate>,
+    /// Set when the text turned out to be affine, which includes Caesar.
+    pub affine: Option<affine::Candidate>,
+    /// Set when the letters were the right ones in the wrong order.
+    pub transposition: Option<transposition::Candidate>,
+    /// Set when the alphabet was replaced wholesale.
+    pub substitution: Option<substitution::Candidate>,
+    /// Set when a key from the wordlist read the text.
+    pub dictionary: Option<keyed::Attempt>,
+    /// Keys worked out of this text, one per assumed key length, best first.
+    pub derived: Vec<vigenere::Derived>,
+    /// Every rotation laid out, best first.
+    ///
+    /// Only filled when nothing else read the text. A great many answers are
+    /// not English — a token, a key, a flag with no marker — and against those
+    /// every scorer here is blind rather than wrong. Twenty-five letter
+    /// rotations and thirty-five wider ones are few enough to hand over whole.
+    pub shortlist: Vec<shortlist::Reading>,
 }
 
 /// Peels the encodings, then attacks what is left with XOR.
@@ -443,6 +571,32 @@ pub struct Reading {
 /// survive being pasted around. Unwrapping first is what makes the cipher
 /// visible at all.
 pub fn read(data: &[u8]) -> Reading {
+    let nothing = |peel: Peel| Reading {
+        peel,
+        xor: xor::Recovery::default(),
+        hash: None,
+        vigenere: None,
+        affine: None,
+        transposition: None,
+        substitution: None,
+        dictionary: None,
+        derived: Vec::new(),
+        shortlist: Vec::new(),
+    };
+
+    // Asked first. A hash is not a wrapper, and nothing below should try to
+    // open it or attack it.
+    if let Some(hash) = hashes::identify(data) {
+        return Reading {
+            hash: Some(hash),
+            ..nothing(Peel {
+                steps: Vec::new(),
+                result: data.to_vec(),
+                score: plainness(data),
+            })
+        };
+    }
+
     let peel = peel(data);
     let inner = if peel.steps.is_empty() {
         data
@@ -450,18 +604,93 @@ pub fn read(data: &[u8]) -> Reading {
         &peel.result
     };
 
+    // Already readable, so there is nothing left to break.
+    //
+    // A flag shape only counts as an answer when a peel produced it. Every
+    // cipher here leaves punctuation alone, so the braces of `flag{...}` come
+    // through enciphering untouched: `zobm{ojfop_nbruq}` is flag-shaped and is
+    // pure ciphertext. Taken as conclusive on text nothing was peeled off, that
+    // shape stops the attacks before they start, on exactly the input most
+    // likely to be an enciphered flag.
+    let produced = !peel.steps.is_empty();
+    if (produced && conclusive(inner).is_some()) || plainness(inner) >= 0.5 {
+        return nothing(peel);
+    }
+
+    let xor = xor::recover(inner);
+
+    // Vigenère only ever produces letters, so a run of bytes that is not
+    // mostly letters was never enciphered with it.
+    let vigenere = vigenere::solve(inner);
+
+    // Each of these answers on its own evidence, against a bar measured in
+    // `tests::probe_bars`, rather than on whether another attack came up empty.
+    let affine = affine::solve(inner);
+    let transposition = transposition::solve(inner);
+
+    // Affine is a substitution with a rule to it, so a text this reads will also
+    // solve as a free-form substitution. Both answers are right and only one is
+    // worth showing: the smaller key is the better explanation.
+    let substitution = affine
+        .is_none()
+        .then(|| substitution::solve(inner))
+        .flatten();
+
+    // Last resort, and only a resort. Everything above reports a conclusion; if
+    // none of them reached one, the honest thing is to stop pretending and hand
+    // over the readings themselves.
+    let settled = xor.found()
+        || vigenere.is_some()
+        || affine.is_some()
+        || transposition.is_some()
+        || substitution.is_some();
+
+    // Rotated from whichever form is still text. A peel can take a wrong turn
+    // and leave bytes behind, and rotating bytes asks a question with no answer
+    // in it; the string that came in is the better starting point then.
+    let readable = |run: &[u8]| {
+        !run.is_empty()
+            && run.iter().filter(|&&b| printable(b)).count() as f32 / run.len() as f32 >= 0.9
+    };
+
+    // A short wordlist, tried only when nothing was recovered from the text
+    // itself. Guessing before the evidence has been exhausted is how a tool
+    // starts preferring a lucky guess to a real recovery.
+    let dictionary = if settled {
+        None
+    } else {
+        keyed::dictionary(inner)
+    };
+
+    let settled = settled || dictionary.is_some();
+
+    // The working, shown whether or not an attack landed above. Text that
+    // already reads never gets this far, which is right: forty ways of
+    // rearranging a readable sentence is not evidence, it is clutter.
+    let derived = vigenere::derive(inner);
+
+    let shortlist = if settled {
+        Vec::new()
+    } else if readable(inner) {
+        shortlist::every(inner)
+    } else {
+        shortlist::every(data)
+    };
+
     Reading {
-        // Nothing to recover if the peel already arrived somewhere readable.
-        xor: if conclusive(inner).is_some() || plainness(inner) >= 0.5 {
-            xor::Recovery::default()
-        } else {
-            xor::recover(inner)
-        },
         peel,
+        xor,
+        hash: None,
+        vigenere,
+        affine,
+        transposition,
+        substitution,
+        dictionary,
+        derived,
+        shortlist,
     }
 }
 
-/// The reading as JSON, ready to leave the worker.
 pub fn json(data: &[u8]) -> String {
     use crate::json::{push_field, push_number, push_string};
 
@@ -516,6 +745,144 @@ pub fn json(data: &[u8]) -> String {
         }
         out.push_str("]}");
     };
+
+    push_string(&mut out, "vigenere");
+    match &reading.vigenere {
+        Some(found) => {
+            out.push_str(":{");
+            push_field(&mut out, "key", &crate::json::latin1(&found.key));
+            out.push(',');
+            push_string(&mut out, "score");
+            out.push_str(&format!(":{:.3}", found.score));
+            out.push(',');
+            push_field(
+                &mut out,
+                "plaintext",
+                &crate::json::latin1(&found.plaintext),
+            );
+            out.push('}');
+        }
+        None => out.push_str(":null"),
+    }
+    out.push(',');
+
+    push_string(&mut out, "affine");
+    match &reading.affine {
+        Some(found) => {
+            out.push_str(":{");
+            push_number(&mut out, "a", found.a as usize);
+            out.push(',');
+            push_number(&mut out, "b", found.b as usize);
+            out.push(',');
+            push_string(&mut out, "score");
+            out.push_str(&format!(":{:.3}", found.score));
+            out.push(',');
+            push_field(
+                &mut out,
+                "plaintext",
+                &crate::json::latin1(&found.plaintext),
+            );
+            out.push('}');
+        }
+        None => out.push_str(":null"),
+    }
+    out.push(',');
+
+    push_string(&mut out, "transposition");
+    match &reading.transposition {
+        Some(found) => {
+            out.push_str(":{");
+            match &found.shape {
+                transposition::Shape::RailFence { rails } => {
+                    push_field(&mut out, "kind", "rail fence");
+                    out.push(',');
+                    push_number(&mut out, "rails", *rails);
+                }
+                transposition::Shape::Columnar { order } => {
+                    push_field(&mut out, "kind", "columnar");
+                    out.push(',');
+                    push_number(&mut out, "width", order.len());
+                    out.push(',');
+                    push_string(&mut out, "order");
+                    out.push_str(":[");
+                    for (i, column) in order.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        out.push_str(&column.to_string());
+                    }
+                    out.push(']');
+                }
+            }
+            out.push(',');
+            push_string(&mut out, "score");
+            out.push_str(&format!(":{:.3}", found.score));
+            out.push(',');
+            push_field(
+                &mut out,
+                "plaintext",
+                &crate::json::latin1(&found.plaintext),
+            );
+            out.push('}');
+        }
+        None => out.push_str(":null"),
+    }
+    out.push(',');
+
+    push_string(&mut out, "substitution");
+    match &reading.substitution {
+        Some(found) => {
+            out.push_str(":{");
+            push_field(&mut out, "key", &crate::json::latin1(&found.key));
+            out.push(',');
+            push_string(&mut out, "score");
+            out.push_str(&format!(":{:.3}", found.score));
+            out.push(',');
+            push_field(
+                &mut out,
+                "plaintext",
+                &crate::json::latin1(&found.plaintext),
+            );
+            out.push('}');
+        }
+        None => out.push_str(":null"),
+    }
+    out.push(',');
+
+    push_string(&mut out, "derivedKeys");
+    out.push(':');
+    out.push_str(&vigenere::derived_json(&reading.derived));
+    out.push(',');
+
+    push_string(&mut out, "dictionary");
+    match &reading.dictionary {
+        Some(found) => {
+            out.push(':');
+            out.push_str(keyed::json(core::slice::from_ref(found)).trim_matches(['[', ']']));
+        }
+        None => out.push_str(":null"),
+    }
+    out.push(',');
+
+    push_string(&mut out, "shortlist");
+    out.push(':');
+    out.push_str(&shortlist::json(&reading.shortlist));
+    out.push(',');
+
+    push_string(&mut out, "frequency");
+    out.push(':');
+    out.push_str(&frequency::json(data));
+    out.push(',');
+
+    push_string(&mut out, "hash");
+    match &reading.hash {
+        Some(_) => {
+            out.push(':');
+            out.push_str(&hashes::json(data));
+        }
+        None => out.push_str(":null"),
+    }
+    out.push(',');
 
     push_string(&mut out, "xor");
     out.push_str(":[");
