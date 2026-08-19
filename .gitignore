@@ -16,6 +16,7 @@ testImgs/
 # Cargo build artifacts (also ignored by trawl-core/.gitignore; repeated here
 # so root-level tooling that only reads this file — eslint, prettier — skips them)
 /trawl-core/target
+/trawl-scan/target
 
 # OS
 .DS_Store

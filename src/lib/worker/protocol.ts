@@ -147,6 +147,40 @@ export function isJpegError(jpeg: JpegStego | JpegError): jpeg is JpegError {
 	return 'error' in jpeg;
 }
 
+/**
+ * One file inside a ZIP, as both places that describe it see it.
+ *
+ * A ZIP says what it holds twice: a local header before each file, and a
+ * central directory at the end listing them all. Readers use the directory, so
+ * the two disagreeing is how an archive hides something.
+ */
+export type ZipEntry = {
+	name: string;
+	method: string;
+	compressed: number;
+	uncompressed: number;
+	offset: number;
+	crc: string;
+	/** The archive's own password flag. Trawl does not crack these. */
+	encrypted: boolean;
+	/** Only a local header names this; the directory does not, so `unzip -l` will not show it. */
+	undeclared: boolean;
+	comment: string;
+	/** What the local header and the directory disagree about, if anything. */
+	disagreement: string | null;
+};
+
+export type ZipArchive = {
+	entries: ZipEntry[];
+	comment: string;
+	/** Bytes before the first header. A polyglot puts a whole image there. */
+	prefix: number;
+	/** Bytes after the end-of-directory record, which a zip tool would not write. */
+	trailing: number;
+	/** How many files the directory claims, against how many it lists. */
+	declared: number;
+};
+
 /** One encoding layer removed from a pasted string. */
 export type PeelStep = {
 	encoding: string;
@@ -487,6 +521,8 @@ export type AnalysisResponse =
 			jpeg: JpegStego | JpegError | null;
 			/** Null unless the file is an indexed image. */
 			paletteStego: PaletteStego | null;
+			/** Null when the file is not a ZIP archive. */
+			zip: ZipArchive | null;
 			sweep: Sweep | null;
 			wall: PlaneWall | null;
 			chi: ChiSquare | null;

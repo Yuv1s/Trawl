@@ -4,3 +4,6 @@
 *.wav binary
 *.bmp binary
 *.gif binary
+
+# Shell scripts must keep LF, or the shebang breaks on Unix.
+*.sh text eol=lf

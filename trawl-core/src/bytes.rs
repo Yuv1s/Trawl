@@ -269,7 +269,8 @@ pub struct MagicHit {
     pub bounded: bool,
 }
 
-fn find(data: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+/// First occurrence of `needle` at or after `from`.
+pub fn find(data: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
     data.get(from..)?
         .windows(needle.len())
         .position(|w| w == needle)

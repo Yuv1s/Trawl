@@ -19,7 +19,8 @@ import init, {
 	wav_lsb_extract,
 	wav_lsb_sweep,
 	wav_spectrogram,
-	wav_structure
+	wav_structure,
+	zip_structure
 } from '$lib/wasm/trawl_core';
 import type {
 	AnalysisRequest,
@@ -39,7 +40,8 @@ import type {
 	Survey,
 	Sweep,
 	WavError,
-	WavStructure
+	WavStructure,
+	ZipArchive
 } from './protocol';
 import { isWavError } from './protocol';
 
@@ -130,6 +132,7 @@ async function analyse(id: number, name: string, bytes: Uint8Array): Promise<Ana
 	if (structure) await inflateTextChunks(bytes, structure);
 
 	const wav = JSON.parse(wav_structure(bytes)) as WavStructure | WavError | null;
+	const zip = JSON.parse(zip_structure(bytes)) as ZipArchive | null;
 	const jpeg = JSON.parse(jpeg_stego(bytes, SWEEP_BYTES, CHI_STEPS_JPEG)) as
 		JpegStego | JpegError | null;
 
@@ -199,6 +202,7 @@ async function analyse(id: number, name: string, bytes: Uint8Array): Promise<Ana
 		wav,
 		jpeg,
 		paletteStego,
+		zip,
 		sweep,
 		wall,
 		chi,

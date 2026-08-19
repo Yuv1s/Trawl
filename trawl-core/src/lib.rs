@@ -18,6 +18,7 @@ pub mod png;
 pub mod spectrogram;
 pub mod survey;
 pub mod wav;
+pub mod zip;
 
 /// Everything that can be said about a file without knowing its format: flag
 /// shapes, strings, embedded signatures and entropy.
@@ -204,6 +205,16 @@ pub fn png_dimensions(file: &[u8]) -> Result<Vec<u32>, JsError> {
 #[wasm_bindgen]
 pub fn peel_encodings(data: &[u8]) -> String {
     mantis::json(data)
+}
+
+/// What a ZIP archive holds, as JSON, or null when the file is not one.
+///
+/// Reports the local headers and the central directory separately, because a
+/// doctored archive is one where they disagree and every ordinary reader only
+/// consults the directory.
+#[wasm_bindgen]
+pub fn zip_structure(file: &[u8]) -> String {
+    zip::json(file)
 }
 
 /// Applies a key somebody already has, across every cipher that takes one.

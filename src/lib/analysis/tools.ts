@@ -12,6 +12,7 @@ import {
 	type RsAnalysis,
 	type Spectrogram,
 	type Structure,
+	type ZipArchive,
 	type Survey,
 	type Sweep,
 	type WavError,
@@ -25,7 +26,7 @@ export type ToolStatus = 'hit' | 'clear' | 'ready' | 'pending';
  * `png` needs the chunk walker, which no other format has. `audio` needs samples.
  * `jpeg` needs the coefficient decoder.
  */
-export type ToolScope = 'bytes' | 'pixels' | 'png' | 'audio' | 'jpeg';
+export type ToolScope = 'bytes' | 'pixels' | 'png' | 'audio' | 'jpeg' | 'zip';
 
 /**
  * The two halves of the rack. Survey reads the file as it sits on disk;
@@ -79,6 +80,7 @@ export function flagsOf(survey: Survey, structure: Structure | null): FlagHit[] 
 const NO_WALKER = 'PNG only, for now';
 const NO_DECODER = 'no decoder for this format';
 const NO_AUDIO = 'not an audio file';
+const NO_ARCHIVE = 'not a ZIP archive';
 const NO_COEFFICIENTS = 'no readable JPEG coefficients';
 
 /** Metadata fields a person types into, as opposed to ones a camera fills in. */
@@ -107,11 +109,49 @@ export type Findings = {
 	rs?: RsAnalysis | null;
 	audio?: AudioSweep | null;
 	spectrogram?: Spectrogram | null;
+	zip?: ZipArchive | null;
 };
+
+/**
+ * Whether an archive shows any sign of having been edited.
+ *
+ * A ZIP describes itself twice, in a local header before each file and again in
+ * the central directory at the end. Readers use the directory, so an entry
+ * missing from it, or a size the two disagree about, is the whole point of
+ * looking.
+ */
+function archiveOdd(zip: ZipArchive): boolean {
+	return (
+		zip.prefix > 0 ||
+		zip.trailing > 0 ||
+		zip.declared !== zip.entries.filter((e) => !e.undeclared).length ||
+		zip.entries.some((e) => e.undeclared || e.disagreement !== null)
+	);
+}
+
+/** What to say about an archive in one line of a tool rack. */
+function archiveNote(zip: ZipArchive): string {
+	const hidden = zip.entries.filter((e) => e.undeclared).length;
+	if (hidden > 0) {
+		return `${hidden} not in the directory`;
+	}
+	if (zip.entries.some((e) => e.disagreement !== null)) {
+		return 'the two copies disagree';
+	}
+	if (zip.trailing > 0) {
+		return `${zip.trailing.toLocaleString()} B appended`;
+	}
+	if (zip.prefix > 0) {
+		return `starts ${zip.prefix.toLocaleString()} B in`;
+	}
+
+	const count = zip.entries.length;
+	return `${count} ${count === 1 ? 'entry' : 'entries'}, nothing out of place`;
+}
 
 export function tools(found: Findings): Tool[] {
 	const { survey, structure = null, sweep = null, wall = null, chi = null, rs = null } = found;
-	const { audio = null, spectrogram = null, paletteStego = null } = found;
+	const { audio = null, spectrogram = null, paletteStego = null, zip = null } = found;
 	const wav = found.wav && !isWavError(found.wav) ? found.wav : null;
 	const jpeg = found.jpeg && !isJpegError(found.jpeg) ? found.jpeg : null;
 
@@ -153,6 +193,11 @@ export function tools(found: Findings): Tool[] {
 			? { ...tool, scope: 'jpeg', group: 'cuttlefish' }
 			: { ...tool, scope: 'jpeg', group: 'cuttlefish', status: 'pending', value: NO_COEFFICIENTS };
 
+	const archive = (tool: Partial): Tool =>
+		zip
+			? { ...tool, scope: 'zip', group: 'survey' }
+			: { ...tool, scope: 'zip', group: 'survey', status: 'pending', value: NO_ARCHIVE };
+
 	const sound = (tool: Partial, group: ToolGroup = 'cuttlefish'): Tool =>
 		wav
 			? { ...tool, scope: 'audio', group }
@@ -170,6 +215,13 @@ export function tools(found: Findings): Tool[] {
 				? `${credible.length} candidate${credible.length === 1 ? '' : 's'}`
 				: 'none in readable data'
 		},
+		archive({
+			id: 'archive',
+			name: 'Archive entries',
+			measures: 'Reads a ZIP twice and reports where the two copies disagree',
+			status: zip && archiveOdd(zip) ? 'hit' : 'clear',
+			value: zip ? archiveNote(zip) : ''
+		}),
 		{
 			id: 'magic',
 			name: 'Embedded files',

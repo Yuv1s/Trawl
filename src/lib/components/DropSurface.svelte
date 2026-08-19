@@ -3,8 +3,15 @@
 	import Logo from '$lib/components/Logo.svelte';
 	import { PLANNED } from '$lib/analysis/tools';
 
-	let { onfile, ontext }: { onfile: (file: File) => void; ontext: (text: string) => void } =
-		$props();
+	let {
+		onfile,
+		ontext,
+		onweb
+	}: {
+		onfile: (file: File) => void;
+		ontext: (text: string) => void;
+		onweb: () => void;
+	} = $props();
 
 	let dragging = $state(false);
 	let depth = 0;
@@ -150,6 +157,11 @@
 				placeholder="SGVsbG8sIHdvcmxkIQ=="></textarea>
 			<button type="submit" disabled={!ready}>Peel it</button>
 		</form>
+
+		<button type="button" class="web" onclick={onweb}>
+			Explore a live site
+			<span class="alt">a URL, scanned by a helper you run yourself</span>
+		</button>
 	</header>
 
 	<div class="rack">
@@ -277,6 +289,33 @@
 		display: block;
 		margin-top: var(--s3);
 		color: var(--muted);
+	}
+
+	/* A third way in, alongside the file drop and the paste box. Its own line
+	   rather than a button in a row, because it leads somewhere else entirely:
+	   the one part of Trawl that reaches the network. */
+	.web {
+		display: block;
+		width: 100%;
+		text-align: left;
+		margin-top: var(--s5);
+		padding: var(--s3) var(--s4);
+		background: none;
+		border: 1px solid var(--rule);
+		border-radius: var(--radius);
+		color: var(--text);
+		font: inherit;
+		font-weight: 600;
+		cursor: pointer;
+		transition: border-color 140ms var(--ease);
+	}
+	.web:hover {
+		border-color: var(--signal);
+	}
+	.web .alt {
+		margin-top: var(--s1);
+		font-weight: 400;
+		font-size: var(--t-label);
 	}
 
 	.decode {

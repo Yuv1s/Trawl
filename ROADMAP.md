@@ -15,6 +15,13 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 - [x] Finding files buried inside other files, and saving them out
 - [x] Text, metadata, entropy, and checksums on anything you drop
 
+- [x] ZIP archives, read twice and compared. A zip describes itself in a local
+      header before each file and again in a central directory at the end, and
+      readers only consult the directory, so the two disagreeing is how an
+      archive hides something. Reports entries the directory never lists,
+      sizes and checksums the two copies argue about, bytes before the first
+      header, bytes appended past the end, and the comments nothing shows
+
 ### Cuttlefish, the steganography half
 
 - [x] Bit-plane wall: every layer of an image shown at once
@@ -103,7 +110,7 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 
 ### Forensics
 
-- [ ] Looking inside ZIP and PDF files
+- [ ] Looking inside PDF files
 - [ ] Windows registry, for tracing which USB stick was plugged in when
 
 ### Steganography still open

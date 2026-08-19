@@ -1,12 +1,14 @@
 <script lang="ts">
 	import AnalysisWorker from '$lib/worker/analysis.worker?worker';
 	import DropSurface from '$lib/components/DropSurface.svelte';
+	import WebRecon from '$lib/components/WebRecon.svelte';
 	import PeelPanel from '$lib/components/PeelPanel.svelte';
 	import { attack as attackRsa, looksLikeRsa, type Report } from '$lib/analysis/rsa';
 	import Logo from '$lib/components/Logo.svelte';
 	import ToolRack from '$lib/components/ToolRack.svelte';
 	import Recovered from '$lib/components/Recovered.svelte';
 	import ChunkList from '$lib/components/ChunkList.svelte';
+	import ZipView from '$lib/components/ZipView.svelte';
 	import HexView from '$lib/components/HexView.svelte';
 	import StringsView from '$lib/components/StringsView.svelte';
 	import SweepView from '$lib/components/SweepView.svelte';
@@ -43,7 +45,9 @@
 		| { phase: 'working'; name: string }
 		| { phase: 'done'; result: Analysis; bytes: Uint8Array }
 		/** A pasted string, which has no file behind it and no tool rack. */
-		| { phase: 'text'; input: string; peel: PeelResult; rsa: Report | null };
+		| { phase: 'text'; input: string; peel: PeelResult; rsa: Report | null }
+		/** Reaching a live site, which runs against a scanner the person starts themselves. */
+		| { phase: 'web' };
 
 	let view = $state<View>({ phase: 'idle' });
 	let activeTool = $state('flags');
@@ -275,6 +279,10 @@
 		view.phase === 'done' && view.result.status === 'ok' ? view.result.paletteStego : null
 	);
 
+	const zip = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.zip : null
+	);
+
 	const audioError = $derived(
 		view.phase === 'done' && view.result.status === 'ok' ? view.result.audioError : null
 	);
@@ -299,7 +307,8 @@
 					chi,
 					rs,
 					audio,
-					spectrogram
+					spectrogram,
+					zip
 				})
 			: []
 	);
@@ -428,7 +437,9 @@
 </svelte:head>
 
 {#if view.phase === 'idle'}
-	<DropSurface onfile={accept} ontext={acceptText} />
+	<DropSurface onfile={accept} ontext={acceptText} onweb={() => (view = { phase: 'web' })} />
+{:else if view.phase === 'web'}
+	<WebRecon onreset={reset} />
 {:else if view.phase === 'text'}
 	<PeelPanel
 		input={view.input}
@@ -577,6 +588,12 @@
 						/>
 					{:else if activeTool === 'riff'}
 						<RiffView {wav} />
+					{:else if activeTool === 'archive'}
+						{#if zip}
+							<ZipView archive={zip} />
+						{:else}
+							<p class="clear">This file is not a ZIP archive, so there is nothing to read.</p>
+						{/if}
 					{:else if activeTool === 'magic'}
 						<MagicList hits={survey.magic} size={survey.size} bytes={view.bytes} />
 					{:else if activeTool === 'exif'}

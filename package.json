@@ -6,6 +6,7 @@
 	"scripts": {
 		"dev": "vite dev",
 		"build:wasm": "cd trawl-core && wasm-pack build --target web --out-dir ../src/lib/wasm",
+		"scanner": "cargo run --release --manifest-path trawl-scan/Cargo.toml",
 		"fixtures": "node fixtures/generate.mjs",
 		"trigrams": "node fixtures/trigrams.mjs",
 		"demo": "node fixtures/duplicate-palette.mjs",

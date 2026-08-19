@@ -1,0 +1,36 @@
+[package]
+name = "trawl-scan"
+version = "0.1.0"
+edition = "2024"
+
+# The web reconnaissance service. Separate from trawl-core on purpose: the core
+# is a pure, offline, WASM analysis library and must stay that way, while this
+# reaches out over the network, which is the one thing the rest of Trawl refuses
+# to do. Keeping it a sibling crate rather than a workspace member leaves the
+# wasm build and the core's release profile completely untouched.
+
+[lib]
+# A library so the security-critical parts — above all the SSRF guard — can be
+# unit-tested without standing up the server or touching the network.
+path = "src/lib.rs"
+
+[[bin]]
+name = "trawl-scan"
+path = "src/main.rs"
+
+[dependencies]
+# The flag and crypto detection already written for the offline tool, reused
+# verbatim over every response body rather than reimplemented. Path dependency,
+# so no workspace and no change to how the core builds.
+trawl-core = { path = "../trawl-core" }
+
+# The server. reqwest is left on its default TLS (schannel on Windows, the
+# system's own) rather than a bundled one, so the scanner builds on a fresh
+# machine without a C toolchain or extra setup — the whole point being that a
+# person can start it with one command.
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower-http = { version = "0.6", features = ["cors"] }
+reqwest = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
