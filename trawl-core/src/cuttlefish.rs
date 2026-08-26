@@ -333,7 +333,7 @@ pub struct PlaneStat {
 
 /// One bit plane of one channel as 0 or 255 per pixel, at full resolution.
 pub fn plane_full(rgba: &[u8], channel: usize, bit: u8) -> Vec<u8> {
-    rgba.chunks_exact(4)
+    rgba.as_chunks::<4>().0.iter()
         .map(|p| if (p[channel] >> bit) & 1 == 1 { 255 } else { 0 })
         .collect()
 }
@@ -475,7 +475,7 @@ fn stats_json(
 /// that carry the picture.
 pub fn traversal_samples(rgba: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgba.len() / 4 * 3);
-    for pixel in rgba.chunks_exact(4) {
+    for pixel in rgba.as_chunks::<4>().0 {
         out.extend_from_slice(&pixel[..3]);
     }
     out

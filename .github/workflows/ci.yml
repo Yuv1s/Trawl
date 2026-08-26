@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: wasm32-unknown-unknown
 
@@ -86,7 +86,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned rather than @stable on purpose: Clippy runs with -D warnings, and
+      # each Rust release adds lints, so a floating toolchain would fail unrelated
+      # PRs the day a new compiler ships. Bump this deliberately, fixing any new
+      # lints in the same change.
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy
 
@@ -110,7 +114,7 @@ jobs:
           node-version: 24
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: wasm32-unknown-unknown
 

@@ -139,7 +139,7 @@ fn render(endian: Endian, kind: u16, count: usize, raw: &[u8]) -> (String, bool)
             false,
         ),
         3 | 8 => (
-            raw.chunks_exact(2)
+            raw.as_chunks::<2>().0.iter()
                 .take(count)
                 .map(|c| endian.u16(c).to_string())
                 .collect::<Vec<_>>()
@@ -147,7 +147,7 @@ fn render(endian: Endian, kind: u16, count: usize, raw: &[u8]) -> (String, bool)
             false,
         ),
         4 | 9 => (
-            raw.chunks_exact(4)
+            raw.as_chunks::<4>().0.iter()
                 .take(count)
                 .map(|c| endian.u32(c).to_string())
                 .collect::<Vec<_>>()
@@ -155,7 +155,7 @@ fn render(endian: Endian, kind: u16, count: usize, raw: &[u8]) -> (String, bool)
             false,
         ),
         5 | 10 => (
-            raw.chunks_exact(8)
+            raw.as_chunks::<8>().0.iter()
                 .take(count)
                 .map(|c| {
                     let n = endian.u32(&c[0..4]);
