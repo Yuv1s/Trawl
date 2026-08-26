@@ -22,6 +22,11 @@ use std::time::Duration;
 /// Longest a single request may take.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Longest to wait on a single address before trying the next one it resolved
+/// to. Short, so a dead first address (the ::1 a v4-only service leaves stale)
+/// falls through quickly instead of holding the whole request.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Most redirects to follow before giving up. A chain longer than this is either
 /// broken or trying to wear the guard down.
 const MAX_REDIRECTS: usize = 5;
@@ -39,6 +44,18 @@ pub struct Fetched {
     pub body: Vec<u8>,
     /// True when the body hit [`MAX_BODY`] and the rest was left unread.
     pub truncated: bool,
+}
+
+/// How to make one request. A plain GET by default; the active probes reach for
+/// the other methods, a body, headers a crawl would never send, and a shorter
+/// timeout, since an endpoint that stalls on a probe should fail fast rather than
+/// hold the whole pass for ten seconds.
+#[derive(Debug, Clone, Default)]
+pub struct Request {
+    pub method: reqwest::Method,
+    pub body: Option<Vec<u8>>,
+    pub headers: Vec<(String, String)>,
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -70,7 +87,15 @@ fn require_web_scheme(url: &reqwest::Url) -> Result<(), FetchError> {
     }
 }
 
-pub async fn fetch(url: &str) -> Result<Fetched, FetchError> {
+pub async fn fetch(url: &str, allow_local: bool) -> Result<Fetched, FetchError> {
+    fetch_with(url, allow_local, &Request::default()).await
+}
+
+pub async fn fetch_with(
+    url: &str,
+    allow_local: bool,
+    request: &Request,
+) -> Result<Fetched, FetchError> {
     let mut current = reqwest::Url::parse(url).map_err(|e| FetchError::BadUrl(e.to_string()))?;
     require_web_scheme(&current)?;
 
@@ -84,35 +109,67 @@ pub async fn fetch(url: &str) -> Result<Fetched, FetchError> {
         // Resolution blocks, so it runs off the async threads. Every address the
         // name answered with is vetted, and one bad answer condemns the name.
         let resolving = host.clone();
-        let resolved =
-            tokio::task::spawn_blocking(move || guard::resolve_and_check(&resolving, port))
-                .await
-                .map_err(|e| FetchError::Network(e.to_string()))?
-                .map_err(|e| FetchError::Network(e.to_string()))?;
+        let resolved = tokio::task::spawn_blocking(move || {
+            guard::resolve_and_check(&resolving, port, allow_local)
+        })
+        .await
+        .map_err(|e| FetchError::Network(e.to_string()))?
+        .map_err(|e| FetchError::Network(e.to_string()))?;
 
         if let Some(reason) = resolved.blocked() {
             return Err(FetchError::Blocked(reason.to_string()));
         }
-        let addr = resolved
-            .safe_addresses()
-            .into_iter()
-            .next()
-            .ok_or_else(|| FetchError::Network("host did not resolve".into()))?;
+        let mut addresses = resolved.safe_addresses();
+        if addresses.is_empty() {
+            return Err(FetchError::Network("host did not resolve".into()));
+        }
 
-        // Pinned to the vetted IP and told not to follow redirects itself. The
-        // hostname still drives TLS, so certificate checking is unaffected.
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(TIMEOUT)
-            .resolve(&host, SocketAddr::new(addr, port))
-            .build()
-            .map_err(|e| FetchError::Network(e.to_string()))?;
+        // Every vetted address is tried in turn until one answers. A name that
+        // resolves to several addresses is the ordinary case, and `localhost` is
+        // the one that bites: it usually lists ::1 first, and a service bound
+        // only to 127.0.0.1 is not there, so the ::1 attempt has to fail before
+        // the working address is reached. On many machines that failure is a
+        // two-second stall rather than a refusal, so IPv4 is tried first and a
+        // short connect timeout keeps a dead address from holding the request.
+        addresses.sort_by_key(|addr| addr.is_ipv6());
 
-        let mut resp = client
-            .get(current.clone())
-            .send()
-            .await
-            .map_err(|e| FetchError::Network(e.to_string()))?;
+        let mut resp = None;
+        let mut last_error = None;
+        for addr in addresses {
+            // Pinned to the vetted IP and told not to follow redirects itself.
+            // The hostname still drives TLS, so certificate checking is unaffected.
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(request.timeout.unwrap_or(TIMEOUT))
+                .connect_timeout(CONNECT_TIMEOUT)
+                .resolve(&host, SocketAddr::new(addr, port))
+                .build()
+                .map_err(|e| FetchError::Network(e.to_string()))?;
+
+            let mut builder = client.request(request.method.clone(), current.clone());
+            for (name, value) in &request.headers {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+            if let Some(body) = &request.body {
+                builder = builder.body(body.clone());
+            }
+
+            match builder.send().await {
+                Ok(got) => {
+                    resp = Some(got);
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        let mut resp = resp.ok_or_else(|| {
+            FetchError::Network(
+                last_error
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "could not connect".into()),
+            )
+        })?;
 
         let status = resp.status();
 

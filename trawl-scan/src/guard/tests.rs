@@ -140,8 +140,49 @@ fn a_clean_name_yields_its_addresses() {
 fn resolves_localhost_and_refuses_it() {
     // An end-to-end check that resolution and classification meet correctly:
     // localhost is reachable to resolve and must come back blocked.
-    let resolved = resolve_and_check("localhost", 80).expect("localhost did not resolve");
+    let resolved = resolve_and_check("localhost", 80, false).expect("localhost did not resolve");
 
     assert!(!resolved.addresses.is_empty());
     assert!(resolved.blocked().is_some(), "localhost was not blocked");
+}
+
+#[test]
+fn local_mode_allows_loopback_and_private_targets() {
+    // The opt-in for local challenges: this machine and private networks become
+    // reachable, so a challenge on localhost or in a container can be scanned.
+    for addr in ["127.0.0.1", "10.0.0.5", "192.168.1.20", "172.16.9.9"] {
+        assert!(
+            forbidden(v4(addr)).is_some(),
+            "{addr} should be blocked by default"
+        );
+        assert!(
+            forbidden_with(v4(addr), true).is_none(),
+            "{addr} should be allowed locally"
+        );
+    }
+    // IPv6 loopback and unique-local too, since localhost often resolves to ::1.
+    assert!(forbidden_with(v6("::1"), true).is_none());
+    assert!(forbidden_with(v6("fd00::1"), true).is_none());
+    assert!(forbidden_with(v6("::ffff:127.0.0.1"), true).is_none());
+}
+
+#[test]
+fn local_mode_still_refuses_the_metadata_address() {
+    // The one thing local mode must never open. No challenge is at the cloud
+    // metadata endpoint, and the reason to keep it shut does not depend on the
+    // rest of the target being local.
+    assert!(forbidden_with(v4("169.254.169.254"), true).is_some());
+    assert!(forbidden_with(v6("::ffff:169.254.169.254"), true).is_some());
+    // And the other never-a-target ranges stay shut in local mode as well.
+    assert!(forbidden_with(v4("224.0.0.1"), true).is_some());
+    assert!(forbidden_with(v4("100.64.0.1"), true).is_some());
+    assert!(forbidden_with(v6("fe80::1"), true).is_some());
+}
+
+#[test]
+fn local_mode_leaves_public_addresses_exactly_as_they_were() {
+    // Turning it on must not change the answer for an ordinary public address.
+    for addr in ["8.8.8.8", "93.184.216.34"] {
+        assert_eq!(forbidden(v4(addr)), forbidden_with(v4(addr), true));
+    }
 }

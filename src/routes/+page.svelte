@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
+	import { getScannerToken } from '$lib';
 	import AnalysisWorker from '$lib/worker/analysis.worker?worker';
 	import DropSurface from '$lib/components/DropSurface.svelte';
 	import WebRecon from '$lib/components/WebRecon.svelte';
@@ -123,31 +125,39 @@
 					// Open whichever tool found something, most conclusive first. An
 					// audio file with nothing else to show lands on the spectrogram,
 					// since that is the one panel a person has to read themselves.
+					const zipFlagged = analysis.zip?.entries.some((e) => (e.flags?.length ?? 0) > 0);
+
 					activeTool = flags.some((f) => f.credible)
 						? 'flags'
-						: analysis.sweep?.candidates.length
-							? 'lsb'
-							: analysis.audio?.candidates.length
-								? 'audio-lsb'
-								: analysis.jpeg && !isJpegError(analysis.jpeg) && analysis.jpeg.candidates.length
-									? 'jsteg'
-									: analysis.paletteStego?.candidates.length
-										? 'palette'
-										: written
-											? 'exif'
-											: analysis.survey.jpegComments.length
-												? 'jpeg'
-												: analysis.chi?.detected
-													? 'chi'
-													: analysis.rs?.detected
-														? 'rs'
-														: analysis.survey.magic.some((m) => m.embedded)
-															? 'magic'
-															: isWav
-																? 'spectrogram'
-																: analysis.structure
-																	? 'chunks'
-																	: 'strings';
+						: analysis.aes.length
+							? 'aes'
+							: zipFlagged
+								? 'archive'
+								: analysis.sweep?.candidates.length
+									? 'lsb'
+									: analysis.audio?.candidates.length
+										? 'audio-lsb'
+										: analysis.jpeg &&
+											  !isJpegError(analysis.jpeg) &&
+											  analysis.jpeg.candidates.length
+											? 'jsteg'
+											: analysis.paletteStego?.candidates.length
+												? 'palette'
+												: written
+													? 'exif'
+													: analysis.survey.jpegComments.length
+														? 'jpeg'
+														: analysis.chi?.detected
+															? 'chi'
+															: analysis.rs?.detected
+																? 'rs'
+																: analysis.survey.magic.some((m) => m.embedded)
+																	? 'magic'
+																	: isWav
+																		? 'spectrogram'
+																		: analysis.structure
+																			? 'chunks'
+																			: 'strings';
 				});
 			});
 		}
@@ -169,13 +179,57 @@
 	}
 
 	async function accept(file: File) {
-		const id = ++ticket;
-		view = { phase: 'working', name: file.name };
-
 		const buffer = await file.arrayBuffer();
-		pending = Promise.resolve(new Uint8Array(buffer));
-		ensureWorker().postMessage({ kind: 'analyse', id, name: file.name, bytes: buffer });
+		analyseBytes(new Uint8Array(buffer), file.name);
 	}
+
+	/**
+	 * The same path a dropped file takes, from bytes already in hand. Remora uses
+	 * it to hand an image it pulled off a site straight to the offline tools, so
+	 * a picture on a target is analysed exactly like one from disk.
+	 */
+	function analyseBytes(bytes: Uint8Array, name: string) {
+		const id = ++ticket;
+		view = { phase: 'working', name };
+
+		const copy = bytes.slice();
+		pending = Promise.resolve(copy);
+		ensureWorker().postMessage({ kind: 'analyse', id, name, bytes: copy.buffer });
+	}
+
+	/** Where the scanner listens, for a tab opened to analyse a target's image. */
+	const SCANNER_URL = (import.meta.env.VITE_SCANNER_URL ?? 'http://localhost:8099').replace(
+		/\/$/,
+		''
+	);
+
+	/**
+	 * A tab opened by Remora's "Check with Trawl" carries the image's address in
+	 * `?analyse=`. This fetches it through the scanner, the one thing that can
+	 * reach the target, and runs it through the offline tools like a dropped file,
+	 * so the recon list is left untouched in the tab it came from.
+	 */
+	onMount(() => {
+		const address = new URLSearchParams(window.location.search).get('analyse');
+		if (!address) return;
+
+		const name = decodeURIComponent(address.split('/').pop()?.split('?')[0] || 'image');
+		view = { phase: 'working', name };
+
+		void (async () => {
+			try {
+				const token = getScannerToken();
+				if (!token) throw new Error('scanner is not paired');
+				const res = await fetch(`${SCANNER_URL}/fetch?url=${encodeURIComponent(address)}`, {
+					headers: { Authorization: `Bearer ${token}` }
+				});
+				if (!res.ok) throw new Error('fetch failed');
+				analyseBytes(new Uint8Array(await res.arrayBuffer()), name);
+			} catch {
+				view = { phase: 'idle' };
+			}
+		})();
+	});
 
 	function requestPlane(channel: number, bit: number) {
 		openPlane = { channel, bit, pixels: null };
@@ -283,6 +337,8 @@
 		view.phase === 'done' && view.result.status === 'ok' ? view.result.zip : null
 	);
 
+	const aes = $derived(view.phase === 'done' && view.result.status === 'ok' ? view.result.aes : []);
+
 	const audioError = $derived(
 		view.phase === 'done' && view.result.status === 'ok' ? view.result.audioError : null
 	);
@@ -308,7 +364,8 @@
 					rs,
 					audio,
 					spectrogram,
-					zip
+					zip,
+					aes
 				})
 			: []
 	);
@@ -330,6 +387,11 @@
 		) ?? []),
 		...(paletteStego?.candidates.flatMap((c) =>
 			c.flags.map((text) => ({ text, origin: 'from the palette indices' }))
+		) ?? []),
+		...(aes?.flatMap((s) => s.flags.map((text) => ({ text, origin: 'from AES decryption' }))) ??
+			[]),
+		...(zip?.entries.flatMap((e) =>
+			(e.flags ?? []).map((text) => ({ text, origin: `from ${e.name}, inside the archive` }))
 		) ?? [])
 	]);
 
@@ -593,6 +655,42 @@
 							<ZipView archive={zip} />
 						{:else}
 							<p class="clear">This file is not a ZIP archive, so there is nothing to read.</p>
+						{/if}
+					{:else if activeTool === 'aes'}
+						{#if aes.length === 0}
+							<p class="clear">
+								Nothing here forms a key, an IV and a payload that decrypt to anything readable. AES
+								needs all three, and a wrong key turns it into noise, so a file that is not carrying
+								its own key reads as nothing. When one is, the key and IV are usually hex in the
+								metadata and the payload is base64 nearby.
+							</p>
+						{:else}
+							<ul class="findings">
+								{#each aes as solved, i (solved.keyHex + solved.ivHex + i)}
+									<li>
+										{#each solved.flags as flag (flag)}
+											<span class="mono big flagged">{flag}</span>
+										{/each}
+										<div class="aes-meta">
+											<span class="keyword">AES-{solved.bits} · CBC</span>
+											<span
+												><span class="label">key</span>
+												<span class="mono muted">{solved.keyHex}</span></span
+											>
+											<span
+												><span class="label">iv</span>
+												<span class="mono muted">{solved.ivHex}</span></span
+											>
+										</div>
+										<pre class="aes-plain mono">{solved.text}</pre>
+									</li>
+								{/each}
+							</ul>
+							<p class="scale-note">
+								A wrong key makes AES print random bytes, so a decryption is only shown when its
+								result reads as text. That filter is what lets this run on every file without
+								turning up noise.
+							</p>
 						{/if}
 					{:else if activeTool === 'magic'}
 						<MagicList hits={survey.magic} size={survey.size} bytes={view.bytes} />
@@ -917,6 +1015,36 @@
 		margin-top: var(--s5);
 		padding-top: var(--s4);
 		border-top: 1px solid var(--rule);
+	}
+
+	.aes-meta {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--s2) var(--s4);
+		align-items: baseline;
+	}
+
+	.aes-meta > span {
+		min-width: 0;
+		overflow-wrap: anywhere;
+	}
+
+	.aes-meta .label {
+		margin-right: var(--s1);
+	}
+
+	.aes-plain {
+		margin: var(--s2) 0 0;
+		padding: var(--s2) var(--s3);
+		background: var(--ground);
+		border: 1px solid var(--rule);
+		border-radius: var(--radius);
+		font-size: var(--t-data);
+		line-height: 1.55;
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+		color: var(--text);
+		user-select: all;
 	}
 
 	.scale-note {

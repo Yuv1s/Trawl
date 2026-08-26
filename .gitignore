@@ -8,6 +8,7 @@ node_modules
 .svelte-kit
 /build
 CLAUDE.md
+AGENTS.md
 testImgs/
 
 # wasm-pack output — generated from trawl-core by `npm run build:wasm`
@@ -28,6 +29,7 @@ Thumbs.db
 !.env.example
 !.env.test
 .claude/
+.agents/
 
 # Vite
 vite.config.js.timestamp-*

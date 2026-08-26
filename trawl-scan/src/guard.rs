@@ -42,6 +42,49 @@ pub fn forbidden(ip: IpAddr) -> Option<Reason> {
     }
 }
 
+/// [`forbidden`], but with local targets allowed when the scanner was started
+/// for them.
+///
+/// A capture-the-flag challenge is very often on the machine running the
+/// scanner, in a container on `localhost`, or on another box on the same LAN.
+/// The default guard refuses all of those, correctly, because a scanner that
+/// reaches inward is the whole danger it exists to stop. So reaching them is not
+/// the default: it is a thing the person starting the scanner turns on, having
+/// decided the target is theirs.
+///
+/// Even then the relaxation is narrow. Only loopback, the RFC1918 private ranges
+/// and IPv6 unique-local are let through, because those are where a local
+/// challenge lives. The cloud metadata address and everything else stay refused,
+/// because no challenge is ever there and the risk of reaching it does not go
+/// away just because the target happens to be local.
+pub fn forbidden_with(ip: IpAddr, allow_local: bool) -> Option<Reason> {
+    let reason = forbidden(ip)?;
+    if allow_local && is_local(ip) {
+        return None;
+    }
+    Some(reason)
+}
+
+/// Whether an address is somewhere a local challenge plausibly lives: this
+/// machine, or a private network. Deliberately not link-local, so the metadata
+/// address is never caught by it.
+fn is_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || matches!(v4.octets(), [10, ..] | [192, 168, ..])
+                || matches!(v4.octets(), [172, b, ..] if (16..=31).contains(&b))
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_local(IpAddr::V4(mapped));
+            }
+            // Loopback (::1) and unique-local (fc00::/7), the v6 private space.
+            v6.is_loopback() || v6.segments()[0] & 0xfe00 == 0xfc00
+        }
+    }
+}
+
 fn forbidden_v4(ip: Ipv4Addr) -> Option<Reason> {
     match ip.octets() {
         // 0.0.0.0/8: "this network". Routes to the local host on many stacks.
@@ -157,12 +200,12 @@ impl Resolved {
 /// The port is required by the resolver and otherwise unused. Resolution is the
 /// one blocking, network-touching step in this module and is kept apart from the
 /// classification so the classification stays pure and testable.
-pub fn resolve_and_check(host: &str, port: u16) -> std::io::Result<Resolved> {
+pub fn resolve_and_check(host: &str, port: u16, allow_local: bool) -> std::io::Result<Resolved> {
     let addresses = (host, port)
         .to_socket_addrs()?
         .map(|socket| {
             let ip = socket.ip();
-            (ip, forbidden(ip))
+            (ip, forbidden_with(ip, allow_local))
         })
         .collect::<Vec<_>>();
 

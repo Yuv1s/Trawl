@@ -7,6 +7,8 @@
 	const hidden = $derived(archive.entries.filter((e) => e.undeclared));
 	const locked = $derived(archive.entries.filter((e) => e.encrypted));
 	const arguing = $derived(archive.entries.filter((e) => e.disagreement !== null));
+	/** Entries whose decompressed content carried a flag shape. */
+	const carrying = $derived(archive.entries.filter((e) => (e.flags?.length ?? 0) > 0));
 
 	/** Everything about the archive itself that a zip tool would not have written. */
 	const notes = $derived(
@@ -25,8 +27,16 @@
 </script>
 
 <div class="zip">
-	{#if hidden.length > 0 || arguing.length > 0 || notes.length > 0}
+	{#if hidden.length > 0 || arguing.length > 0 || notes.length > 0 || carrying.length > 0}
 		<ul class="findings">
+			{#each carrying as entry (entry.offset)}
+				{#each entry.flags ?? [] as flag (flag)}
+					<li class="flagged">
+						<span class="mono big">{flag}</span>
+						<span class="muted"> inside <span class="mono">{entry.name}</span></span>
+					</li>
+				{/each}
+			{/each}
 			{#each hidden as entry (entry.offset)}
 				<li class="flagged">
 					<span class="mono">{entry.name}</span> is in the file but not in the directory, so no ordinary
@@ -91,6 +101,21 @@
 				{#if entry.comment}
 					<tr class="aside">
 						<td colspan="5"><span class="label">comment</span> {entry.comment}</td>
+					</tr>
+				{/if}
+				{#if entry.text}
+					<tr class="aside">
+						<td colspan="5">
+							<span class="label">content</span>
+							<pre class="content mono">{entry.text}</pre>
+						</td>
+					</tr>
+				{:else if entry.readError}
+					<tr class="aside">
+						<td colspan="5">
+							<span class="label">content</span>
+							<span class="muted">could not read: {entry.readError}</span>
+						</td>
 					</tr>
 				{/if}
 			{/each}
@@ -202,6 +227,21 @@
 
 	tr.aside .label {
 		margin-right: var(--s2);
+	}
+
+	.content {
+		margin: var(--s1) 0 0;
+		padding: var(--s2) var(--s3);
+		background: var(--ground);
+		border: 1px solid var(--rule);
+		border-radius: var(--radius);
+		max-height: 20rem;
+		overflow: auto;
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+		color: var(--text);
+		line-height: 1.5;
+		user-select: all;
 	}
 
 	.muted {

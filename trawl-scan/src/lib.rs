@@ -10,6 +10,9 @@
 //! guard on every request, and [`server`] is the thin HTTP surface the frontend
 //! polls and scans through.
 
+pub mod active;
+pub mod crawl;
+pub mod decode;
 pub mod fetch;
 pub mod guard;
 pub mod server;

@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  wasm:
+    name: WASM core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked --version 0.15.0
+      - name: Build the core into src/lib/wasm
+        run: npm run build:wasm
+
+      # The frontend imports $lib/wasm/trawl_core, which is generated from
+      # trawl-core rather than committed. Building it once and passing it on
+      # keeps every check that needs it from rebuilding the same thing.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wasm
+          path: src/lib/wasm
+          retention-days: 1
+
+  frontend-quality:
+    name: Svelte and TypeScript quality
+    needs: wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - uses: actions/download-artifact@v8
+        with:
+          name: wasm
+          path: src/lib/wasm
+
+      - name: Check Svelte and TypeScript
+        run: npm run check
+      - name: Check formatting and lint
+        run: npm run lint
+
+  frontend-tests:
+    name: Vitest browser tests
+    needs: wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - uses: actions/download-artifact@v8
+        with:
+          name: wasm
+          path: src/lib/wasm
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Run tests
+        run: npm test
+
+  rust:
+    name: Rust quality and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run Clippy
+        run: |
+          cargo clippy --manifest-path trawl-core/Cargo.toml --all-targets --all-features -- -D warnings
+          cargo clippy --manifest-path trawl-scan/Cargo.toml --all-targets --all-features -- -D warnings
+      - name: Test the core
+        run: cargo test --release --manifest-path trawl-core/Cargo.toml
+      - name: Test the scanner
+        run: cargo test --manifest-path trawl-scan/Cargo.toml
+
+  production-build:
+    name: Production build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - run: npm ci
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked --version 0.15.0
+      # Deliberately the whole documented command, wasm build included, rather
+      # than the artifact above: this is the job that proves `npm run build`
+      # works from a clean checkout, which is what a person actually runs.
+      - name: Build the production site
+        run: npm run build

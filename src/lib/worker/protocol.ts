@@ -160,6 +160,8 @@ export type ZipEntry = {
 	compressed: number;
 	uncompressed: number;
 	offset: number;
+	/** Where the compressed data begins. Null for a phantom the directory points at with no header. */
+	dataOffset: number | null;
 	crc: string;
 	/** The archive's own password flag. Trawl does not crack these. */
 	encrypted: boolean;
@@ -168,6 +170,22 @@ export type ZipEntry = {
 	comment: string;
 	/** What the local header and the directory disagree about, if anything. */
 	disagreement: string | null;
+	/** Filled in by the worker: the decompressed content, as text, when it reads as text. */
+	text?: string;
+	/** Filled in by the worker: flag shapes found in the decompressed content. */
+	flags?: string[];
+	/** Set when the worker tried to decompress this entry and could not. */
+	readError?: string;
+};
+
+/** One AES-CBC decryption that read as text, and where its key and IV came from. */
+export type AesSolved = {
+	keyHex: string;
+	ivHex: string;
+	/** Key length in bits: 128, 192 or 256. */
+	bits: number;
+	text: string;
+	flags: string[];
 };
 
 export type ZipArchive = {
@@ -523,6 +541,8 @@ export type AnalysisResponse =
 			paletteStego: PaletteStego | null;
 			/** Null when the file is not a ZIP archive. */
 			zip: ZipArchive | null;
+			/** AES-CBC decryptions the file's own key and payload produced. Empty for most files. */
+			aes: AesSolved[];
 			sweep: Sweep | null;
 			wall: PlaneWall | null;
 			chi: ChiSquare | null;

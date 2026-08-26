@@ -18,7 +18,11 @@ permissions:
   contents: write
 
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   binaries:
+    needs: ci
     strategy:
       fail-fast: false
       matrix:
@@ -41,7 +45,7 @@ jobs:
             built: trawl-scan
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -56,7 +60,20 @@ jobs:
           src="trawl-scan/target/${{ matrix.target }}/release/${{ matrix.built }}"
           cp "$src" "${{ matrix.asset }}"
 
+      - name: Generate checksum
+        shell: bash
+        run: |
+          asset="${{ matrix.asset }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            hash="$(sha256sum "$asset" | cut -d ' ' -f1)"
+          else
+            hash="$(shasum -a 256 "$asset" | cut -d ' ' -f1)"
+          fi
+          printf '%s  %s\n' "$hash" "$asset" > "$asset.sha256"
+
       - name: Publish to the release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.asset }}
+          files: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256

@@ -97,6 +97,10 @@ pub struct Entry {
     pub crc: u32,
     /// Where the local header sits in the file.
     pub offset: usize,
+    /// Where this entry's compressed data begins, past its local header and
+    /// name. None for a phantom the directory points at with no header of its
+    /// own, since there is no data to point to.
+    pub data_offset: Option<usize>,
     /// The archive's own password flag. Trawl does not crack these.
     pub encrypted: bool,
     /// Per-entry comment, which readers rarely show and puzzles sometimes use.
@@ -146,6 +150,7 @@ fn local_at(data: &[u8], at: usize) -> Option<Entry> {
     let flags = u16_at(data, at + 6)?;
     let method = u16_at(data, at + 8)?;
     let name_len = u16_at(data, at + 26)? as usize;
+    let extra_len = u16_at(data, at + 28)? as usize;
 
     if name_len == 0 || name_len > MAX_NAME || method_name(method) == "unknown" {
         return None;
@@ -161,6 +166,7 @@ fn local_at(data: &[u8], at: usize) -> Option<Entry> {
         compressed: u32_at(data, at + 18)? as u64,
         uncompressed: u32_at(data, at + 22)? as u64,
         offset: at,
+        data_offset: Some(name_at + name_len + extra_len),
         // Bit zero is the archive saying its own data is encrypted.
         encrypted: flags & 1 == 1,
         comment: String::new(),
@@ -356,6 +362,7 @@ pub fn read(data: &[u8]) -> Option<Archive> {
                 uncompressed: record.uncompressed,
                 crc: record.crc,
                 offset: record.points_at,
+                data_offset: None,
                 encrypted: record.encrypted,
                 comment: record.comment.clone(),
                 undeclared: false,
@@ -410,6 +417,11 @@ pub fn json(data: &[u8]) -> String {
         out.push(',');
         push_number(&mut out, "offset", entry.offset);
         out.push(',');
+        push_string(&mut out, "dataOffset");
+        match entry.data_offset {
+            Some(at) => out.push_str(&format!(":{at},")),
+            None => out.push_str(":null,"),
+        }
         push_string(&mut out, "crc");
         out.push_str(&format!(":\"{:08x}\",", entry.crc));
         push_string(&mut out, "encrypted");

@@ -2,6 +2,7 @@ import {
 	isHeaderError,
 	isJpegError,
 	isWavError,
+	type AesSolved,
 	type AudioSweep,
 	type ChiSquare,
 	type FlagHit,
@@ -103,6 +104,7 @@ export type Findings = {
 	wav?: WavStructure | WavError | null;
 	jpeg?: JpegStego | JpegError | null;
 	paletteStego?: PaletteStego | null;
+	aes?: AesSolved[];
 	sweep?: Sweep | null;
 	wall?: PlaneWall | null;
 	chi?: ChiSquare | null;
@@ -125,12 +127,17 @@ function archiveOdd(zip: ZipArchive): boolean {
 		zip.prefix > 0 ||
 		zip.trailing > 0 ||
 		zip.declared !== zip.entries.filter((e) => !e.undeclared).length ||
-		zip.entries.some((e) => e.undeclared || e.disagreement !== null)
+		zip.entries.some((e) => e.undeclared || e.disagreement !== null) ||
+		zip.entries.some((e) => (e.flags?.length ?? 0) > 0)
 	);
 }
 
 /** What to say about an archive in one line of a tool rack. */
 function archiveNote(zip: ZipArchive): string {
+	const withFlag = zip.entries.filter((e) => (e.flags?.length ?? 0) > 0).length;
+	if (withFlag > 0) {
+		return `flag in ${withFlag === 1 ? 'an entry' : `${withFlag} entries`}`;
+	}
 	const hidden = zip.entries.filter((e) => e.undeclared).length;
 	if (hidden > 0) {
 		return `${hidden} not in the directory`;
@@ -152,6 +159,7 @@ function archiveNote(zip: ZipArchive): string {
 export function tools(found: Findings): Tool[] {
 	const { survey, structure = null, sweep = null, wall = null, chi = null, rs = null } = found;
 	const { audio = null, spectrogram = null, paletteStego = null, zip = null } = found;
+	const aes = found.aes ?? [];
 	const wav = found.wav && !isWavError(found.wav) ? found.wav : null;
 	const jpeg = found.jpeg && !isJpegError(found.jpeg) ? found.jpeg : null;
 
@@ -273,6 +281,15 @@ export function tools(found: Findings): Tool[] {
 			status: wall ? 'ready' : 'pending',
 			value: wall ? `${wall.planes.length} planes` : 'pixels unavailable'
 		}),
+		{
+			id: 'aes',
+			name: 'AES decrypt',
+			measures: 'Finds a key and payload in the file and runs AES-CBC',
+			scope: 'bytes',
+			group: 'cuttlefish',
+			status: aes.length ? 'hit' : 'clear',
+			value: aes.length ? `${aes.length} decrypted` : 'no key and payload found'
+		},
 		{
 			id: 'exif',
 			name: 'Metadata',

@@ -5,6 +5,7 @@
 
 use wasm_bindgen::prelude::*;
 
+pub mod aes;
 pub mod bmp;
 pub mod bytes;
 pub mod cuttlefish;
@@ -205,6 +206,16 @@ pub fn png_dimensions(file: &[u8]) -> Result<Vec<u32>, JsError> {
 #[wasm_bindgen]
 pub fn peel_encodings(data: &[u8]) -> String {
     mantis::json(data)
+}
+
+/// AES-CBC decryptions the file decrypts to readable text, as JSON.
+///
+/// A file that carries its own key, IV and ciphertext is decrypted here rather
+/// than by hand. The array is empty when nothing in the file forms a set that
+/// decrypts to anything a person could read, which is every ordinary file.
+#[wasm_bindgen]
+pub fn aes_probe(file: &[u8]) -> String {
+    aes::json(file)
 }
 
 /// What a ZIP archive holds, as JSON, or null when the file is not one.

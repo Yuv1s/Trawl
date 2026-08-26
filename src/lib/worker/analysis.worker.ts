@@ -1,4 +1,5 @@
 import init, {
+	aes_probe,
 	chi_square,
 	file_survey,
 	find_flags,
@@ -41,7 +42,8 @@ import type {
 	Sweep,
 	WavError,
 	WavStructure,
-	ZipArchive
+	ZipArchive,
+	AesSolved
 } from './protocol';
 import { isWavError } from './protocol';
 
@@ -65,6 +67,68 @@ async function inflate(bytes: Uint8Array): Promise<Uint8Array> {
 		.stream()
 		.pipeThrough(new DecompressionStream('deflate'));
 	return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+/** Raw deflate, with no zlib wrapper, which is how a ZIP stores each entry. */
+async function inflateRaw(bytes: Uint8Array): Promise<Uint8Array> {
+	const stream = new Blob([bytes as Uint8Array<ArrayBuffer>])
+		.stream()
+		.pipeThrough(new DecompressionStream('deflate-raw'));
+	return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+/** Fraction of bytes a person could read, to tell text content from binary. */
+function printableRatio(bytes: Uint8Array): number {
+	if (bytes.length === 0) return 0;
+	let readable = 0;
+	for (const b of bytes) {
+		if ((b >= 0x20 && b <= 0x7e) || b === 9 || b === 10 || b === 13) readable += 1;
+	}
+	return readable / bytes.length;
+}
+
+/** Most entries to open, and the most of one to read, so an archive bomb cannot
+ *  turn one dropped file into gigabytes of work. */
+const ZIP_ENTRY_LIMIT = 40;
+const ZIP_BYTE_LIMIT = 1 << 20;
+const ZIP_TEXT_PREVIEW = 8192;
+
+/**
+ * Reads what each archive entry actually holds.
+ *
+ * The structure walk names the entries and where their data sits, but stops at
+ * the compression. A flag inside `manifest.txt` is only visible once the entry
+ * is inflated, so this does that and scans the result, the same move the text
+ * chunks get. Stored entries are already plain; deflated ones go through the
+ * platform's raw inflate.
+ */
+async function inflateZipEntries(bytes: Uint8Array, zip: ZipArchive): Promise<void> {
+	let opened = 0;
+	for (const entry of zip.entries) {
+		if (opened >= ZIP_ENTRY_LIMIT) break;
+		if (entry.dataOffset === null || entry.encrypted || entry.compressed === 0) continue;
+		if (entry.method !== 'stored' && entry.method !== 'deflate') continue;
+		if (entry.uncompressed > ZIP_BYTE_LIMIT) continue;
+
+		const end = entry.dataOffset + entry.compressed;
+		if (end > bytes.length) continue;
+		opened += 1;
+
+		try {
+			const packed = bytes.subarray(entry.dataOffset, end);
+			const raw = entry.method === 'deflate' ? await inflateRaw(packed) : packed;
+
+			entry.flags = (JSON.parse(find_flags(raw)) as Found[]).map((f) => f.text);
+			if (printableRatio(raw) >= 0.85) {
+				const text = new TextDecoder('utf-8', { fatal: false }).decode(
+					raw.subarray(0, ZIP_TEXT_PREVIEW)
+				);
+				entry.text = raw.length > ZIP_TEXT_PREVIEW ? `${text}\n…` : text;
+			}
+		} catch (error: unknown) {
+			entry.readError = error instanceof Error ? error.message : String(error);
+		}
+	}
 }
 
 function readWall(packed: Uint8Array): PlaneWall {
@@ -108,6 +172,29 @@ async function inflateTextChunks(bytes: Uint8Array, structure: Structure): Promi
 	}
 }
 
+/**
+ * The file bytes, with every text chunk's content appended.
+ *
+ * A compressed chunk holds text the raw bytes do not, and the AES probe pairs
+ * hex and base64 it finds lying around. Appending the inflated text puts a key
+ * or IV that was compressed back where the probe can see it, next to a payload
+ * that was in the clear.
+ */
+function withInflatedText(bytes: Uint8Array, structure: Structure | null): Uint8Array {
+	if (!structure) return bytes;
+	const extra = structure.text
+		.map((chunk) => chunk.text)
+		.filter(Boolean)
+		.join('\n');
+	if (!extra) return bytes;
+
+	const tail = new TextEncoder().encode(`\n${extra}`);
+	const combined = new Uint8Array(bytes.length + tail.length);
+	combined.set(bytes, 0);
+	combined.set(tail, bytes.length);
+	return combined;
+}
+
 function readSpectrogram(packed: Uint8Array): Spectrogram {
 	const headerLength = new DataView(packed.buffer, packed.byteOffset, 4).getUint32(0, true);
 	const json = new TextDecoder().decode(packed.subarray(4, 4 + headerLength));
@@ -133,6 +220,11 @@ async function analyse(id: number, name: string, bytes: Uint8Array): Promise<Ana
 
 	const wav = JSON.parse(wav_structure(bytes)) as WavStructure | WavError | null;
 	const zip = JSON.parse(zip_structure(bytes)) as ZipArchive | null;
+	if (zip) await inflateZipEntries(bytes, zip);
+	// The key and IV for a decryption can sit in a compressed text chunk, which
+	// the raw bytes do not carry. Text chunks are inflated by now, so the probe
+	// runs over the bytes plus that recovered text and can pair the two.
+	const aes = JSON.parse(aes_probe(withInflatedText(bytes, structure))) as AesSolved[];
 	const jpeg = JSON.parse(jpeg_stego(bytes, SWEEP_BYTES, CHI_STEPS_JPEG)) as
 		JpegStego | JpegError | null;
 
@@ -203,6 +295,7 @@ async function analyse(id: number, name: string, bytes: Uint8Array): Promise<Ana
 		jpeg,
 		paletteStego,
 		zip,
+		aes,
 		sweep,
 		wall,
 		chi,
