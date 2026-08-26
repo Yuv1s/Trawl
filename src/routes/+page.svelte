@@ -1,10 +1,16 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { getScannerToken } from '$lib';
+	import { getScannerToken, getTourChoice, setTourChoice } from '$lib';
 	import AnalysisWorker from '$lib/worker/analysis.worker?worker';
 	import DropSurface from '$lib/components/DropSurface.svelte';
 	import WebRecon from '$lib/components/WebRecon.svelte';
 	import PeelPanel from '$lib/components/PeelPanel.svelte';
+	import HeaderControls from '$lib/components/HeaderControls.svelte';
+	import TourPrompt from '$lib/components/TourPrompt.svelte';
+	import TourOverlay from '$lib/components/TourOverlay.svelte';
+	import DownloadPrompt from '$lib/components/DownloadPrompt.svelte';
+	import { buildPixelDemo } from '$lib/tour/demo';
+	import type { TourStep } from '$lib/tour/types';
 	import { attack as attackRsa, looksLikeRsa, type Report } from '$lib/analysis/rsa';
 	import Logo from '$lib/components/Logo.svelte';
 	import ToolRack from '$lib/components/ToolRack.svelte';
@@ -58,6 +64,11 @@
 	let extracted = $state<{ label: string; text: string } | null>(null);
 	/** A key somebody typed, and what each cipher made of it. */
 	let keyed = $state<{ key: string; attempts: KeyAttempt[] } | null>(null);
+
+	let showTourPrompt = $state(false);
+	let tourPending = $state(false);
+	let tourActive = $state(false);
+	let showDownloadPrompt = $state(false);
 
 	let worker: Worker | null = null;
 	let ticket = 0;
@@ -209,9 +220,84 @@
 	 * reach the target, and runs it through the offline tools like a dropped file,
 	 * so the recon list is left untouched in the tab it came from.
 	 */
+	function startTour() {
+		setTourChoice('tour');
+		showTourPrompt = false;
+		tourPending = true;
+		const demo = buildPixelDemo();
+		analyseBytes(demo.bytes, demo.name);
+	}
+
+	function skipTour() {
+		setTourChoice('skip');
+		showTourPrompt = false;
+	}
+
+	function finishTour() {
+		tourActive = false;
+		showDownloadPrompt = true;
+	}
+
+	$effect(() => {
+		if (view.phase === 'done' && tourPending) {
+			tourPending = false;
+			tourActive = true;
+		}
+	});
+
+	const tourSteps: TourStep[] = [
+		{
+			target: '[data-tour="identity"]',
+			title: 'One file, every tool at once',
+			body: 'This is a sample image with a flag hidden in its low bits. Every tool in the rack already ran against it before you saw the page.'
+		},
+		{
+			target: '[data-tour="recovered"]',
+			title: 'Anything credible floats to the top',
+			body: 'A flag shows up here the moment any tool finds one, no matter which tool it was. This one came out of the red channel.'
+		},
+		{
+			target: '[data-tour="rack"]',
+			title: 'Every tool that ran',
+			body: "Tools that hit are marked. Tools that don't apply to this file say why instead of just disappearing. Click through any of them.",
+			onenter: () => (activeTool = 'lsb')
+		},
+		{
+			target: '[data-tour="pane"]',
+			title: 'LSB sweep',
+			body: 'It tries every channel, bit position and order at once: the whole space a hidden message could sit in. Hit Extract on any result to turn it into text.',
+			onenter: () => (activeTool = 'lsb')
+		},
+		{
+			target: '[data-tour="pane"]',
+			title: 'Chi-square attack',
+			body: "This one doesn't read the message. It estimates how much of the image carries a payload, so a flat trace just means nothing at this scale, not that nothing is hidden.",
+			onenter: () => (activeTool = 'chi')
+		},
+		{
+			target: '[data-tour="pane"]',
+			title: 'Bit-plane wall',
+			body: 'Every bit plane of every channel, drawn as its own picture. A hidden payload usually looks like noise where the image should have structure, or the reverse.',
+			onenter: () => (activeTool = 'planes')
+		},
+		{
+			target: '[data-tour="theme-github"]',
+			title: 'Theme and source',
+			body: 'Switch between light and dark from here, or open the repository on GitHub.'
+		},
+		{
+			target: '[data-tour="new-file"]',
+			title: 'New file',
+			body: "This clears the current file and takes you back to the start screen, the same place you can drop a file, paste a string, or scan a live site. Finish up and we'll leave a couple more sample files for you to try, each one hiding its flag somewhere different."
+		}
+	];
+
 	onMount(() => {
 		const address = new URLSearchParams(window.location.search).get('analyse');
-		if (!address) return;
+		if (!address) {
+			if (getTourChoice() === null) showTourPrompt = true;
+			return;
+		}
 
 		const name = decodeURIComponent(address.split('/').pop()?.split('?')[0] || 'image');
 		view = { phase: 'working', name };
@@ -499,7 +585,12 @@
 </svelte:head>
 
 {#if view.phase === 'idle'}
-	<DropSurface onfile={accept} ontext={acceptText} onweb={() => (view = { phase: 'web' })} />
+	<DropSurface
+		onfile={accept}
+		ontext={acceptText}
+		onweb={() => (view = { phase: 'web' })}
+		ontour={startTour}
+	/>
 {:else if view.phase === 'web'}
 	<WebRecon onreset={reset} />
 {:else if view.phase === 'text'}
@@ -520,7 +611,7 @@
 		ondragover={(e) => e.preventDefault()}
 	>
 		<header>
-			<div class="identity">
+			<div class="identity" data-tour="identity">
 				<Logo size={22} />
 				<span class="name">{view.phase === 'working' ? view.name : view.result.name}</span>
 				{#if view.phase === 'done'}
@@ -543,7 +634,8 @@
 						{hits} of {built.length} tools hit
 					</span>
 				{/if}
-				<button type="button" class="reset" onclick={reset}>New file</button>
+				<button type="button" class="reset" onclick={reset} data-tour="new-file">New file</button>
+				<HeaderControls dataTour="theme-github" />
 			</div>
 		</header>
 
@@ -573,11 +665,13 @@
 			</div>
 		{:else if survey}
 			{#if credibleFlags.length > 0 || sweepFlags.length > 0}
-				<Recovered candidates={credibleFlags} sources={flagSources} fromPixels={sweepFlags} />
+				<div data-tour="recovered">
+					<Recovered candidates={credibleFlags} sources={flagSources} fromPixels={sweepFlags} />
+				</div>
 			{/if}
 
 			<div class="body">
-				<aside class="rack-pane">
+				<aside class="rack-pane" data-tour="rack">
 					<ToolRack
 						{built}
 						planned={PLANNED}
@@ -586,7 +680,7 @@
 					/>
 				</aside>
 
-				<main class="pane" aria-label="Tool output">
+				<main class="pane" aria-label="Tool output" data-tour="pane">
 					{#if current}
 						<div class="pane-head">
 							<h2>{current.name}</h2>
@@ -862,6 +956,18 @@
 			</div>
 		{/if}
 	</div>
+{/if}
+
+{#if showTourPrompt}
+	<TourPrompt ontour={startTour} onskip={skipTour} />
+{/if}
+
+{#if tourActive}
+	<TourOverlay steps={tourSteps} onfinish={finishTour} />
+{/if}
+
+{#if showDownloadPrompt}
+	<DownloadPrompt onclose={() => (showDownloadPrompt = false)} />
 {/if}
 
 <style>

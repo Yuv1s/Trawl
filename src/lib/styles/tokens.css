@@ -61,6 +61,23 @@
 	--ease: cubic-bezier(0.32, 0.72, 0, 1);
 }
 
+/* Same cool-slate hue family as the dark theme, run in reverse: ground goes
+   from darkest to lightest, so a panel is still a step of contrast rather
+   than a different palette bolted on. */
+:root[data-theme='light'] {
+	--ground: #eef2f1;
+	--panel: #dde3e2;
+	--rule: #c3cbca;
+	--ink: #8a5a34;
+	--signal: #9c6a12;
+	--text: #1b2426;
+	--muted: #57676a;
+
+	--panel-lift: #d2d9d8;
+	--panel-deep: #e6ebea;
+	--rule-bright: #a8b3b1;
+}
+
 *,
 *::before,
 *::after {

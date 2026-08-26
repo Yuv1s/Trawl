@@ -28,7 +28,7 @@ function adler32(bytes: Uint8Array): number {
 	return ((b << 16) | a) >>> 0;
 }
 
-function chunk(type: string, data: Uint8Array): Uint8Array {
+export function pngChunk(type: string, data: Uint8Array): Uint8Array {
 	const out = new Uint8Array(12 + data.length);
 	const view = new DataView(out.buffer);
 	view.setUint32(0, data.length);
@@ -173,9 +173,9 @@ function assemble(
 
 	const parts = [
 		SIGNATURE,
-		chunk('IHDR', ihdr),
-		chunk('IDAT', idat),
-		chunk('IEND', new Uint8Array(0))
+		pngChunk('IHDR', ihdr),
+		pngChunk('IDAT', idat),
+		pngChunk('IEND', new Uint8Array(0))
 	];
 
 	const file = new Uint8Array(parts.reduce((n, part) => n + part.length, 0));

@@ -1,3 +1,16 @@
+export type TourChoice = 'tour' | 'skip';
+
+const TOUR_CHOICE_KEY = 'trawl.tour.choice';
+
+export function getTourChoice(): TourChoice | null {
+	const value = localStorage.getItem(TOUR_CHOICE_KEY);
+	return value === 'tour' || value === 'skip' ? value : null;
+}
+
+export function setTourChoice(choice: TourChoice): void {
+	localStorage.setItem(TOUR_CHOICE_KEY, choice);
+}
+
 export const SCANNER_TOKEN_KEY = 'trawl.scanner.token';
 
 export function getScannerToken(): string | null {

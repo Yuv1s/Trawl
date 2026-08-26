@@ -1,5 +1,6 @@
 <script lang="ts">
 	import Logo from '$lib/components/Logo.svelte';
+	import HeaderControls from '$lib/components/HeaderControls.svelte';
 	import { getOrCreateScannerToken } from '$lib';
 	import { SvelteSet } from 'svelte/reactivity';
 
@@ -295,7 +296,10 @@
 			<Logo size={22} />
 			<span class="name">Web exploration</span>
 		</div>
-		<button type="button" class="reset" onclick={onreset}>Back</button>
+		<div class="right">
+			<button type="button" class="reset" onclick={onreset}>Back</button>
+			<HeaderControls />
+		</div>
 	</header>
 
 	<main class="pane">
@@ -584,6 +588,12 @@
 
 	.name {
 		font-weight: 600;
+	}
+
+	.right {
+		display: flex;
+		align-items: center;
+		gap: var(--s3);
 	}
 
 	.reset {

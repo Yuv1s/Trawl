@@ -1,16 +1,19 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
 	import Logo from '$lib/components/Logo.svelte';
+	import HeaderControls from '$lib/components/HeaderControls.svelte';
 	import { PLANNED } from '$lib/analysis/tools';
 
 	let {
 		onfile,
 		ontext,
-		onweb
+		onweb,
+		ontour
 	}: {
 		onfile: (file: File) => void;
 		ontext: (text: string) => void;
 		onweb: () => void;
+		ontour: () => void;
 	} = $props();
 
 	let dragging = $state(false);
@@ -135,6 +138,10 @@
 	ondragover={(e) => e.preventDefault()}
 	ondrop={drop}
 >
+	<div class="corner">
+		<HeaderControls onTour={ontour} />
+	</div>
+
 	<header>
 		<h1><Logo size={44} /><span>Trawl</span></h1>
 		<p class="lede">
@@ -211,7 +218,7 @@
 		height: 100dvh;
 		display: grid;
 		grid-template-columns: minmax(0, 1fr) minmax(0, 32rem);
-		grid-template-rows: minmax(0, 1fr) auto;
+		grid-template-rows: auto minmax(0, 1fr) auto;
 		/* A row gap as well as a column one. Without it the rack's bottom border
 		   lands exactly on the footer's top border, and the two 1px rules read
 		   as one thick line dividing nothing. */
@@ -222,6 +229,14 @@
 
 	.dragging {
 		background: var(--panel-deep);
+	}
+
+	/* Its own row, not floated over the rack — the rack's own header sits
+	   flush with the top edge and leaves no gutter to float above. */
+	.corner {
+		grid-column: 1 / -1;
+		display: flex;
+		justify-content: flex-end;
 	}
 
 	header {
@@ -487,7 +502,7 @@
 			height: auto;
 			min-height: 100dvh;
 			grid-template-columns: minmax(0, 1fr);
-			grid-template-rows: auto auto auto;
+			grid-template-rows: auto auto auto auto;
 			gap: var(--s5) 0;
 			padding: var(--s5) var(--s4) var(--s4);
 		}

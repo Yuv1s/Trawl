@@ -1,5 +1,6 @@
 <script lang="ts">
 	import Logo from '$lib/components/Logo.svelte';
+	import HeaderControls from '$lib/components/HeaderControls.svelte';
 	import type { KeyAttempt, PeelResult, Rotation } from '$lib/worker/protocol';
 	import type { Report } from '$lib/analysis/rsa';
 
@@ -286,6 +287,7 @@
 				{peel.depth === 1 ? 'layer' : 'layers'} peeled
 			</span>
 			<button type="button" class="reset" onclick={onreset}>New</button>
+			<HeaderControls />
 		</div>
 	</header>
 
