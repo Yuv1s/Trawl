@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { SAMPLE_FILES, downloadSample } from '$lib/tour/demo';
+	import { SAMPLE_FILES, downloadSample, type SampleFile } from '$lib/tour/demo';
 
-	let { onclose }: { onclose: () => void } = $props();
+	let { onclose, onrun }: { onclose: () => void; onrun: (file: SampleFile) => void } = $props();
 
 	const files = SAMPLE_FILES.map((f) => ({ file: f.build(), blurb: f.blurb }));
 
@@ -23,10 +23,10 @@
 
 <div class="scrim" role="presentation" onclick={onScrimClick}>
 	<div class="dialog" tabindex="-1" role="dialog" aria-modal="true" aria-labelledby="dl-title">
-		<h2 id="dl-title">A few more to try</h2>
+		<h2 id="dl-title">See it work</h2>
 		<p>
-			Same idea as the tour, each one hiding its flag somewhere different. Download any of them and
-			drop it back in whenever you want to try Trawl on something real.
+			Each of these is a small file with a flag hidden somewhere different. Run one to watch every
+			tool go at it, or download it and drop it back in yourself. Nothing here leaves the tab.
 		</p>
 		<ul>
 			{#each files as { file, blurb } (file.name)}
@@ -35,7 +35,10 @@
 						<span class="mono name">{file.name}</span>
 						<span class="blurb">{blurb}</span>
 					</div>
-					<button type="button" class="get" onclick={() => downloadSample(file)}> Download </button>
+					<div class="row-actions">
+						<button type="button" class="run" onclick={() => onrun(file)}>Run</button>
+						<button type="button" class="get" onclick={() => downloadSample(file)}>Download</button>
+					</div>
 				</li>
 			{/each}
 		</ul>
@@ -128,14 +131,30 @@
 		flex: none;
 	}
 
-	.get {
+	.row-actions {
+		display: flex;
+		gap: var(--s2);
+		flex: none;
+	}
+
+	.run {
 		background: var(--signal);
 		border: 1px solid var(--signal);
 		color: var(--ground);
 	}
 
-	.get:hover {
+	.run:hover {
 		filter: brightness(1.08);
+	}
+
+	.get {
+		background: none;
+		border: 1px solid var(--rule-bright);
+		color: var(--text);
+	}
+
+	.get:hover {
+		background: var(--panel-lift);
 	}
 
 	.ghost {

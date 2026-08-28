@@ -9,7 +9,7 @@
 	import TourPrompt from '$lib/components/TourPrompt.svelte';
 	import TourOverlay from '$lib/components/TourOverlay.svelte';
 	import DownloadPrompt from '$lib/components/DownloadPrompt.svelte';
-	import { buildPixelDemo } from '$lib/tour/demo';
+	import { buildPixelDemo, type SampleFile } from '$lib/tour/demo';
 	import type { TourStep } from '$lib/tour/types';
 	import { attack as attackRsa, looksLikeRsa, type Report } from '$lib/analysis/rsa';
 	import Logo from '$lib/components/Logo.svelte';
@@ -236,6 +236,13 @@
 	function finishTour() {
 		tourActive = false;
 		showDownloadPrompt = true;
+	}
+
+	/** Load a sample straight into the analyser, so a newcomer can watch the tools
+	 *  run without downloading a file and dropping it back in. */
+	function runSample(file: SampleFile) {
+		showDownloadPrompt = false;
+		analyseBytes(file.bytes, file.name);
 	}
 
 	$effect(() => {
@@ -590,6 +597,7 @@
 		ontext={acceptText}
 		onweb={() => (view = { phase: 'web' })}
 		ontour={startTour}
+		ondemos={() => (showDownloadPrompt = true)}
 	/>
 {:else if view.phase === 'web'}
 	<WebRecon onreset={reset} />
@@ -635,7 +643,7 @@
 					</span>
 				{/if}
 				<button type="button" class="reset" onclick={reset} data-tour="new-file">New file</button>
-				<HeaderControls dataTour="theme-github" />
+				<HeaderControls dataTour="theme-github" onDemos={() => (showDownloadPrompt = true)} />
 			</div>
 		</header>
 
@@ -967,7 +975,7 @@
 {/if}
 
 {#if showDownloadPrompt}
-	<DownloadPrompt onclose={() => (showDownloadPrompt = false)} />
+	<DownloadPrompt onclose={() => (showDownloadPrompt = false)} onrun={runSample} />
 {/if}
 
 <style>

@@ -8,7 +8,8 @@ an ordinary-looking image, a sound file, or a line of text with a message buried
 inside it.
 
 **Status: in development.** [ROADMAP.md](ROADMAP.md) has the current state.
-Steganography is done. Cryptography is well along. Forensics and web exploration have just begun.
+Steganography is done. Cryptography is well along. Web exploration pulls a site
+apart and probes it on request. Forensics has just begun.
 
 ## What it is for
 
@@ -58,17 +59,29 @@ saying so beats picking one at random and sounding sure.
 
 Everything found collects in the Cod-end, the panel at the top of the page.
 
-A link is the newest kind of input, and the one still being built. Remora, the
-web-exploration half, is for a challenge that lives on a site rather than in a
-file you were handed. A browser tab cannot reach a site it was not served from,
-so Remora runs as a small program you start on your own machine with one line the
-page hands you; once it is running, the page finds it and switches to a box for
-the target address. That handshake works today. What comes next is the point of
-it: retrieve every part of a site and give each piece to the tool that already
-reads it. A website is only ever made of the things Trawl reads anyway, so an
-image it pulls down goes to Cuttlefish, an encoded string in the source goes to
-Mantis, and a file buried in the page goes to the same extractor a dropped file
-uses.
+A link is the newest kind of input. Remora, the web-exploration half, is for a
+challenge that lives on a site rather than in a file you were handed. A browser
+tab cannot reach a site it was not served from, so Remora runs as a small program
+you start on your own machine with one line the page hands you; once it is
+running, the page finds it and switches to a box for the target address.
+
+From there it pulls the site apart into the things Trawl already reads. It
+follows the links, the scripts, and what robots and the sitemap give away to the
+pages nothing advertises, and tries a short list of the places a file gets left
+where it should not be. Each page is read for a flag sitting in plain sight, in a
+comment or a response header, and for one that was hidden: a base64 cookie, a hex
+or ROT13 variable, a colour written as CSS escapes, an array XORed against a byte,
+each decoded only far enough to see whether a flag falls out. An image it finds
+is opened in a new tab against Cuttlefish, the same tools a dropped picture gets,
+because a website is only ever made of the things Trawl reads anyway.
+
+That much only reads. A second mode, off until you affirm you are allowed to test
+the target, sends what a page did not ask for: a quote in a parameter to draw out
+an error, a privilege field into an update, a timestamp into a window that opens
+only for now. If a response hands back a JSON web token, it recovers the signing
+key when the site was careless enough to leak it and mints one that says you are
+an administrator. When you already have a lead, a box takes it and tries it in
+every place a name might belong.
 
 ## What it will not tell you
 

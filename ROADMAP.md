@@ -21,6 +21,9 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
       archive hides something. Reports entries the directory never lists,
       sizes and checksums the two copies argue about, bytes before the first
       header, bytes appended past the end, and the comments nothing shows
+- [x] Reading inside the archive too: each entry inflated and scanned, so a flag
+      in a file inside the zip, including one appended to a PNG, shows in place
+      without saving it out and unzipping it first
 
 ### Cuttlefish, the steganography half
 
@@ -33,6 +36,11 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 - [x] Spectrogram, for pictures drawn into sound
 - [x] JSteg extraction from JPEG coefficients
 - [x] Coefficient statistics, with the value counts shown
+- [x] AES-CBC run on a file that carries its own key. The hex key and IV out of
+      the metadata, the base64 payload from nearby, tried across the key sizes and
+      shown only when the result reads as text. A wrong key turns AES into noise,
+      so a file with no key in it stays silent, and the cipher is written out here
+      the same as every other, nothing pulled in
 
 ### Mantis, the cryptography half
 
@@ -108,9 +116,46 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 - [x] A guarded fetch that follows redirects by hand, so every hop meets the
       guard again instead of being trusted by the HTTP client
 - [x] A scanner started with one line per system, which downloads a prebuilt
-      binary and runs it on your own machine; the page finds it on its own and
-      switches to a box for the target. No repository, no toolchain, nothing
-      uploaded
+      binary, checks it against a published checksum, and runs it on your own
+      machine; the page finds it on its own and switches to a box for the target.
+      No repository, no toolchain, nothing uploaded
+- [x] A token and a single allowed origin, both chosen when the scanner starts,
+      required on every request. The scanner is a service on your loopback, and
+      this keeps another page on the same machine from turning it into a proxy of
+      its own, which matters most once local targets are allowed
+- [x] A crawl one level deep: the links, scripts, robots and sitemap followed to
+      the pages nothing advertises, and a short list of the places a file gets
+      left where it should not be tried by name, the /.git and /.env and a source
+      backup among them
+- [x] Every page read for a flag in plain sight: in the source, in a comment, in
+      a linked filename, and in a response header, the plain `X-Flag` and the
+      base64 cookie included
+- [x] Encoded flags dug out of the source and headers and kept only when a flag
+      falls out of the decoding: base64, hex, ROT13, a reversed-then-base64 ETag,
+      a colour written as CSS escapes, and an array of numbers XORed against a
+      byte with every byte tried. The same flag-shape filter the offline half uses
+      keeps all of it quiet on a page that hid nothing
+- [x] Images handed to Cuttlefish. Each is fetched through the scanner and opened
+      in a new tab against the same tools a dropped picture gets, so the offline
+      half reads a picture off a URL exactly as it reads one off a disk and still
+      never touches the network itself
+- [x] Active checks, off until you affirm you may test the target, since this is
+      the half that sends rather than reads: a quote in a parameter to draw out an
+      error, a privilege field into an update, the current time into a window that
+      only opens for now, an internal marker into a header. Wordlist-driven, held
+      to the target's own host, and bounded by a timeout so a stalling endpoint
+      cannot hang the scan
+- [x] A box for your own leads, each woven into every position at once, an
+      endpoint, a parameter, a field and a header, on top of the built-in list, so
+      a name you suspect is tried wherever it might belong without your having to
+      say which it is
+- [x] Signed tokens forged. A JWT found in a response has its key recovered the
+      one way that cannot be fooled, the candidate whose HMAC reproduces the
+      token's own signature, whether the site leaked the key in the token's own
+      payload or left a weak one a short list guesses. With the key in hand a
+      fresh token that names an administrator is signed and replayed against the
+      endpoints that answered. SHA-256 and HMAC are written out here too, nothing
+      borrowed
 
 ## Next
 
@@ -123,17 +168,11 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 
 ### Remora
 
-- [ ] Pages: every route the site gives up, crawled from its own links and
-      scripts, read out of robots and sitemaps, and guessed from a wordlist of the
-      places flags hide, grouped by what the server says about each
-- [ ] Images and media, each one collected into a tab and handed to Cuttlefish,
-      since a flag in a picture is Cuttlefish's problem whether the picture came
-      off a disk or a URL
-- [ ] Code and secrets: the source read for comments, keys and tokens, with
-      anything that looks encoded run back through Mantis and only what decodes
-      into something surfaced
-- [ ] Headers, cookies and exposed files: the strange header, the cookie that
-      decodes to a flag, and the /.git or /.env left where it should not be
+- [ ] Flows that take more than one request: a value decoded out of one response
+      and carried into the next as a header or a host, the multi-step a single
+      probe cannot reach on its own
+- [ ] A wider wordlist and a deeper crawl, so more of a site's routes and
+      parameters are found without a hint to point at them
 
 ### Forensics
 

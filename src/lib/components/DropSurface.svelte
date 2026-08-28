@@ -8,12 +8,14 @@
 		onfile,
 		ontext,
 		onweb,
-		ontour
+		ontour,
+		ondemos
 	}: {
 		onfile: (file: File) => void;
 		ontext: (text: string) => void;
 		onweb: () => void;
 		ontour: () => void;
+		ondemos: () => void;
 	} = $props();
 
 	let dragging = $state(false);
@@ -139,7 +141,7 @@
 	ondrop={drop}
 >
 	<div class="corner">
-		<HeaderControls onTour={ontour} />
+		<HeaderControls onTour={ontour} onDemos={ondemos} />
 	</div>
 
 	<header>

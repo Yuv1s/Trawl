@@ -15,4 +15,5 @@ pub mod crawl;
 pub mod decode;
 pub mod fetch;
 pub mod guard;
+pub mod jwt;
 pub mod server;

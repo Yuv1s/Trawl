@@ -2,7 +2,11 @@
 	import { onMount } from 'svelte';
 	import { applyTheme, storedTheme, systemTheme, type Theme } from '$lib/theme';
 
-	let { onTour, dataTour }: { onTour?: () => void; dataTour?: string } = $props();
+	let {
+		onTour,
+		onDemos,
+		dataTour
+	}: { onTour?: () => void; onDemos?: () => void; dataTour?: string } = $props();
 
 	const REPO_URL = 'https://github.com/Yuv1s/Trawl';
 
@@ -34,6 +38,20 @@
 				/>
 			</svg>
 			<span class="ctrl-label">Tour</span>
+		</button>
+	{/if}
+
+	{#if onDemos}
+		<button type="button" class="ctrl" onclick={onDemos} aria-label="Try a sample file">
+			<svg viewBox="0 0 18 18" width="16" height="16" fill="none" aria-hidden="true">
+				<path
+					d="M6.5 5.2v7.6l6.2-3.8z"
+					stroke="currentColor"
+					stroke-width="1.4"
+					stroke-linejoin="round"
+				/>
+			</svg>
+			<span class="ctrl-label">Demos</span>
 		</button>
 	{/if}
 
