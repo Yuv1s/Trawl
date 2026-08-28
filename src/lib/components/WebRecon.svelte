@@ -20,6 +20,7 @@
 	const POLL = 2500;
 
 	type Os = 'windows' | 'macos' | 'linux';
+	type CopyTarget = 'install' | 'restart';
 
 	const OS_LABEL: Record<Os, string> = {
 		windows: 'Windows',
@@ -35,19 +36,31 @@
 	let origin = $state('');
 	let os = $state<Os>('linux');
 	let scannerToken = $state('');
+	/** Off by default, the same as the scanner itself: reaching local and
+	 *  private targets is a choice the person installing it makes. */
+	let allowLocal = $state(false);
 
 	/** One line per system: fetch the installer from this site and run it. */
 	const commands = $derived<Record<Os, string>>({
-		windows: `$env:TRAWL_TOKEN='${scannerToken}'; $env:TRAWL_ORIGIN='${origin}'; irm ${origin}/install.ps1 | iex`,
-		macos: `curl -fsSL ${origin}/install.sh | TRAWL_TOKEN='${scannerToken}' TRAWL_ORIGIN='${origin}' sh`,
-		linux: `curl -fsSL ${origin}/install.sh | TRAWL_TOKEN='${scannerToken}' TRAWL_ORIGIN='${origin}' sh`
+		windows: `$env:TRAWL_TOKEN='${scannerToken}'; $env:TRAWL_ORIGIN='${origin}';${allowLocal ? " $env:TRAWL_ALLOW_LOCAL='1';" : ' Remove-Item Env:TRAWL_ALLOW_LOCAL -ErrorAction SilentlyContinue;'} irm ${origin}/install.ps1 | iex`,
+		macos: `curl -fsSL ${origin}/install.sh | TRAWL_TOKEN='${scannerToken}' TRAWL_ORIGIN='${origin}'${allowLocal ? " TRAWL_ALLOW_LOCAL='1'" : ''} sh`,
+		linux: `curl -fsSL ${origin}/install.sh | TRAWL_TOKEN='${scannerToken}' TRAWL_ORIGIN='${origin}'${allowLocal ? " TRAWL_ALLOW_LOCAL='1'" : ''} sh`
 	});
 	const command = $derived(commands[os]);
+	const scannerAddress = new URL(scannerUrl);
+	const scannerPort = scannerAddress.port || (scannerAddress.protocol === 'https:' ? '443' : '80');
+	const restartCommands = $derived<Record<Os, string>>({
+		windows: `$env:TRAWL_TOKEN='${scannerToken}'; $env:TRAWL_ORIGIN='${origin}'; $env:PORT='${scannerPort}'; & "$env:LOCALAPPDATA\\trawl\\trawl-scan.exe" --allow-local`,
+		macos: `TRAWL_TOKEN='${scannerToken}' TRAWL_ORIGIN='${origin}' PORT='${scannerPort}' "$HOME/.trawl/bin/trawl-scan" --allow-local`,
+		linux: `TRAWL_TOKEN='${scannerToken}' TRAWL_ORIGIN='${origin}' PORT='${scannerPort}' "$HOME/.trawl/bin/trawl-scan" --allow-local`
+	});
+	const restartCommand = $derived(restartCommands[os]);
 
 	let connected = $state(false);
 	/** Whether the scanner will reach local and private targets, from /health. */
 	let localMode = $state(false);
-	let copied = $state(false);
+	let copied = $state<CopyTarget | null>(null);
+	let copyError = $state<CopyTarget | null>(null);
 	let copyTimer: ReturnType<typeof setTimeout> | undefined;
 
 	function detectOs(): Os {
@@ -73,7 +86,9 @@
 			connected = res.ok;
 			if (res.ok) {
 				const health = (await res.json()) as { allow_local?: boolean };
-				localMode = health.allow_local === true;
+				const nextLocalMode = health.allow_local === true;
+				if (nextLocalMode && localRefusal) scanError = null;
+				localMode = nextLocalMode;
 			}
 		} catch {
 			connected = false;
@@ -91,12 +106,22 @@
 
 	$effect(() => () => clearTimeout(copyTimer));
 
-	function copy() {
-		navigator.clipboard.writeText(command).then(() => {
-			copied = true;
-			clearTimeout(copyTimer);
-			copyTimer = setTimeout(() => (copied = false), 1600);
-		});
+	async function copy(value: string, target: CopyTarget) {
+		clearTimeout(copyTimer);
+		copied = null;
+		copyError = null;
+		try {
+			await navigator.clipboard.writeText(value);
+			copied = target;
+			copyTimer = setTimeout(() => (copied = null), 1600);
+		} catch {
+			copyError = target;
+		}
+	}
+
+	async function copyLocalRestart() {
+		allowLocal = true;
+		await copy(restartCommand, 'restart');
 	}
 
 	// The shape the scanner returns: a crawl, grouped the way a person looks.
@@ -138,7 +163,9 @@
 
 	/** A refusal that a local-mode scanner would not have given. */
 	const localRefusal = $derived(
-		scanError !== null && !localMode && /loopback|private|link-local|unique local/i.test(scanError)
+		scanError !== null &&
+			!localMode &&
+			/loopback|private network|unique local address/i.test(scanError)
 	);
 
 	function fileName(url: string): string {
@@ -314,12 +341,14 @@
 				</p>
 			</div>
 
-			<form class="target" onsubmit={runScan}>
+			<form class="target" onsubmit={runScan} aria-busy={scanning}>
 				<label class="label" for="target-url">Target URL</label>
 				<input
 					id="target-url"
 					type="url"
 					bind:value={target}
+					aria-describedby={scanError ? 'scan-error-text' : undefined}
+					aria-invalid={localRefusal}
 					spellcheck="false"
 					autocomplete="off"
 					placeholder="https://chal.some-ctf.example/"
@@ -359,22 +388,57 @@
 			{/if}
 
 			{#if scanError}
-				<p class="scan-error mono">{scanError}</p>
-				{#if localRefusal}
-					<p class="hint">
-						That looks like a target on your own machine. The scanner refuses those by default, so
-						it cannot be turned against a network it should not reach. To scan a challenge you are
-						hosting locally, restart the scanner with <span class="mono">--allow-local</span> (or
-						set
-						<span class="mono">TRAWL_ALLOW_LOCAL=1</span>). The cloud metadata address stays blocked
-						either way.
-					</p>
-				{/if}
+				<div class="scan-failure">
+					<p id="scan-error-text" class="scan-error mono" role="alert">{scanError}</p>
+					{#if localRefusal}
+						<section class="local-restart" aria-labelledby="local-restart-title">
+							<div class="local-restart-copy">
+								<h3 id="local-restart-title">Restart in local mode</h3>
+								<p>
+									Copy this command first. Then stop the scanner with <span class="mono"
+										>Ctrl+C</span
+									>
+									and paste it into the same terminal. Trawl reconnects when it starts.
+								</p>
+							</div>
+
+							<div class="command">
+								<input
+									class="command-text mono"
+									type="text"
+									readonly
+									aria-label={`${OS_LABEL[os]} local-mode restart command`}
+									value={restartCommand}
+								/>
+								<button
+									type="button"
+									onclick={copyLocalRestart}
+									aria-describedby="local-restart-note"
+								>
+									{copied === 'restart' ? 'Copied' : 'Copy restart command'}
+								</button>
+							</div>
+
+							<p class="copy-status" role="status" aria-live="polite" aria-atomic="true">
+								{copied === 'restart' ? 'Restart command copied.' : ''}
+							</p>
+							{#if copyError === 'restart'}
+								<p class="copy-error" role="alert">
+									Clipboard access failed. Select the command and copy it manually.
+								</p>
+							{/if}
+							<p id="local-restart-note" class="local-restart-note">
+								Local mode can reach this machine and private networks. Cloud metadata stays
+								blocked.
+							</p>
+						</section>
+					{/if}
+				</div>
 			{/if}
 
 			{#if scanning}
-				<div class="status" aria-live="polite">
-					<span class="dot"></span>
+				<div class="status" role="status" aria-live="polite">
+					<span class="dot" aria-hidden="true"></span>
 					<span class="mono">reaching {target}</span>
 				</div>
 			{/if}
@@ -382,7 +446,7 @@
 			{#if result}
 				{@const r = result}
 				<p class="summary">
-					<span class="mono">{r.target}</span> — {r.pages.length}
+					<span class="mono">{r.target}</span>, {r.pages.length}
 					{r.pages.length === 1 ? 'page' : 'pages'} crawled.
 				</p>
 
@@ -525,12 +589,11 @@
 			</div>
 
 			<div class="start">
-				<div class="switch" role="tablist" aria-label="Your system">
+				<div class="switch" role="group" aria-label="Your operating system">
 					{#each ['windows', 'macos', 'linux'] as const as choice (choice)}
 						<button
 							type="button"
-							role="tab"
-							aria-selected={os === choice}
+							aria-pressed={os === choice}
 							class:on={os === choice}
 							onclick={() => (os = choice)}>{OS_LABEL[choice]}</button
 						>
@@ -538,9 +601,37 @@
 				</div>
 
 				<div class="command">
-					<pre class="mono">{command}</pre>
-					<button type="button" onclick={copy}>{copied ? 'Copied' : 'Copy'}</button>
+					<input
+						class="command-text mono"
+						type="text"
+						readonly
+						aria-label={`${OS_LABEL[os]} scanner install command`}
+						value={command}
+					/>
+					<button type="button" onclick={() => copy(command, 'install')}>
+						{copied === 'install' ? 'Copied' : 'Copy'}
+					</button>
 				</div>
+				<p class="copy-status" role="status" aria-live="polite" aria-atomic="true">
+					{copied === 'install' ? 'Install command copied.' : ''}
+				</p>
+				{#if copyError === 'install'}
+					<p class="copy-error" role="alert">
+						Clipboard access failed. Select the command and copy it manually.
+					</p>
+				{/if}
+
+				<label class="active-gate">
+					<input type="checkbox" bind:checked={allowLocal} />
+					<span>
+						<span class="gate-title">Allow local targets</span>
+						<span class="gate-note"
+							>Lets the scanner reach a challenge on this machine or your private network. The cloud
+							metadata address stays blocked either way. Leave this off unless the target is yours
+							and local.</span
+						>
+					</span>
+				</label>
 
 				<p class="hint">
 					It runs a short script served from this page, which fetches the scanner for {OS_LABEL[os]} and
@@ -549,8 +640,8 @@
 				</p>
 			</div>
 
-			<div class="status" aria-live="polite">
-				<span class="dot"></span>
+			<div class="status" role="status" aria-live="polite">
+				<span class="dot" aria-hidden="true"></span>
 				<span class="mono">Watching for it at {scannerUrl}</span>
 			</div>
 
@@ -679,23 +770,32 @@
 		border-radius: var(--radius);
 		overflow: hidden;
 	}
-	.command pre {
+	.command:focus-within {
+		border-color: var(--rule-bright);
+	}
+	.command-text {
 		flex: 1;
+		width: 100%;
 		min-width: 0;
 		margin: 0;
 		padding: var(--s3);
 		background: var(--ground);
+		border: 0;
 		font-size: var(--t-data);
 		color: var(--text);
 		user-select: all;
-		overflow-x: auto;
+	}
+	.command-text:focus-visible,
+	.command button:focus-visible {
+		outline-offset: -3px;
 	}
 	.command button {
 		flex: none;
+		min-height: 44px;
 		padding: 0 var(--s4);
 		background: var(--panel-lift);
 		border: 0;
-		color: var(--muted);
+		color: var(--text);
 		font-family: var(--sans);
 		font-size: var(--t-label);
 		text-transform: uppercase;
@@ -705,6 +805,24 @@
 		transition: color 140ms var(--ease);
 	}
 	.command button:hover {
+		color: var(--signal);
+	}
+
+	.copy-status {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip: rect(0, 0, 0, 0);
+		white-space: nowrap;
+		border: 0;
+	}
+	.copy-error {
+		margin: var(--s2) 0 0;
+		font-size: var(--t-label);
+		line-height: 1.5;
 		color: var(--text);
 	}
 
@@ -837,14 +955,50 @@
 		cursor: default;
 	}
 
+	.scan-failure {
+		display: grid;
+		gap: var(--s3);
+		max-width: 78ch;
+	}
+
 	.scan-error {
-		margin: var(--s3) 0 0;
+		margin: 0;
 		padding: var(--s2) var(--s3);
 		border: 1px solid var(--ink);
 		border-radius: var(--radius);
 		background: var(--panel-deep);
 		color: var(--text);
 		font-size: var(--t-data);
+		overflow-wrap: anywhere;
+	}
+
+	.local-restart {
+		display: grid;
+		gap: var(--s3);
+		padding: var(--s4);
+		border: 1px solid var(--rule);
+		border-radius: var(--radius);
+		background: var(--panel-deep);
+	}
+	.local-restart-copy {
+		display: grid;
+		gap: var(--s1);
+	}
+	.local-restart h3,
+	.local-restart p {
+		margin: 0;
+	}
+	.local-restart h3 {
+		font-size: var(--t-mid);
+	}
+	.local-restart-copy p,
+	.local-restart-note {
+		color: var(--text);
+		font-size: var(--t-data);
+		line-height: 1.5;
+	}
+	.local-restart .copy-error {
+		font-size: var(--t-label);
 	}
 
 	.summary {
@@ -1132,6 +1286,12 @@
 	@media (max-width: 640px) {
 		.recon {
 			padding: var(--s4);
+		}
+		.command {
+			flex-direction: column;
+		}
+		.command button {
+			padding: var(--s3) var(--s4);
 		}
 	}
 </style>
