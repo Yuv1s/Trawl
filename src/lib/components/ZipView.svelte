@@ -1,7 +1,15 @@
 <script lang="ts">
 	import type { ZipArchive } from '$lib/worker/protocol';
 
-	let { archive }: { archive: ZipArchive } = $props();
+	let {
+		archive,
+		onanalyse,
+		onpeel
+	}: {
+		archive: ZipArchive;
+		onanalyse?: (bytes: Uint8Array, name: string) => void;
+		onpeel?: (text: string) => void;
+	} = $props();
 
 	const listed = $derived(archive.entries.filter((e) => !e.undeclared).length);
 	const hidden = $derived(archive.entries.filter((e) => e.undeclared));
@@ -86,6 +94,15 @@
 				<tr class:odd={entry.undeclared || entry.disagreement !== null}>
 					<td>
 						<span class="mono name">{entry.name}</span>
+						{#if entry.bytes && onanalyse}
+							<button
+								class="entry-action"
+								type="button"
+								onclick={() => onanalyse?.(entry.bytes!, entry.name)}
+							>
+								Analyse
+							</button>
+						{/if}
 						{#if entry.undeclared}
 							<span class="mono chip flagged">not in the directory</span>
 						{/if}
@@ -106,7 +123,13 @@
 				{#if entry.text}
 					<tr class="aside">
 						<td colspan="5">
-							<span class="label">content</span>
+							<div class="content-head">
+								<span class="label">content</span>
+								{#if onpeel}
+									<button type="button" onclick={() => onpeel?.(entry.text!)}>Send to Mantis</button
+									>
+								{/if}
+							</div>
 							<pre class="content mono">{entry.text}</pre>
 						</td>
 					</tr>
@@ -211,6 +234,31 @@
 
 	.name {
 		overflow-wrap: anywhere;
+	}
+
+	.entry-action,
+	.content-head button {
+		margin-left: var(--s2);
+		background: none;
+		border: 1px solid var(--rule-bright);
+		color: var(--text);
+		font: inherit;
+		font-size: var(--t-label);
+		padding: 1px var(--s2);
+		cursor: pointer;
+	}
+
+	.entry-action:focus-visible,
+	.content-head button:focus-visible {
+		outline: 2px solid var(--signal);
+		outline-offset: 2px;
+	}
+
+	.content-head {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: var(--s3);
 	}
 
 	/* A row worth a second look, marked on the edge rather than by filling it,

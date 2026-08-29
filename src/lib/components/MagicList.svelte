@@ -1,7 +1,17 @@
 <script lang="ts">
 	import type { MagicHit } from '$lib/worker/protocol';
 
-	let { hits, size, bytes }: { hits: MagicHit[]; size: number; bytes: Uint8Array } = $props();
+	let {
+		hits,
+		size,
+		bytes,
+		onanalyse
+	}: {
+		hits: MagicHit[];
+		size: number;
+		bytes: Uint8Array;
+		onanalyse?: (bytes: Uint8Array, name: string) => void;
+	} = $props();
 
 	const embedded = $derived(hits.filter((h) => h.embedded));
 	const header = $derived(hits.find((h) => !h.embedded) ?? null);
@@ -29,8 +39,12 @@
 	 * The object URL is revoked on the next frame rather than immediately, since
 	 * revoking before the browser has started reading cancels the save.
 	 */
+	function sliceOf(hit: MagicHit) {
+		return bytes.slice(hit.offset, hit.offset + hit.length);
+	}
+
 	function carve(hit: MagicHit) {
-		const slice = bytes.slice(hit.offset, hit.offset + hit.length);
+		const slice = sliceOf(hit);
 		const url = URL.createObjectURL(new Blob([slice as Uint8Array<ArrayBuffer>]));
 
 		const link = document.createElement('a');
@@ -63,7 +77,21 @@
 			<li>
 				<div class="head">
 					<span class="label-text">{hit.label}</span>
-					<button type="button" onclick={() => carve(hit)}>Save this file</button>
+					<div class="actions">
+						{#if onanalyse}
+							<button
+								type="button"
+								onclick={() =>
+									onanalyse?.(
+										sliceOf(hit),
+										`carved-${hex(hit.offset)}.${EXTENSIONS[hit.label] ?? 'bin'}`
+									)}
+							>
+								Analyse here
+							</button>
+						{/if}
+						<button type="button" onclick={() => carve(hit)}>Save file</button>
+					</div>
 				</div>
 				<span class="mono muted">
 					{kb(hit.length)} at {hex(hit.offset)}, {((hit.offset / size) * 100).toFixed(1)}% into the
@@ -130,8 +158,13 @@
 		color: var(--signal);
 	}
 
-	.head button {
+	.actions {
 		margin-left: auto;
+		display: flex;
+		gap: var(--s2);
+	}
+
+	.head button {
 		background: none;
 		border: 1px solid var(--rule-bright);
 		border-radius: var(--radius);

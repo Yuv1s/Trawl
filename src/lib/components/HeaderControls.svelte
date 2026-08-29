@@ -1,12 +1,25 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { applyTheme, storedTheme, systemTheme, type Theme } from '$lib/theme';
+	import FlagTagEditor from '$lib/components/FlagTagEditor.svelte';
 
 	let {
 		onTour,
 		onDemos,
+		onExport,
+		flagTags = [],
+		onFlagTags,
 		dataTour
-	}: { onTour?: () => void; onDemos?: () => void; dataTour?: string } = $props();
+	}: {
+		onTour?: () => void;
+		onDemos?: () => void;
+		/** Hands a writeup Markdown off, either to the clipboard or as a file. */
+		onExport?: (action: 'copy' | 'download') => Promise<void>;
+		/** Flag prefix presets, so detection and key recovery know the prize shape. */
+		flagTags?: string[];
+		onFlagTags?: (tags: string[]) => void;
+		dataTour?: string;
+	} = $props();
 
 	const REPO_URL = 'https://github.com/Yuv1s/Trawl';
 
@@ -22,6 +35,47 @@
 	function toggleTheme() {
 		theme = theme === 'dark' ? 'light' : 'dark';
 		applyTheme(theme);
+	}
+
+	let open = $state(false);
+	let tagsOpen = $state(false);
+	let copied = $state(false);
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let firstItem: HTMLButtonElement | undefined = $state();
+	let addInput: HTMLInputElement | undefined = $state();
+
+	$effect(() => () => clearTimeout(timer));
+
+	$effect(() => {
+		if (open && firstItem) firstItem.focus();
+	});
+
+	$effect(() => {
+		if (tagsOpen && addInput) addInput.focus();
+	});
+
+	$effect(() => {
+		if (!open && !tagsOpen) return;
+		const close = (event: KeyboardEvent) => {
+			if (event.key === 'Escape') {
+				open = false;
+				tagsOpen = false;
+			}
+		};
+		window.addEventListener('keydown', close);
+		return () => window.removeEventListener('keydown', close);
+	});
+
+	async function pick(action: 'copy' | 'download') {
+		open = false;
+		if (action === 'download') {
+			await onExport?.('download');
+			return;
+		}
+		await onExport?.('copy');
+		copied = true;
+		clearTimeout(timer);
+		timer = setTimeout(() => (copied = false), 1600);
 	}
 </script>
 
@@ -53,6 +107,116 @@
 			</svg>
 			<span class="ctrl-label">Demos</span>
 		</button>
+	{/if}
+
+	{#if onExport}
+		<div class="wrap">
+			<button
+				type="button"
+				class="ctrl"
+				aria-haspopup="menu"
+				aria-expanded={open}
+				onclick={() => (open = !open)}
+				aria-label={copied ? 'Writeup copied' : 'Export a writeup'}
+			>
+				{#if copied}
+					<svg viewBox="0 0 18 18" width="16" height="16" fill="none" aria-hidden="true">
+						<path
+							d="M4 9.2l3.2 3.2L14 6.2"
+							stroke="currentColor"
+							stroke-width="1.5"
+							stroke-linecap="round"
+							stroke-linejoin="round"
+						/>
+					</svg>
+				{:else}
+					<svg viewBox="0 0 18 18" width="16" height="16" fill="none" aria-hidden="true">
+						<path
+							d="M5.25 2.5h4.75l3.5 3.5V15.5H5.25z"
+							stroke="currentColor"
+							stroke-width="1.4"
+							stroke-linejoin="round"
+						/>
+						<path
+							d="M10 2.5v3.75h3.5"
+							stroke="currentColor"
+							stroke-width="1.4"
+							stroke-linejoin="round"
+						/>
+						<path
+							d="M7.6 9.3l2.4-2.4 2.4 2.4M10 6.9v5"
+							stroke="currentColor"
+							stroke-width="1.3"
+							stroke-linecap="round"
+							stroke-linejoin="round"
+						/>
+					</svg>
+				{/if}
+				<span class="ctrl-label">{copied ? 'Copied' : 'Writeup'}</span>
+			</button>
+
+			{#if open}
+				<div class="menu" role="menu" aria-label="Writeup options">
+					<button
+						role="menuitem"
+						bind:this={firstItem}
+						onclick={() => pick('copy')}
+						aria-label="Copy the writeup as Markdown"
+					>
+						Copy markdown
+					</button>
+					<button
+						role="menuitem"
+						onclick={() => pick('download')}
+						aria-label="Download the writeup as a Markdown file"
+					>
+						Download .md
+					</button>
+				</div>
+				<button
+					type="button"
+					class="backdrop"
+					aria-label="Close menu"
+					onclick={() => (open = false)}
+				></button>
+			{/if}
+		</div>
+	{/if}
+
+	{#if onFlagTags}
+		<div class="wrap">
+			<button
+				type="button"
+				class="ctrl"
+				aria-haspopup="menu"
+				aria-expanded={tagsOpen}
+				onclick={() => (tagsOpen = !tagsOpen)}
+				aria-label="Configure flag formats"
+			>
+				<svg viewBox="0 0 18 18" width="16" height="16" fill="none" aria-hidden="true">
+					<path d="M5.5 2.5v13" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+					<path
+						d="M5.5 3.5h6.4l-1.7 2.5 1.7 2.5H5.5z"
+						stroke="currentColor"
+						stroke-width="1.4"
+						stroke-linejoin="round"
+					/>
+				</svg>
+				<span class="ctrl-label">Flag formats</span>
+			</button>
+
+			{#if tagsOpen}
+				<div class="menu wide" role="menu" aria-label="Flag format presets">
+					<FlagTagEditor tags={flagTags ?? []} onchange={(tags) => onFlagTags?.(tags)} />
+				</div>
+				<button
+					type="button"
+					class="backdrop"
+					aria-label="Close menu"
+					onclick={() => (tagsOpen = false)}
+				></button>
+			{/if}
+		</div>
 	{/if}
 
 	<button
@@ -138,5 +302,57 @@
 		font-size: var(--t-label);
 		font-weight: 600;
 		padding-right: var(--s1);
+	}
+
+	.wrap {
+		position: relative;
+		z-index: 10;
+	}
+
+	.menu {
+		position: absolute;
+		top: calc(100% + var(--s1));
+		right: 0;
+		z-index: 1;
+		min-width: 160px;
+		padding: var(--s1);
+		background: var(--panel-deep);
+		border: 1px solid var(--rule-bright);
+		border-radius: var(--radius);
+	}
+
+	.menu.wide {
+		min-width: 240px;
+	}
+
+	.menu button {
+		display: block;
+		width: 100%;
+		text-align: left;
+		padding: var(--s2) var(--s2);
+		background: none;
+		border: none;
+		border-radius: var(--radius);
+		color: var(--muted);
+		font-size: var(--t-label);
+		cursor: pointer;
+		transition:
+			background-color 120ms var(--ease),
+			color 120ms var(--ease);
+	}
+
+	.menu button:hover,
+	.menu button:focus-visible {
+		background: var(--panel-lift);
+		color: var(--text);
+		outline: none;
+	}
+
+	.backdrop {
+		position: fixed;
+		inset: 0;
+		border: none;
+		background: none;
+		cursor: default;
 	}
 </style>

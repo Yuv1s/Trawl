@@ -99,10 +99,20 @@ export type Sweep = {
 	candidates: SweepCandidate[];
 };
 
+export type IhdrRepair = {
+	declaredWidth: number;
+	declaredHeight: number;
+	recoveredWidth: number;
+	recoveredHeight: number;
+	targetCrc: string;
+	field: 'width' | 'height';
+};
+
 export type Structure = {
 	signature: boolean;
 	size: number;
 	header: Header;
+	ihdrRepair?: IhdrRepair | null;
 	chunks: Chunk[];
 	text: TextChunk[];
 	flags: FlagHit[];
@@ -174,6 +184,8 @@ export type ZipEntry = {
 	text?: string;
 	/** Filled in by the worker: flag shapes found in the decompressed content. */
 	flags?: string[];
+	/** Filled in by the worker when the entry is small enough for in-memory re-analysis. */
+	bytes?: Uint8Array;
 	/** Set when the worker tried to decompress this entry and could not. */
 	readError?: string;
 };
@@ -441,10 +453,18 @@ export type AudioCandidate = {
 	flags: string[];
 };
 
+export type ToneFinding = {
+	kind: 'Morse' | 'DTMF';
+	decoded: string;
+	confidence: number;
+	units: number;
+};
+
 export type AudioSweep = {
 	samples: number;
 	combinations: number;
 	candidates: AudioCandidate[];
+	tones?: ToneFinding[];
 };
 
 export type Spectrogram = {
@@ -503,10 +523,10 @@ export type PlaneWall = {
 };
 
 export type AnalysisRequest =
-	| { kind: 'analyse'; id: number; name: string; bytes: ArrayBuffer }
+	| { kind: 'analyse'; id: number; name: string; bytes: ArrayBuffer; flagTags: string }
 	| { kind: 'plane'; id: number; channel: number; bit: number }
 	| { kind: 'extract'; id: number; channels: string; bit: number; msbFirst: boolean }
-	| { kind: 'peel'; id: number; text: string }
+	| { kind: 'peel'; id: number; text: string; flagTags: string }
 	| { kind: 'extractPalette'; id: number; msbFirst: boolean }
 	| {
 			kind: 'extractJpeg';
@@ -514,7 +534,7 @@ export type AnalysisRequest =
 			includeDc: boolean;
 			msbFirst: boolean;
 	  }
-	| { kind: 'withKey'; id: number; text: string; key: string }
+	| { kind: 'withKey'; id: number; text: string; key: string; flagTags: string }
 	| {
 			kind: 'extractAudio';
 			id: number;

@@ -2,7 +2,7 @@ import init, {
 	aes_probe,
 	chi_square,
 	file_survey,
-	find_flags,
+	find_flags_for_tags,
 	lsb_extract,
 	lsb_sweep,
 	plane,
@@ -14,8 +14,8 @@ import init, {
 	jpeg_stego_extract,
 	palette_extract,
 	palette_stego,
-	mantis_with_key,
-	peel_encodings,
+	mantis_with_key_for_tags,
+	peel_encodings_for_tags,
 	rs_analysis,
 	wav_lsb_extract,
 	wav_lsb_sweep,
@@ -102,7 +102,11 @@ const ZIP_TEXT_PREVIEW = 8192;
  * chunks get. Stored entries are already plain; deflated ones go through the
  * platform's raw inflate.
  */
-async function inflateZipEntries(bytes: Uint8Array, zip: ZipArchive): Promise<void> {
+async function inflateZipEntries(
+	bytes: Uint8Array,
+	zip: ZipArchive,
+	flagTags: string
+): Promise<void> {
 	let opened = 0;
 	for (const entry of zip.entries) {
 		if (opened >= ZIP_ENTRY_LIMIT) break;
@@ -118,7 +122,8 @@ async function inflateZipEntries(bytes: Uint8Array, zip: ZipArchive): Promise<vo
 			const packed = bytes.subarray(entry.dataOffset, end);
 			const raw = entry.method === 'deflate' ? await inflateRaw(packed) : packed;
 
-			entry.flags = (JSON.parse(find_flags(raw)) as Found[]).map((f) => f.text);
+			entry.bytes = raw.slice();
+			entry.flags = (JSON.parse(find_flags_for_tags(raw, flagTags)) as Found[]).map((f) => f.text);
 			if (printableRatio(raw) >= 0.85) {
 				const text = new TextDecoder('utf-8', { fatal: false }).decode(
 					raw.subarray(0, ZIP_TEXT_PREVIEW)
@@ -146,7 +151,11 @@ function readWall(packed: Uint8Array): PlaneWall {
  * platform call. Reporting "content unread" was honest and useless; a flag can
  * sit in a zTXt chunk indefinitely.
  */
-async function inflateTextChunks(bytes: Uint8Array, structure: Structure): Promise<void> {
+async function inflateTextChunks(
+	bytes: Uint8Array,
+	structure: Structure,
+	flagTags: string
+): Promise<void> {
 	for (const chunk of structure.text) {
 		if (!chunk.compressed || chunk.payloadLength === 0) continue;
 
@@ -158,7 +167,7 @@ async function inflateTextChunks(bytes: Uint8Array, structure: Structure): Promi
 
 			// The byte-level scan ran before this text existed, so anything hiding
 			// in a compressed chunk is only visible now.
-			for (const found of JSON.parse(find_flags(raw)) as Found[]) {
+			for (const found of JSON.parse(find_flags_for_tags(raw, flagTags)) as Found[]) {
 				structure.flags.push({
 					offset: chunk.payloadOffset,
 					text: found.text,
@@ -208,7 +217,12 @@ async function pixelInput(bytes: Uint8Array, isPng: boolean): Promise<Uint8Array
 	return isPng ? inflate(png_idat(bytes)) : new Uint8Array();
 }
 
-async function analyse(id: number, name: string, bytes: Uint8Array): Promise<AnalysisResponse> {
+async function analyse(
+	id: number,
+	name: string,
+	bytes: Uint8Array,
+	flagTags: string
+): Promise<AnalysisResponse> {
 	await ready;
 
 	// Byte-level analysis needs no format, so it runs on everything.
@@ -216,11 +230,11 @@ async function analyse(id: number, name: string, bytes: Uint8Array): Promise<Ana
 	const walked = JSON.parse(png_structure(bytes)) as Structure;
 	const structure = walked.signature ? walked : null;
 
-	if (structure) await inflateTextChunks(bytes, structure);
+	if (structure) await inflateTextChunks(bytes, structure, flagTags);
 
 	const wav = JSON.parse(wav_structure(bytes)) as WavStructure | WavError | null;
 	const zip = JSON.parse(zip_structure(bytes)) as ZipArchive | null;
-	if (zip) await inflateZipEntries(bytes, zip);
+	if (zip) await inflateZipEntries(bytes, zip, flagTags);
 	// The key and IV for a decryption can sit in a compressed text chunk, which
 	// the raw bytes do not carry. Text chunks are inflated by now, so the probe
 	// runs over the bytes plus that recovered text and can pair the two.
@@ -341,14 +355,16 @@ async function extract(
 }
 
 /** Mantis. The only request that carries no file: a string is the whole subject. */
-async function peelText(id: number, text: string): Promise<AnalysisResponse> {
+async function peelText(id: number, text: string, flagTags: string): Promise<AnalysisResponse> {
 	await ready;
 
 	return {
 		id,
 		status: 'peel',
 		input: text,
-		peel: JSON.parse(peel_encodings(new TextEncoder().encode(text))) as PeelResult
+		peel: JSON.parse(
+			peel_encodings_for_tags(new TextEncoder().encode(text), flagTags)
+		) as PeelResult
 	};
 }
 
@@ -400,14 +416,21 @@ async function extractAudio(
 	};
 }
 
-async function applyKey(id: number, text: string, key: string): Promise<AnalysisResponse> {
+async function applyKey(
+	id: number,
+	text: string,
+	key: string,
+	flagTags: string
+): Promise<AnalysisResponse> {
 	await ready;
 
 	return {
 		id,
 		status: 'keyed',
 		key,
-		attempts: JSON.parse(mantis_with_key(new TextEncoder().encode(text), key)) as KeyAttempt[]
+		attempts: JSON.parse(
+			mantis_with_key_for_tags(new TextEncoder().encode(text), key, flagTags)
+		) as KeyAttempt[]
 	};
 }
 
@@ -416,9 +439,9 @@ self.addEventListener('message', (event: MessageEvent<AnalysisRequest>) => {
 
 	const work =
 		request.kind === 'peel'
-			? peelText(request.id, request.text)
+			? peelText(request.id, request.text, request.flagTags)
 			: request.kind === 'withKey'
-				? applyKey(request.id, request.text, request.key)
+				? applyKey(request.id, request.text, request.key, request.flagTags)
 				: request.kind === 'plane'
 					? requestPlane(request.id, request.channel, request.bit)
 					: request.kind === 'extract'
@@ -435,7 +458,12 @@ self.addEventListener('message', (event: MessageEvent<AnalysisRequest>) => {
 											request.bit,
 											request.msbFirst
 										)
-									: analyse(request.id, request.name, new Uint8Array(request.bytes));
+									: analyse(
+											request.id,
+											request.name,
+											new Uint8Array(request.bytes),
+											request.flagTags
+										);
 
 	work
 		.then((response) => self.postMessage(response))

@@ -179,6 +179,7 @@ pub struct Candidate {
     /// How much the result reads like ordinary text.
     pub score: f32,
     pub flags: Vec<String>,
+    convincing: bool,
 }
 
 impl Candidate {
@@ -189,7 +190,7 @@ impl Candidate {
     /// enough to rank real finds below nonsense without this.
     fn rank(&self) -> (bool, f32) {
         (
-            self.flags.iter().any(|f| bytes::tag_is_known(f)),
+            self.convincing,
             self.score - self.key.len() as f32 * LENGTH_COST,
         )
     }
@@ -234,14 +235,16 @@ const MIN_SCORE: f32 = 0.5;
 /// Longest repeating key worth hunting for.
 const MAX_KEY: usize = 32;
 
-fn assess(key: Vec<u8>, plaintext: Vec<u8>) -> Option<Candidate> {
-    let flags: Vec<String> = bytes::flag_candidates(&plaintext)
+fn assess(key: Vec<u8>, plaintext: Vec<u8>, tags: &[String]) -> Option<Candidate> {
+    let flags: Vec<String> = bytes::flag_candidates_for_tags(&plaintext, tags)
         .into_iter()
         .map(|f| f.text)
         .collect();
 
     let score = plainness(&plaintext);
-    let convincing = flags.iter().any(|f| bytes::tag_is_known(f));
+    let convincing = flags
+        .iter()
+        .any(|flag| bytes::tag_is_known_for(flag, tags));
     if score < MIN_SCORE && !convincing {
         return None;
     }
@@ -251,13 +254,14 @@ fn assess(key: Vec<u8>, plaintext: Vec<u8>) -> Option<Candidate> {
         plaintext,
         score,
         flags,
+        convincing,
     })
 }
 
 /// Every single-byte key that produced something readable, best first.
-pub fn single_byte(data: &[u8]) -> Vec<Candidate> {
+pub fn single_byte(data: &[u8], tags: &[String]) -> Vec<Candidate> {
     let mut found: Vec<Candidate> = (1..=255u8)
-        .filter_map(|key| assess(vec![key], apply(data, &[key])))
+        .filter_map(|key| assess(vec![key], apply(data, &[key]), tags))
         .collect();
 
     found.sort_by(|a, b| {
@@ -274,7 +278,7 @@ pub fn single_byte(data: &[u8]) -> Vec<Candidate> {
 }
 
 /// The best repeating key, if one produces something readable.
-pub fn repeating(data: &[u8]) -> Option<Candidate> {
+pub fn repeating(data: &[u8], tags: &[String]) -> Option<Candidate> {
     if data.len() < 16 {
         return None;
     }
@@ -285,7 +289,7 @@ pub fn repeating(data: &[u8]) -> Option<Candidate> {
         .filter(|&length| length > 1)
         .filter_map(|length| {
             let key = key_of_length(data, length);
-            assess(key.clone(), apply(data, &key))
+            assess(key.clone(), apply(data, &key), tags)
         })
         // Strictly better, so a tie keeps the earlier candidate. Key lengths
         // arrive shortest first and a multiple decrypts just as well.
@@ -333,10 +337,10 @@ impl Recovery {
     }
 }
 
-pub fn recover(data: &[u8]) -> Recovery {
+pub fn recover(data: &[u8], tags: &[String]) -> Recovery {
     Recovery {
-        single: single_byte(data),
-        repeating: repeating(data),
+        single: single_byte(data, tags),
+        repeating: repeating(data, tags),
     }
 }
 

@@ -81,12 +81,11 @@ pub fn chi_square(file: &[u8], inflated: &[u8], steps: usize) -> Result<String, 
 ///
 /// Exposed so the worker can re-scan text it decompressed itself, using the same
 /// matcher as everything else rather than a second implementation in JS.
-#[wasm_bindgen]
-pub fn find_flags(data: &[u8]) -> String {
+fn flags_json(found: &[bytes::Found]) -> String {
     use json::{push_field, push_number};
 
     let mut out = String::from("[");
-    for (i, found) in bytes::flag_candidates(data).iter().enumerate() {
+    for (i, found) in found.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
@@ -98,6 +97,22 @@ pub fn find_flags(data: &[u8]) -> String {
     }
     out.push(']');
     out
+}
+
+#[wasm_bindgen]
+pub fn find_flags(data: &[u8]) -> String {
+    flags_json(&bytes::flag_candidates(data))
+}
+
+#[wasm_bindgen]
+pub fn find_flags_for_tags(data: &[u8], tags: &str) -> String {
+    let tags: Vec<String> = tags
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect();
+    flags_json(&bytes::flag_candidates_for_tags(data, &tags))
 }
 
 /// Palette findings for an indexed image, as JSON. Null when there is no PLTE.
@@ -177,6 +192,12 @@ pub fn png_structure(file: &[u8]) -> String {
     png::structure_json(file)
 }
 
+#[wasm_bindgen]
+pub fn png_patch_ihdr(file: &[u8], width: u32, height: u32) -> Result<Vec<u8>, JsError> {
+    png::patch_ihdr(file, width, height)
+        .ok_or_else(|| JsError::new("PNG has no complete IHDR chunk"))
+}
+
 /// Concatenated IDAT payloads, to be inflated by `DecompressionStream` on the JS
 /// side and handed straight back to [`png_decode`].
 #[wasm_bindgen]
@@ -206,6 +227,19 @@ pub fn png_dimensions(file: &[u8]) -> Result<Vec<u32>, JsError> {
 #[wasm_bindgen]
 pub fn peel_encodings(data: &[u8]) -> String {
     mantis::json(data)
+}
+
+/// `peel_encodings`, with the caller's configured flag tags steering the cribs
+/// that recover keys underneath an enciphered flag.
+#[wasm_bindgen]
+pub fn peel_encodings_for_tags(data: &[u8], tags: &str) -> String {
+    let tags: Vec<String> = tags
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect();
+    mantis::json_for_tags(data, &tags)
 }
 
 /// AES-CBC decryptions the file decrypts to readable text, as JSON.
@@ -238,6 +272,18 @@ pub fn zip_structure(file: &[u8]) -> String {
 #[wasm_bindgen]
 pub fn mantis_with_key(data: &[u8], key: &str) -> String {
     mantis::keyed::json(&mantis::keyed::with_key(data, key))
+}
+
+/// `mantis_with_key`, with the caller's configured flag tags steering the cribs.
+#[wasm_bindgen]
+pub fn mantis_with_key_for_tags(data: &[u8], key: &str, tags: &str) -> String {
+    let tags: Vec<String> = tags
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect();
+    mantis::keyed::json(&mantis::keyed::with_key_for_tags(data, key, &tags))
 }
 
 /// JPEG coefficient analysis as JSON: the chi-square attack, the coefficient
@@ -317,6 +363,7 @@ pub fn wav_lsb_sweep(file: &[u8], max_bytes: usize) -> Result<String, JsError> {
     Ok(cuttlefish::audio::sweep_json(
         &samples,
         parsed.format.channels,
+        parsed.format.sample_rate,
         max_bytes,
     ))
 }

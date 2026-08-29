@@ -669,7 +669,7 @@ fn a_wordlist_key_is_found_where_the_columns_are_too_thin_to_climb() {
     let cipher = vigenere::encipher(message, b"cryptography");
 
     assert!(
-        vigenere::solve(&cipher).is_none(),
+        vigenere::solve(&cipher, &[]).is_none(),
         "recovery got there alone"
     );
 
@@ -803,7 +803,7 @@ and the map that shows it is folded inside the cover of the green book on the se
             let prose: Vec<u8> = base.repeat(repeats);
             let letters = crate::mantis::ngram::letters(&prose).len();
             let built = vigenere::encipher(&prose, &key);
-            let exact = vigenere::solve(&built)
+            let exact = vigenere::solve(&built, &[])
                 .map(|c| c.plaintext == prose)
                 .unwrap_or(false);
             println!(
@@ -824,7 +824,7 @@ fn recovers_keys_of_several_lengths_from_varied_prose() {
 
     for key in [&b"key"[..], b"lemon", b"palimpsest"] {
         let built = vigenere::encipher(varied, key);
-        let found = vigenere::solve(&built);
+        let found = vigenere::solve(&built, &[]);
         let found =
             found.unwrap_or_else(|| panic!("{:?} was missed", String::from_utf8_lossy(key)));
         assert_eq!(found.key, key.to_vec());
@@ -873,13 +873,13 @@ fn probe_enciphered_flag() {
     let cipher = b"gouj.. zobm{ojfop_nbruq}";
     let r = read(cipher);
 
-    println!("conclusive  {:?}", conclusive(cipher));
+    println!("conclusive  {:?}", conclusive(cipher, &[]));
     println!("plainness   {:.3}", plainness(cipher));
     println!("derived     {} keys", r.derived.len());
     println!("vigenere    {:?}", r.vigenere.is_some());
     println!("letters     {}", ngram::letters(cipher).len());
-    println!("direct derive -> {} keys", vigenere::derive(cipher).len());
-    for d in vigenere::derive(cipher).iter().take(3) {
+    println!("direct derive -> {} keys", vigenere::derive(cipher, &[]).len());
+    for d in vigenere::derive(cipher, &[]).iter().take(3) {
         println!(
             "   {:<8} perCol={} -> {:?}",
             String::from_utf8_lossy(&d.key),

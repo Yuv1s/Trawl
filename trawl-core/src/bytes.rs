@@ -162,11 +162,27 @@ pub const KNOWN_TAGS: [&str; 6] = ["flag", "ctf", "key", "htb", "thm", "pico"];
 /// anywhere inside instead calls `ethtBAN` a flag, because it happens to contain
 /// the letters of HTB, and on a list of decryptions that is not a rare accident.
 pub fn tag_is_known(text: &str) -> bool {
+    tag_is_known_for(text, &[])
+}
+
+pub fn tag_is_known_for(text: &str, tags: &[String]) -> bool {
     let Some(tag) = text.split('{').next() else {
         return false;
     };
-    let lower = tag.to_ascii_lowercase();
-    KNOWN_TAGS.iter().any(|known| lower.ends_with(known))
+    if tags.is_empty() {
+        let lower = tag.to_ascii_lowercase();
+        return KNOWN_TAGS.iter().any(|known| lower.ends_with(known));
+    }
+
+    tags.iter()
+        .any(|known| tag.eq_ignore_ascii_case(known.trim()))
+}
+
+pub fn flag_candidates_for_tags(data: &[u8], tags: &[String]) -> Vec<Found> {
+    flag_candidates(data)
+        .into_iter()
+        .filter(|found| tag_is_known_for(&found.text, tags))
+        .collect()
 }
 
 pub fn flag_candidates(data: &[u8]) -> Vec<Found> {
@@ -886,6 +902,20 @@ mod tests {
     fn flag_candidates_records_the_offset_of_the_tag_not_the_brace() {
         let found = flag_candidates(b"..HTB{abcd}");
         assert_eq!(found[0].offset, 2);
+    }
+
+    #[test]
+    fn configured_flag_tags_match_the_whole_prefix_without_suffix_guessing() {
+        let tags = vec!["picoCTF".to_string(), "event".to_string()];
+        let found = flag_candidates_for_tags(
+            b"picoCTF{first_flag} testCTF{not_selected} event{second_flag}",
+            &tags,
+        );
+        let texts: Vec<&str> = found.iter().map(|found| found.text.as_str()).collect();
+
+        assert_eq!(texts, vec!["picoCTF{first_flag}", "event{second_flag}"]);
+        assert!(tag_is_known_for("PICOctf{case_insensitive}", &tags));
+        assert!(!tag_is_known_for("testCTF{not_selected}", &tags));
     }
 
     #[test]

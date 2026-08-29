@@ -108,6 +108,12 @@ fn settled(attempt: &Attempt) -> bool {
 /// because it does not read like English would defeat the entire point, which is
 /// that the answer may well be a token.
 pub fn with_key(data: &[u8], key: &str) -> Vec<Attempt> {
+    with_key_for_tags(data, key, &[])
+}
+
+/// `with_key`, with the caller's configured flag tags steering the cribs that
+/// recover what sits underneath each attempt.
+pub fn with_key_for_tags(data: &[u8], key: &str, tags: &[String]) -> Vec<Attempt> {
     let mut out = attempts(data, key);
 
     // What is underneath, for the attempts that did not reach the bottom.
@@ -117,7 +123,7 @@ pub fn with_key(data: &[u8], key: &str) -> Vec<Attempt> {
     // guesses is hundreds of key recoveries to answer a question nobody asked.
     for attempt in &mut out {
         if !settled(attempt) {
-            attempt.next = vigenere::derive(&attempt.plaintext);
+            attempt.next = vigenere::derive(&attempt.plaintext, tags);
             attempt.next.truncate(NEXT_KEYS);
         }
     }

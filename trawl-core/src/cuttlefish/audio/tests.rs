@@ -146,7 +146,7 @@ fn does_not_count_the_same_read_twice_on_a_mono_file() {
 #[test]
 fn reports_the_search_space_it_actually_swept() {
     let samples = hide(b"flag{counted}", 2, Some(0), 0, true);
-    let json = sweep_json(&samples, 2, 4096);
+    let json = sweep_json(&samples, 2, 44_100, 4096);
 
     assert!(json.contains("\"combinations\":18"));
     assert!(json.contains("\"channels\":\"left\""));
@@ -156,6 +156,6 @@ fn reports_the_search_space_it_actually_swept() {
 #[test]
 fn writes_null_for_a_read_that_covers_every_channel() {
     let samples = hide(b"flag{every_channel}", 2, None, 0, true);
-    let json = sweep_json(&samples, 2, 4096);
+    let json = sweep_json(&samples, 2, 44_100, 4096);
     assert!(json.contains("\"channelIndex\":null"));
 }

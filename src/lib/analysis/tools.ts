@@ -343,12 +343,14 @@ export function tools(found: Findings): Tool[] {
 		}),
 		sound({
 			id: 'spectrogram',
-			name: 'Spectrogram',
-			measures: 'Draws the sound, in case a picture is hiding in it',
-			status: spectrogram ? 'ready' : 'pending',
-			value: spectrogram
-				? `${spectrogram.seconds.toFixed(1)}s up to ${(spectrogram.maxFrequency / 1000).toFixed(1)} kHz`
-				: 'the clip is too short to draw'
+			name: 'Spectrogram & tones',
+			measures: 'Draws the sound and reads Morse or DTMF tones',
+			status: audio?.tones?.length ? 'hit' : spectrogram ? 'ready' : 'pending',
+			value: audio?.tones?.length
+				? audio.tones!.map((tone) => `${tone.kind}: ${tone.decoded}`).join(' · ')
+				: spectrogram
+					? `${spectrogram.seconds.toFixed(1)}s up to ${(spectrogram.maxFrequency / 1000).toFixed(1)} kHz`
+					: 'the clip is too short to draw'
 		}),
 		sound({
 			id: 'audio-lsb',

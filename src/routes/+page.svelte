@@ -1,6 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { getScannerToken, getTourChoice, setTourChoice } from '$lib';
+	import { matchesFlagTag, readFlagTags, writeFlagTags } from '$lib/flag-config';
+	import { writeupMarkdown } from '$lib/analysis/writeup';
 	import AnalysisWorker from '$lib/worker/analysis.worker?worker';
 	import DropSurface from '$lib/components/DropSurface.svelte';
 	import WebRecon from '$lib/components/WebRecon.svelte';
@@ -69,6 +71,7 @@
 	let tourPending = $state(false);
 	let tourActive = $state(false);
 	let showDownloadPrompt = $state(false);
+	let flagTags = $state<string[]>([]);
 
 	let worker: Worker | null = null;
 	let ticket = 0;
@@ -300,6 +303,7 @@
 	];
 
 	onMount(() => {
+		flagTags = readFlagTags();
 		const address = new URLSearchParams(window.location.search).get('analyse');
 		if (!address) {
 			if (getTourChoice() === null) showTourPrompt = true;
@@ -324,9 +328,30 @@
 		})();
 	});
 
+	function updateFlagTags(tags: string[]) {
+		flagTags = writeFlagTags(tags);
+	}
+
 	function requestPlane(channel: number, bit: number) {
 		openPlane = { channel, bit, pixels: null };
 		ensureWorker().postMessage({ kind: 'plane', id: ticket, channel, bit });
+	}
+
+	function repairIhdr() {
+		if (view.phase !== 'done' || view.result.status !== 'ok') return;
+		const repair = view.result.structure?.ihdrRepair;
+		if (!repair) return;
+
+		const name = `${view.result.name} · repaired`;
+		const id = ++ticket;
+		view = { phase: 'working', name };
+		ensureWorker().postMessage({
+			kind: 'patchIhdr',
+			id,
+			name,
+			width: repair.recoveredWidth,
+			height: repair.recoveredHeight
+		});
 	}
 
 	function requestExtract(channels: string, bit: number, msbFirst: boolean) {
@@ -364,6 +389,25 @@
 	function reset() {
 		keyed = null;
 		view = { phase: 'idle' };
+	}
+
+	/** Hands the current analysis off as Markdown, to the clipboard or as a file. */
+	async function exportWriteup(action: 'copy' | 'download'): Promise<void> {
+		if (view.phase !== 'done' || view.result.status !== 'ok') return;
+		const markdown = writeupMarkdown(view.result, allFlags, sweepFlags);
+
+		if (action === 'copy') {
+			await navigator.clipboard.writeText(markdown);
+			return;
+		}
+
+		const url = URL.createObjectURL(new Blob([markdown], { type: 'text/markdown' }));
+		const link = document.createElement('a');
+		const base = view.result.name.replace(/\.[a-z0-9]+$/i, '') || 'analysis';
+		link.href = url;
+		link.download = `${base}-trawl.md`;
+		link.click();
+		requestAnimationFrame(() => URL.revokeObjectURL(url));
 	}
 
 	function pick(event: Event) {
@@ -465,28 +509,37 @@
 	const current = $derived(built.find((t) => t.id === activeTool) ?? null);
 
 	const allFlags = $derived(survey ? flagsOf(survey, structure) : []);
-	const credibleFlags = $derived(allFlags.filter((f) => f.credible));
+	const credibleFlags = $derived(
+		allFlags.filter((f) => f.credible && matchesFlagTag(f.text, flagTags))
+	);
 	const suppressedFlags = $derived(allFlags.filter((f) => !f.credible));
 	/** Every sweep find, each carrying the name of the sweep that turned it up. */
-	const sweepFlags = $derived([
-		...(sweep?.candidates.flatMap((c) =>
-			c.flags.map((text) => ({ text, origin: 'from the pixel sweep' }))
-		) ?? []),
-		...(audio?.candidates.flatMap((c) =>
-			c.flags.map((text) => ({ text, origin: 'from the audio sweep' }))
-		) ?? []),
-		...(jpeg?.candidates.flatMap((c) =>
-			c.flags.map((text) => ({ text, origin: 'from the JPEG coefficients' }))
-		) ?? []),
-		...(paletteStego?.candidates.flatMap((c) =>
-			c.flags.map((text) => ({ text, origin: 'from the palette indices' }))
-		) ?? []),
-		...(aes?.flatMap((s) => s.flags.map((text) => ({ text, origin: 'from AES decryption' }))) ??
-			[]),
-		...(zip?.entries.flatMap((e) =>
-			(e.flags ?? []).map((text) => ({ text, origin: `from ${e.name}, inside the archive` }))
-		) ?? [])
-	]);
+	const sweepFlags = $derived(
+		[
+			...(sweep?.candidates.flatMap((c) =>
+				c.flags.map((text) => ({ text, origin: 'from the pixel sweep' }))
+			) ?? []),
+			...(audio?.candidates.flatMap((c) =>
+				c.flags.map((text) => ({ text, origin: 'from the audio sweep' }))
+			) ?? []),
+			...(audio?.tones?.flatMap((tone) =>
+				/[A-Za-z0-9_]{3,}\{[^}]{4,}\}/.test(tone.decoded)
+					? [{ text: tone.decoded, origin: `from ${tone.kind} tones` }]
+					: []
+			) ?? []),
+			...(jpeg?.candidates.flatMap((c) =>
+				c.flags.map((text) => ({ text, origin: 'from the JPEG coefficients' }))
+			) ?? []),
+			...(paletteStego?.candidates.flatMap((c) =>
+				c.flags.map((text) => ({ text, origin: 'from the palette indices' }))
+			) ?? []),
+			...(aes?.flatMap((s) => s.flags.map((text) => ({ text, origin: 'from AES decryption' }))) ??
+				[]),
+			...(zip?.entries.flatMap((e) =>
+				(e.flags ?? []).map((text) => ({ text, origin: `from ${e.name}, inside the archive` }))
+			) ?? [])
+		].filter((found) => matchesFlagTag(found.text, flagTags))
+	);
 
 	/** Both sweeps feed one view, so a find looks the same wherever it came from. */
 	const pixelRows = $derived(
@@ -643,7 +696,13 @@
 					</span>
 				{/if}
 				<button type="button" class="reset" onclick={reset} data-tour="new-file">New file</button>
-				<HeaderControls dataTour="theme-github" onDemos={() => (showDownloadPrompt = true)} />
+				<HeaderControls
+					dataTour="theme-github"
+					onDemos={() => (showDownloadPrompt = true)}
+					onExport={view.phase === 'done' ? exportWriteup : undefined}
+					{flagTags}
+					onFlagTags={updateFlagTags}
+				/>
 			</div>
 		</header>
 
@@ -674,7 +733,12 @@
 		{:else if survey}
 			{#if credibleFlags.length > 0 || sweepFlags.length > 0}
 				<div data-tour="recovered">
-					<Recovered candidates={credibleFlags} sources={flagSources} fromPixels={sweepFlags} />
+					<Recovered
+						candidates={credibleFlags}
+						sources={flagSources}
+						fromPixels={sweepFlags}
+						onpeel={acceptText}
+					/>
 				</div>
 			{/if}
 
@@ -731,6 +795,7 @@
 							blocked="The coefficients could not be read, so no sweep ran."
 							error={jpegError}
 							{extracted}
+							onpeel={acceptText}
 						/>
 					{:else if activeTool === 'jpeg-chi' && jpeg}
 						<ChiTrace
@@ -740,7 +805,7 @@
 						/>
 						<CoefficientView {jpeg} />
 					{:else if activeTool === 'spectrogram'}
-						<SpectrogramView {spectrogram} error={audioError} />
+						<SpectrogramView {spectrogram} toneFindings={audio?.tones ?? []} error={audioError} />
 					{:else if activeTool === 'audio-lsb'}
 						<SweepView
 							rows={audioRows}
@@ -749,12 +814,13 @@
 							blocked="The samples could not be read, so no sweep ran."
 							error={audioError}
 							{extracted}
+							onpeel={acceptText}
 						/>
 					{:else if activeTool === 'riff'}
 						<RiffView {wav} />
 					{:else if activeTool === 'archive'}
 						{#if zip}
-							<ZipView archive={zip} />
+							<ZipView archive={zip} onanalyse={analyseBytes} onpeel={acceptText} />
 						{:else}
 							<p class="clear">This file is not a ZIP archive, so there is nothing to read.</p>
 						{/if}
@@ -795,7 +861,12 @@
 							</p>
 						{/if}
 					{:else if activeTool === 'magic'}
-						<MagicList hits={survey.magic} size={survey.size} bytes={view.bytes} />
+						<MagicList
+							hits={survey.magic}
+							size={survey.size}
+							bytes={view.bytes}
+							onanalyse={analyseBytes}
+						/>
 					{:else if activeTool === 'exif'}
 						<ExifView entries={survey.exif} />
 					{:else if activeTool === 'jpeg'}
@@ -833,6 +904,7 @@
 							blocked="Pixels could not be decoded, so no sweep ran."
 							error={pixelError}
 							{extracted}
+							onpeel={acceptText}
 						/>
 						{#if sweep?.candidates.length && chi && !chi.detected}
 							<p class="scale-note">
@@ -842,6 +914,27 @@
 								there is nothing for them to measure, so the sweep is the tool that finds small
 								payloads and they are the tools that size large ones.
 							</p>
+						{/if}
+					{:else if activeTool === 'crc' && structure}
+						{#if structure.ihdrRepair}
+							{@const repair = structure.ihdrRepair}
+							<div class="repair-callout">
+								<div>
+									<span class="label">Recoverable IHDR edit</span>
+									<h3>
+										{repair.field === 'width'
+											? `${repair.declaredWidth} → ${repair.recoveredWidth}px wide`
+											: `${repair.declaredHeight} → ${repair.recoveredHeight}px high`}
+									</h3>
+									<p>
+										The stored IHDR checksum matches those recovered dimensions exactly. Apply them
+										to the bytes and run every tool again.
+									</p>
+								</div>
+								<button type="button" onclick={repairIhdr}>Repair and re-analyse</button>
+							</div>
+						{:else}
+							<p class="clear">Every PNG chunk agrees with its stored checksum.</p>
 						{/if}
 					{:else if activeTool === 'flags'}
 						{#if credibleFlags.length === 0}
@@ -928,11 +1021,16 @@
 									blocked="The pixel data could not be read, so the indices were not swept."
 									error={pixelError}
 									{extracted}
+									onpeel={acceptText}
 								/>
 							</div>
 						{/if}
 					{:else if activeTool === 'strings'}
-						<StringsView total={survey.strings.total} sample={survey.strings.sample} />
+						<StringsView
+							total={survey.strings.total}
+							sample={survey.strings.sample}
+							onpeel={acceptText}
+						/>
 					{:else if activeTool === 'pixels'}
 						<p class="lead">
 							Pixels decode through a hand-written PNG decoder rather than the browser, because a
@@ -1161,6 +1259,49 @@
 		user-select: all;
 	}
 
+	.repair-callout {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto;
+		gap: var(--s5);
+		align-items: end;
+		padding: var(--s4);
+		background: var(--panel-deep);
+		border: 1px solid var(--rule);
+	}
+
+	.repair-callout h3 {
+		margin: var(--s1) 0 var(--s2);
+		font-size: var(--t-mid);
+	}
+
+	.repair-callout p {
+		margin: 0;
+		max-width: 68ch;
+		color: var(--muted);
+		font-size: var(--t-label);
+		line-height: 1.6;
+	}
+
+	.repair-callout button {
+		border: 1px solid var(--signal);
+		background: var(--signal);
+		color: var(--ground);
+		padding: var(--s2) var(--s3);
+		font: inherit;
+		font-weight: 600;
+		cursor: pointer;
+		transition: transform 160ms cubic-bezier(0.2, 0.8, 0.2, 1);
+	}
+
+	.repair-callout button:active {
+		transform: translateY(1px);
+	}
+
+	.repair-callout button:focus-visible {
+		outline: 2px solid var(--signal);
+		outline-offset: 3px;
+	}
+
 	.scale-note {
 		margin: var(--s5) 0 0;
 		padding-top: var(--s3);
@@ -1355,6 +1496,11 @@
 
 		.pane {
 			padding: var(--s4);
+		}
+
+		.repair-callout {
+			grid-template-columns: 1fr;
+			align-items: start;
 		}
 	}
 </style>

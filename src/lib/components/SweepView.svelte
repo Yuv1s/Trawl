@@ -19,7 +19,8 @@
 		over,
 		blocked,
 		error,
-		extracted
+		extracted,
+		onpeel
 	}: {
 		/** Null when the sweep could not run at all. */
 		rows: Row[] | null;
@@ -30,6 +31,7 @@
 		blocked: string;
 		error: string | null;
 		extracted: { label: string; text: string } | null;
+		onpeel?: (text: string) => void;
 	} = $props();
 </script>
 
@@ -80,7 +82,12 @@
 
 	{#if extracted}
 		<section class="extracted">
-			<h3 class="label">Full extraction · {extracted.label}</h3>
+			<div class="extracted-head">
+				<h3 class="label">Full extraction · {extracted.label}</h3>
+				{#if onpeel}
+					<button type="button" onclick={() => onpeel?.(extracted.text)}>Send to Mantis</button>
+				{/if}
+			</div>
 			<pre class="dump mono">{extracted.text}</pre>
 		</section>
 	{/if}
@@ -200,8 +207,26 @@
 		border-top: 1px solid var(--rule);
 	}
 
+	.extracted-head {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: var(--s3);
+		margin-bottom: var(--s2);
+	}
+
 	.extracted h3 {
 		margin: 0;
+	}
+
+	.extracted-head button {
+		background: none;
+		border: 1px solid var(--rule-bright);
+		color: var(--text);
+		font: inherit;
+		font-size: var(--t-label);
+		padding: var(--s1) var(--s2);
+		cursor: pointer;
 	}
 
 	.dump {
