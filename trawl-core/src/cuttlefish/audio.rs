@@ -212,11 +212,10 @@ pub fn detect_morse(samples: &[i32], channels: usize, sample_rate: u32) -> Optio
             decoded.push(' ');
         }
     }
-    if !code.is_empty() {
-        if let Some(letter) = morse_char(&code) {
-            decoded.push(letter);
-            valid += 1;
-        }
+    if !code.is_empty()
+        && let Some(letter) = morse_char(&code) {
+        decoded.push(letter);
+        valid += 1;
     }
     let letters = decoded.chars().filter(|c| !c.is_whitespace()).count();
     (letters >= 2 && valid * 4 >= letters * 3).then_some(ToneFinding {

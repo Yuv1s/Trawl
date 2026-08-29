@@ -58,6 +58,16 @@ answer that is a token rather than a sentence reads like nothing to a scorer, an
 saying so beats picking one at random and sounding sure.
 
 Everything found collects in the Cod-end, the panel at the top of the page.
+Its header carries the list of flag shapes the detectors report against:
+`flag{`, `CTF{`, `key{` and a few more on by default, and you can add your own.
+A button next to it hands the whole analysis back as a Markdown writeup, to the
+clipboard or as a file.
+
+On first load a short tour walks through what to drop in and what to look for.
+The three files it uses are built in your browser, each with a flag hidden a
+different way: in the low bits of an image, in the bytes after the image ends,
+and in the samples of a tone. The same files stay available anytime from the
+page, so there is always something to try before you reach for your own.
 
 A link is the newest kind of input. Remora, the web-exploration half, is for a
 challenge that lives on a site rather than in a file you were handed. A browser

@@ -157,6 +157,19 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
       endpoints that answered. SHA-256 and HMAC are written out here too, nothing
       borrowed
 
+### Onboarding and reporting
+
+- [x] A short guided tour on first load, walking through what to drop in and
+      what to look for, using example files it builds in your browser
+- [x] Three demo files, downloadable anytime from the page: an image with a
+      flag in its low bits, an image with a flag in the bytes after it ends,
+      and a tone with a flag in its samples
+- [x] A list of flag shapes that detectors report against, `flag{`, `CTF{`,
+      `key{` and more, edited in the header and saved with the page
+- [x] A Markdown writeup of the whole analysis, taken to the clipboard or saved
+      as a file, with every candidate and finding listed and generated on your
+      machine, nothing uploaded
+
 ## Next
 
 ### Mantis
