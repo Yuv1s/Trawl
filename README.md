@@ -1,6 +1,6 @@
 ![Trawl](src/lib/assets/TrawlBanner.png)
 
-Live at **[trawl.vercel.app](https://trawl.vercel.app)**.
+Live at **[TBD.com](https://TBD.com)**.
 
 Drop a file into the page, or paste a string, and Trawl looks for whatever is
 hidden in it. Nothing leaves your computer.
