@@ -701,14 +701,14 @@
 		name="description"
 		content="Local CTF toolkit for steganography, cryptography and forensics."
 	/>
-	<link rel="canonical" href="https://trawl.vercel.app/" />
+	<link rel="canonical" href="https://trawlctf.vercel.app/" />
 	<meta property="og:type" content="website" />
 	<meta property="og:title" content="Trawl" />
 	<meta
 		property="og:description"
 		content="Local CTF toolkit for steganography, cryptography and forensics. Nothing leaves your machine."
 	/>
-	<meta property="og:url" content="https://trawl.vercel.app/" />
+	<meta property="og:url" content="https://trawlctf.vercel.app/" />
 	<meta name="twitter:card" content="summary" />
 </svelte:head>
 
