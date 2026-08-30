@@ -247,7 +247,7 @@ pub const CODECS: [Codec; 14] = [
 const MIN_GAIN: f32 = 0.08;
 
 /// How deep a chain will be followed. Real ones are two or three layers.
-const MAX_DEPTH: usize = 6;
+pub const MAX_DEPTH: usize = 6;
 
 /// Beats any plainness score, so a flag always wins.
 const CONCLUSIVE: f32 = 2.0;
@@ -402,9 +402,9 @@ fn candidates(data: &[u8], tags: &[String]) -> Vec<(&'static str, Vec<u8>, bool)
 /// wall of hex digits, which reads no more like English than the base64 did. A
 /// peeler that demands an improvement at every step stops there and never
 /// reaches the sentence underneath.
-fn explore(data: &[u8], seen: &mut Vec<Vec<u8>>, tags: &[String], depth: usize) -> (f32, Vec<Step>) {
+fn explore(data: &[u8], seen: &mut Vec<Vec<u8>>, tags: &[String], depth: usize, depth_budget: usize) -> (f32, Vec<Step>) {
     let here = rate(data, tags);
-    if depth >= MAX_DEPTH || here == CONCLUSIVE || data.len() > MAX_INPUT {
+    if depth >= depth_budget || here == CONCLUSIVE || data.len() > MAX_INPUT {
         return (here, Vec::new());
     }
 
@@ -416,10 +416,9 @@ fn explore(data: &[u8], seen: &mut Vec<Vec<u8>>, tags: &[String], depth: usize) 
         }
 
         seen.push(output.clone());
-        let (reachable, rest) = explore(&output, seen, tags, depth + 1);
+        let (reachable, rest) = explore(&output, seen, tags, depth + 1, depth_budget);
         seen.pop();
 
-        // What this branch is worth, once its own step is paid for.
         let score = reachable - STEP_COST;
         if score <= best.0 {
             continue;
@@ -454,20 +453,15 @@ fn explore(data: &[u8], seen: &mut Vec<Vec<u8>>, tags: &[String], depth: usize) 
 /// is hex whatever it decodes to, and when what it decodes to is a cipher the
 /// search will never take the step because the ciphertext reads no better than
 /// the hex did. Refusing to unwrap it would leave the cipher invisible.
-fn unwrap_structural(data: &[u8], tags: &[String]) -> Vec<Step> {
+pub fn unwrap_structural(data: &[u8], tags: &[String], depth_budget: usize) -> Vec<Step> {
     let mut steps = Vec::new();
     let mut current = data.to_vec();
 
-    while steps.len() < MAX_DEPTH {
-        // Already readable, so this is the answer rather than a wrapper. Pure
-        // hex reads as hex, and "deadbeefdeadbeef" should be left as it is.
+    while steps.len() < depth_budget {
         if plainness(&current) >= ROTATION_BAR {
             break;
         }
 
-        // A digest is the end of the road. Thirty-two hex digits unwrap
-        // perfectly well into sixteen bytes that were never text, and before
-        // this the peeler did exactly that and presented the noise as a result.
         if hashes::is_digest(&current) {
             break;
         }
@@ -505,25 +499,22 @@ fn unwrap_structural(data: &[u8], tags: &[String]) -> Vec<Step> {
 
 /// Peels layer after layer until nothing improves.
 fn peel_with(data: &[u8], tags: &[String]) -> Peel {
-    let mut seen = vec![data.to_vec()];
-    let (score, steps) = explore(data, &mut seen, tags, 0);
+    peel_with_depth(data, tags, MAX_DEPTH)
+}
 
-    // The whole chain has to be worth it, not just the last step of it.
-    //
-    // A chain of purely structural peels counts even when it ends somewhere
-    // unreadable. That is the shape of a cipher wrapped for transport: the hex
-    // comes off cleanly and what is underneath is still encrypted. Demanding a
-    // readability gain there would refuse to unwrap it and leave the cipher
-    // invisible.
+/// Internal peeler that accepts a remaining depth budget.
+/// Used by the worker to share one six-layer budget across Rust and platform layers.
+pub fn peel_with_depth(data: &[u8], tags: &[String], depth_budget: usize) -> Peel {
+    let mut seen = vec![data.to_vec()];
+    let (score, steps) = explore(data, &mut seen, tags, 0, depth_budget);
+
     let structural_only = steps.iter().all(|step| step.structural);
     let worth_it = score == CONCLUSIVE || score >= plainness(data) + MIN_GAIN || structural_only;
 
     let steps = if worth_it && !steps.is_empty() {
         steps
     } else {
-        // Nothing scored its way through, so fall back to what the form alone
-        // justifies. Usually that is nothing at all.
-        unwrap_structural(data, tags)
+        unwrap_structural(data, tags, depth_budget)
     };
 
     if steps.is_empty() {
@@ -540,6 +531,64 @@ fn peel_with(data: &[u8], tags: &[String]) -> Peel {
         steps,
         result,
     }
+}
+
+/// Serialises a Peel (steps + final result) into the JSON shape the worker expects.
+/// Does not re-run attacks — used when the worker has already combined layers.
+pub fn json_from_peel(peel: &Peel) -> String {
+    use crate::json::{push_field, push_number, push_string};
+
+    let mut out = String::from("{");
+
+    push_number(&mut out, "depth", peel.steps.len());
+    out.push(',');
+    push_string(&mut out, "score");
+    out.push_str(&format!(":{:.3}", peel.score));
+    out.push(',');
+    push_field(&mut out, "result", &crate::json::latin1(&peel.result));
+    out.push(',');
+
+    push_string(&mut out, "steps");
+    out.push_str(":[");
+    for (i, step) in peel.steps.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        push_field(&mut out, "encoding", step.encoding);
+        out.push(',');
+        push_field(&mut out, "reason", &step.reason);
+        out.push(',');
+        push_field(&mut out, "output", &crate::json::latin1(&step.output));
+        out.push('}');
+    }
+    out.push_str("],");
+
+    // Empty/null placeholders for attack fields — the worker fills these
+    // after the final pass on the exact tail bytes.
+    push_string(&mut out, "xor");
+    out.push_str(":[],");
+    push_string(&mut out, "vigenere");
+    out.push_str(":null,");
+    push_string(&mut out, "affine");
+    out.push_str(":null,");
+    push_string(&mut out, "transposition");
+    out.push_str(":null,");
+    push_string(&mut out, "substitution");
+    out.push_str(":null,");
+    push_string(&mut out, "derivedKeys");
+    out.push_str(":[],");
+    push_string(&mut out, "dictionary");
+    out.push_str(":null,");
+    push_string(&mut out, "shortlist");
+    out.push_str(":[],");
+    push_string(&mut out, "frequency");
+    out.push(':');
+    out.push_str(&frequency::json(&peel.result));
+    out.push(',');
+    push_string(&mut out, "hash");
+    out.push_str(":null}");
+    out
 }
 
 /// Peels layer after layer until nothing improves, with no configured tags.

@@ -3,13 +3,44 @@ import {
 	isJpegError,
 	isWavError,
 	type AnalysisResponse,
-	type FlagHit
+	type FlagHit,
+	type GifSource,
+	type NestedArtifact
 } from '$lib/worker/protocol';
 
 type Analysis = Extract<AnalysisResponse, { status: 'ok' }>;
 
 const clean = (value: string) => value.replaceAll('\r', '').replaceAll('```', "''' ");
 const list = (items: string[]) => items.map((item) => `- ${item}`).join('\n');
+
+/** One line per embedded file, including the ones a budget stopped. */
+function nestedArtifacts(roots: NestedArtifact[], path: string): string[] {
+	const out: string[] = [];
+	for (const artifact of roots) {
+		const here = path ? `${path} / ${artifact.name}` : artifact.name;
+		const status =
+			artifact.status === 'analysed'
+				? `analysed, ${artifact.findings.length} finding${artifact.findings.length === 1 ? '' : 's'} here`
+				: (artifact.reason ?? artifact.status);
+		out.push(`${here} (${status})`);
+		out.push(...nestedArtifacts(artifact.children, here));
+	}
+	return out;
+}
+
+/** The detectors that can flag a frame or a difference. */
+function gifSourceHits(source: GifSource): string[] {
+	const out: string[] = [];
+	for (const candidate of source.lsb.candidates)
+		out.push(
+			`${candidate.channels} ${candidate.bit} ${candidate.msbFirst ? 'MSB' : 'LSB'} first: ${clean(candidate.reason)}`
+		);
+	if (source.chi?.detected)
+		out.push(`chi-square ~${(source.chi.embeddedFraction * 100).toFixed(1)}% embedded`);
+	if (source.rs?.detected)
+		out.push(`RS ~${(source.rs.rate * 100).toFixed(1)}% of low bits embedded`);
+	return out;
+}
 
 export function writeupMarkdown(
 	analysis: Analysis,
@@ -106,6 +137,29 @@ export function writeupMarkdown(
 		'## Carved and archived artifacts',
 		archive.length ? list(archive) : 'No ZIP entries.'
 	);
+
+	const childInventory = nestedArtifacts(analysis.nested?.roots ?? [], '');
+	if (childInventory.length) {
+		sections.push('', '## Nested artifacts');
+		if (analysis.nested?.capped)
+			sections.push('_The recursive walk stopped early against a depth, count, or byte budget._');
+		sections.push(list(childInventory));
+	}
+
+	if (analysis.gif && !analysis.gif.error) {
+		const frames = analysis.gif.sources.filter((s) => s.kind === 'frame').length;
+		const diffs = analysis.gif.sources.filter((s) => s.kind === 'difference').length;
+		const lead = `${analysis.gif.declaredFrames} frames declared, ${analysis.gif.analysedFrames} analysed (${frames} shown)${diffs ? `, ${diffs} consecutive differences` : ''}${analysis.gif.capped ? ', capped at work budget' : ''}`;
+		const gifLines = [lead];
+		for (const source of analysis.gif.sources) {
+			const label =
+				source.kind === 'frame'
+					? `frame ${source.from}`
+					: `frames ${source.from} to ${source.to} difference`;
+			gifLines.push(...gifSourceHits(source).map((hit) => `${label}: ${hit}`));
+		}
+		sections.push('', '## GIF frames', list(gifLines));
+	}
 
 	const wav = analysis.wav && !isWavError(analysis.wav) ? analysis.wav : null;
 	if (wav)

@@ -7,7 +7,8 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 ### Reading things
 
 - [x] PNG, all colour types and bit depths, interlaced or not
-- [x] BMP and GIF
+- [x] BMP and GIF, every frame of an animation and the difference between each
+      pair, each run through the steganography detectors in their own right
 - [x] WAV, 8 through 32-bit, mono or multichannel
 - [x] JPEG structure, and the compressed numbers underneath it, baseline or
       progressive
@@ -24,6 +25,10 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 - [x] Reading inside the archive too: each entry inflated and scanned, so a flag
       in a file inside the zip, including one appended to a PNG, shows in place
       without saving it out and unzipping it first
+- [x] Recursive embedded-file analysis: ZIP entries and carved files are
+      automatically scanned through the same pipelines. A shared budget limits
+      depth (3), total children (32), per-child bytes (1 MiB), and aggregate
+      bytes (8 MiB). Skipped and errored children are reported in place.
 
 ### Cuttlefish, the steganography half
 
@@ -44,7 +49,10 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 
 ### Mantis, the cryptography half
 
-- [x] Spot an encoding and peel it, over and over, until plain text falls out
+- [x] Spot an encoding and peel it, over and over, until plain text falls out,
+      and keep going through compression: when a layer peels to a gzip or zlib
+      stream, the layer is inflated in the browser and peeled after, within the
+      same layer budget, until plain text falls out
 - [x] Sixteen encodings: base64, base58, base32, ascii85, hex, morse, binary,
       uuencode, quoted-printable and the rest
 - [x] Caesar, solved rather than applied: every shift tried, the readable one
@@ -161,9 +169,10 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 
 - [x] A short guided tour on first load, walking through what to drop in and
       what to look for, using example files it builds in your browser
-- [x] Three demo files, downloadable anytime from the page: an image with a
-      flag in its low bits, an image with a flag in the bytes after it ends,
-      and a tone with a flag in its samples
+- [x] Seven demo and practice files, runnable or downloadable anytime from the
+      page: three generated flag samples, a picture drawn into a WAV
+      spectrogram, that WAV with text in its low bits, and a clean/modified PNG
+      pair for checking duplicate palette entries
 - [x] A list of flag shapes that detectors report against, `flag{`, `CTF{`,
       `key{` and more, edited in the header and saved with the page
 - [x] A Markdown writeup of the whole analysis, taken to the clipboard or saved

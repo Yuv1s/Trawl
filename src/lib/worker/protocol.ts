@@ -217,6 +217,8 @@ export type PeelStep = {
 	/** Why it was kept: a gain in readability, a flag, or a file signature. */
 	reason: string;
 	output: string;
+	/** Set when the step was a gzip or zlib decompression done by the platform. */
+	compressed?: boolean;
 };
 
 /** A recovered XOR key and what it decrypted to. */
@@ -522,6 +524,86 @@ export type PlaneWall = {
 	thumbnails: Uint8Array;
 };
 
+/** One compact result for a displayed GIF frame or a consecutive pair. */
+export type GifSource = {
+	kind: 'frame' | 'difference';
+	/** One-based frame this source came from. */
+	from: number;
+	/** Present only for a difference: the earlier frame it is measured against. */
+	to: number | null;
+	/** Delay in hundredths of a second, and the disposal method, for a plain frame. */
+	delay: number | null;
+	disposal: string | null;
+	/** LSB sweep over this exact frame or difference. */
+	lsb: Sweep;
+	/** The chi-square verdict over the same pixels. */
+	chi: { detected: boolean; embeddedFraction: number } | null;
+	/** The RS verdict over the same pixels. */
+	rs: { detected: boolean; rate: number } | null;
+};
+
+/**
+ * What automatic frame analysis found, for GIF files.
+ *
+ * Compact on purpose: the per-frame pixels and plane walls stay behind, and a
+ * frame worth a closer look gets the ordinary full analysis.
+ */
+export type GifAnalysis = {
+	width: number;
+	height: number;
+	declaredFrames: number;
+	analysedFrames: number;
+	/** True when a work budget stopped the walk before every frame. */
+	capped: boolean;
+	/** Why no frame could be read, when the file is a GIF this reader refuses. */
+	error: string | null;
+	sources: GifSource[];
+};
+
+/** One finding recovered from a nested file, headed back to the root by origin. */
+export type DerivedFinding = {
+	text: string;
+	/** The detector that reported it, in words a person would use. */
+	detector: string;
+	/** Path from the root down: `outer.zip / images/clue.gif`. */
+	origin: string;
+	/** Short reason or preview where the detector offers one. */
+	reason: string;
+};
+
+/** One automatically analysed child of the root file. */
+export type NestedArtifact = {
+	/** Stable across the analysis, and unique within it. */
+	id: string;
+	name: string;
+	/** Where the child came from inside its parent. */
+	source: 'zip' | 'carved';
+	/** Offset in the parent: a local header for a ZIP entry, the marker for a carved file. */
+	offset: number;
+	format: string | null;
+	size: number;
+	depth: number;
+	status: 'analysed' | 'skipped' | 'error';
+	/** Set when status is not `analysed`: what stopped the walk. */
+	reason?: string;
+	/** This child's findings and everything below it. */
+	findings: DerivedFinding[];
+	children: NestedArtifact[];
+};
+
+/** Budget accounting for the recursive walk over embedded files. */
+export type NestedAnalysis = {
+	roots: NestedArtifact[];
+	/** Files fully analysed, across the whole tree. */
+	analysed: number;
+	/** Files skipped without a full run. */
+	skipped: number;
+	/** Child bytes decompressed or carved, tracked against the aggregate cap. */
+	expandedBytes: number;
+	/** True when a depth, count, per-file, or aggregate budget stopped the walk. */
+	capped: boolean;
+};
+
 export type AnalysisRequest =
 	| { kind: 'analyse'; id: number; name: string; bytes: ArrayBuffer; flagTags: string }
 	| { kind: 'plane'; id: number; channel: number; bit: number }
@@ -571,6 +653,10 @@ export type AnalysisResponse =
 			spectrogram: Spectrogram | null;
 			pixelError: string | null;
 			audioError: string | null;
+			/** Recursive analysis of files inside this file; null only when nothing was attempted. */
+			nested: NestedAnalysis | null;
+			/** Automatic per-frame and per-difference analysis for GIF files. */
+			gif: GifAnalysis | null;
 	  }
 	| { id: number; status: 'peel'; input: string; peel: PeelResult }
 	| { id: number; status: 'keyed'; key: string; attempts: KeyAttempt[] }

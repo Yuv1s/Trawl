@@ -60,7 +60,7 @@ const MAX_INPUT: usize = 4096;
 const MIN_INPUT: usize = 4;
 
 fn judge(how: String, text: Vec<u8>) -> Reading {
-    let steps = unwrap_structural(&text, &[]);
+    let steps = unwrap_structural(&text, &[], 6);
 
     let then = (!steps.is_empty()).then(|| {
         let result = steps.last().map(|s| s.output.clone()).unwrap_or_default();

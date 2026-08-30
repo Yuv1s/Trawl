@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { getScannerToken, getTourChoice, setTourChoice } from '$lib';
-	import { matchesFlagTag, readFlagTags, writeFlagTags } from '$lib/flag-config';
+	import { flagTagsParameter, matchesFlagTag, readFlagTags, writeFlagTags } from '$lib/flag-config';
 	import { writeupMarkdown } from '$lib/analysis/writeup';
 	import AnalysisWorker from '$lib/worker/analysis.worker?worker';
 	import DropSurface from '$lib/components/DropSurface.svelte';
@@ -19,6 +19,7 @@
 	import Recovered from '$lib/components/Recovered.svelte';
 	import ChunkList from '$lib/components/ChunkList.svelte';
 	import ZipView from '$lib/components/ZipView.svelte';
+	import GifFramesView from '$lib/components/GifFramesView.svelte';
 	import HexView from '$lib/components/HexView.svelte';
 	import StringsView from '$lib/components/StringsView.svelte';
 	import SweepView from '$lib/components/SweepView.svelte';
@@ -33,7 +34,7 @@
 	import ExifView from '$lib/components/ExifView.svelte';
 	import PaletteView from '$lib/components/PaletteView.svelte';
 	import JpegView from '$lib/components/JpegView.svelte';
-	import { flagsOf, PLANNED, tools, WRITTEN_BY_HAND } from '$lib/analysis/tools';
+	import { flagsOf, nestedFindings, PLANNED, tools, WRITTEN_BY_HAND } from '$lib/analysis/tools';
 	import {
 		COLOR_TYPES,
 		isHeaderError,
@@ -72,6 +73,11 @@
 	let tourActive = $state(false);
 	let showDownloadPrompt = $state(false);
 	let flagTags = $state<string[]>([]);
+
+	/** Join current flag tags into the single string the worker expects. */
+	function flagTagsString(): string {
+		return flagTagsParameter(flagTags);
+	}
 
 	let worker: Worker | null = null;
 	let ticket = 0;
@@ -182,14 +188,27 @@
 		const id = ++ticket;
 		keyed = null;
 		view = { phase: 'working', name: 'pasted text' };
-		ensureWorker().postMessage({ kind: 'peel', id, text });
+		const req = {
+			kind: 'peel',
+			id,
+			text,
+			flagTags: flagTagsString()
+		} satisfies import('$lib/worker/protocol').AnalysisRequest;
+		ensureWorker().postMessage(req);
 	}
 
 	/** Applies a key the reader already has, which no amount of text would give up. */
 	function requestKey(key: string) {
 		if (view.phase !== 'text') return;
 		keyed = null;
-		ensureWorker().postMessage({ kind: 'withKey', id: ticket, text: view.input, key });
+		const req = {
+			kind: 'withKey',
+			id: ticket,
+			text: view.input,
+			key,
+			flagTags: flagTagsString()
+		} satisfies import('$lib/worker/protocol').AnalysisRequest;
+		ensureWorker().postMessage(req);
 	}
 
 	async function accept(file: File) {
@@ -208,7 +227,14 @@
 
 		const copy = bytes.slice();
 		pending = Promise.resolve(copy);
-		ensureWorker().postMessage({ kind: 'analyse', id, name, bytes: copy.buffer });
+		const req = {
+			kind: 'analyse',
+			id,
+			name,
+			bytes: copy.buffer,
+			flagTags: flagTagsString()
+		} satisfies import('$lib/worker/protocol').AnalysisRequest;
+		ensureWorker().postMessage(req);
 	}
 
 	/** Where the scanner listens, for a tab opened to analyse a target's image. */
@@ -474,6 +500,14 @@
 		view.phase === 'done' && view.result.status === 'ok' ? view.result.zip : null
 	);
 
+	const nested = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.nested : null
+	);
+
+	const gif = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.gif : null
+	);
+
 	const aes = $derived(view.phase === 'done' && view.result.status === 'ok' ? view.result.aes : []);
 
 	const audioError = $derived(
@@ -502,7 +536,9 @@
 					audio,
 					spectrogram,
 					zip,
-					aes
+					aes,
+					nested,
+					gif
 				})
 			: []
 	);
@@ -514,31 +550,54 @@
 	);
 	const suppressedFlags = $derived(allFlags.filter((f) => !f.credible));
 	/** Every sweep find, each carrying the name of the sweep that turned it up. */
+	/** One line per distinct flag in the cod-end. The same flag read two ways, a
+	 *  GIF frame and the difference that also carries it, collapses to the first. */
+	function uniqueByText<T extends { text: string }>(items: T[]): T[] {
+		const out: T[] = [];
+		for (const item of items) if (!out.some((kept) => kept.text === item.text)) out.push(item);
+		return out;
+	}
+
 	const sweepFlags = $derived(
-		[
-			...(sweep?.candidates.flatMap((c) =>
-				c.flags.map((text) => ({ text, origin: 'from the pixel sweep' }))
-			) ?? []),
-			...(audio?.candidates.flatMap((c) =>
-				c.flags.map((text) => ({ text, origin: 'from the audio sweep' }))
-			) ?? []),
-			...(audio?.tones?.flatMap((tone) =>
-				/[A-Za-z0-9_]{3,}\{[^}]{4,}\}/.test(tone.decoded)
-					? [{ text: tone.decoded, origin: `from ${tone.kind} tones` }]
-					: []
-			) ?? []),
-			...(jpeg?.candidates.flatMap((c) =>
-				c.flags.map((text) => ({ text, origin: 'from the JPEG coefficients' }))
-			) ?? []),
-			...(paletteStego?.candidates.flatMap((c) =>
-				c.flags.map((text) => ({ text, origin: 'from the palette indices' }))
-			) ?? []),
-			...(aes?.flatMap((s) => s.flags.map((text) => ({ text, origin: 'from AES decryption' }))) ??
-				[]),
-			...(zip?.entries.flatMap((e) =>
-				(e.flags ?? []).map((text) => ({ text, origin: `from ${e.name}, inside the archive` }))
-			) ?? [])
-		].filter((found) => matchesFlagTag(found.text, flagTags))
+		uniqueByText(
+			[
+				...(sweep?.candidates.flatMap((c) =>
+					c.flags.map((text) => ({ text, origin: 'from the pixel sweep' }))
+				) ?? []),
+				...(audio?.candidates.flatMap((c) =>
+					c.flags.map((text) => ({ text, origin: 'from the audio sweep' }))
+				) ?? []),
+				...(audio?.tones?.flatMap((tone) =>
+					/[A-Za-z0-9_]{3,}\{[^}]{4,}\}/.test(tone.decoded)
+						? [{ text: tone.decoded, origin: `from ${tone.kind} tones` }]
+						: []
+				) ?? []),
+				...(jpeg?.candidates.flatMap((c) =>
+					c.flags.map((text) => ({ text, origin: 'from the JPEG coefficients' }))
+				) ?? []),
+				...(paletteStego?.candidates.flatMap((c) =>
+					c.flags.map((text) => ({ text, origin: 'from the palette indices' }))
+				) ?? []),
+				...(gif?.sources.flatMap((source) => {
+					const origin =
+						source.kind === 'frame'
+							? `GIF frame ${source.from}`
+							: `the difference between GIF frames ${source.to} and ${source.from}`;
+					return source.lsb.candidates.flatMap((c) =>
+						c.flags.map((text) => ({ text, origin: `from ${origin}` }))
+					);
+				}) ?? []),
+				...(aes?.flatMap((s) => s.flags.map((text) => ({ text, origin: 'from AES decryption' }))) ??
+					[]),
+				...(zip?.entries.flatMap((e) =>
+					(e.flags ?? []).map((text) => ({ text, origin: `from ${e.name}, inside the archive` }))
+				) ?? []),
+				...nestedFindings(nested?.roots ?? []).map((found) => ({
+					text: found.text,
+					origin: `from ${found.origin}`
+				}))
+			].filter((found) => matchesFlagTag(found.text, flagTags))
+		)
 	);
 
 	/** Both sweeps feed one view, so a find looks the same wherever it came from. */
@@ -820,10 +879,12 @@
 						<RiffView {wav} />
 					{:else if activeTool === 'archive'}
 						{#if zip}
-							<ZipView archive={zip} onanalyse={analyseBytes} onpeel={acceptText} />
+							<ZipView archive={zip} {nested} onanalyse={analyseBytes} onpeel={acceptText} />
 						{:else}
 							<p class="clear">This file is not a ZIP archive, so there is nothing to read.</p>
 						{/if}
+					{:else if activeTool === 'gif'}
+						<GifFramesView {gif} {nested} />
 					{:else if activeTool === 'aes'}
 						{#if aes.length === 0}
 							<p class="clear">
@@ -865,6 +926,7 @@
 							hits={survey.magic}
 							size={survey.size}
 							bytes={view.bytes}
+							{nested}
 							onanalyse={analyseBytes}
 						/>
 					{:else if activeTool === 'exif'}

@@ -1,10 +1,12 @@
-# Trawl — Build Plan
+# Trawl build brief
 
-A browser-based toolkit for the file-based CTF categories: steganography, cryptography, and
-forensics. Drop a file or paste a string, and every relevant check runs locally.
+A browser-based toolkit for file-based CTF categories and guarded web exploration. Drop a file,
+paste a string, or connect the local Remora scanner to a target, and every relevant check runs.
+File and string analysis stay on the machine.
 
-This document is the brief for an AI coding agent working with me on this project. Read all of it
-before writing code.
+This document began as the build plan and now records the product constraints and architecture for
+an AI coding agent working on this project. Read all of it before writing code. Current feature
+status lives in `ROADMAP.md`; this brief explains why the project is built the way it is.
 
 ---
 
@@ -60,12 +62,13 @@ For an experienced player that's fifteen minutes of muscle memory. For a beginne
 they skip these categories entirely. They don't know the tools exist, let alone which one to reach
 for.
 
-**Trawl is one interface that runs all of it at once, in a browser tab, on files that never leave
-the machine.**
+**Trawl is one interface that runs the applicable checks at once. Dropped files and pasted text never
+leave the machine.**
 
 That last part matters more than it sounds. CTF files are often from private or paid competitions,
-and the existing web-based tools upload to someone's server. Trawl does everything client-side.
-There is no backend to upload to.
+and the existing web-based tools upload to someone's server. Trawl's file and text analysis runs in
+the browser. Remora reaches only the web target the user names, through a local scanner rather than a
+hosted backend.
 
 ## 3. Who it's for
 
@@ -95,8 +98,9 @@ goes at the bottom, collapsed.
 **Explain the verdict.** Every finding states what was measured and what it means. A confidence
 number with no explanation is worse than nothing, because it can't be argued with.
 
-**No installation, no upload, no account.** Static site. Works offline after first load. Works on a
-locked-down competition laptop.
+**No installation for offline analysis, no upload, no account.** The static page works offline after
+first load and on a locked-down competition laptop. Remora is the one exception: web challenges need
+the small local scanner because reaching the target is the work.
 
 **Never modify the user's file.** Read-only, always.
 
@@ -191,19 +195,24 @@ These are the tells. Avoid all of them:
 │      │ calls                                          │    │
 │      ▼                                                │    │
 │  trawl-core (Rust → WASM)                             │    │
-│    ├── bytes/     shared: magic scan, entropy,        │    │
-│    │              strings, carving                    │    │
-│    ├── cuttlefish/  steg: bit planes, LSB sweep,      │    │
-│    │              chi-square, RS analysis             │    │
-│    ├── crypto/    ciphers, XOR, RSA, scoring          │    │
-│    └── forensics/ ZIP, PDF, registry hives            │    │
+│    ├── bytes.rs    magic scan, entropy, strings,      │    │
+│    │               checksums and carving              │    │
+│    ├── cuttlefish/ image and audio steganography      │    │
+│    ├── mantis/     encodings, ciphers, XOR, RSA       │    │
+│    └── parsers     PNG, GIF, JPEG, WAV, ZIP and EXIF  │    │
 └────────────────────────────────────────────────────────────┘
+
+trawl-scan (native Rust process)
+    └── Remora: guarded fetch, crawl, decode and active probes
 ```
 
-The Rust crate is `trawl-core`. Cuttlefish is a module inside it, not the name of the engine.
+The offline Rust crate is `trawl-core`. Cuttlefish and Mantis are modules inside it. Network access
+belongs to the separate `trawl-scan` crate, which runs on the user's machine and exposes Remora to
+the page through a token-protected loopback service.
 
-**Shared code matters here.** Magic byte scanning, entropy windowing, and string extraction are used
-by both the steganography and forensics paths. They live in `bytes/` and are written once.
+**Shared code matters here.** Magic byte scanning, entropy windowing, string extraction, checksums,
+and carving live in `bytes.rs` and are written once. Format parsers stay at the crate root or under
+their format module rather than being duplicated under category folders.
 
 **Why Rust/WASM and not just JavaScript:** RS analysis over a 12-megapixel image is roughly 100
 million pixel-group evaluations, and the LSB parameter sweep multiplies that across ~64 parameter
@@ -211,8 +220,9 @@ combinations. Substitution cipher hill climbing runs tens of thousands of scored
 real compute, and JS will stutter badly. This is an engineering justification I can defend, not
 decoration.
 
-**Why a Web Worker:** the UI must stay responsive while a sweep runs, and results must stream in
-progressively rather than appearing all at once at the end.
+**Why a Web Worker:** the UI stays responsive while a sweep runs. The current worker returns the
+completed analysis in one response; if future work streams partial results, keep the same message
+boundary rather than moving analysis onto the UI thread.
 
 **Rust scope discipline:** the core is pure functions over `&[u8]` and `&str`. No async, no traits,
 no generics unless genuinely needed, no lifetime gymnastics. Slice in, struct out. If a piece of
@@ -228,29 +238,22 @@ Canvas `getImageData` will silently corrupt least-significant bits through color
 alpha premultiplication. For a steganography tool this is fatal, because it destroys exactly the
 data we're looking for.
 
-v1 mitigation, required:
+PNG pixel analysis uses the hand-written Rust decoder in `trawl-core/src/png.rs`. The browser's
+`DecompressionStream` supplies inflate, then Trawl unfilters and expands every sample itself. The
+fidelity tests include bit 0 and translucent input, so canvas premultiplication cannot quietly enter
+the PNG path.
 
-```js
-const bitmap = await createImageBitmap(blob, {
-	colorSpaceConversion: 'none',
-	premultiplyAlpha: 'none'
-});
-```
-
-Then verify: build a test PNG with a known 1-bit-plane pattern, round-trip it through the decode
-path, and assert the bits survive. **Write this test before writing any analysis.** Use a 1-bit
-fixture specifically, since a payload spread across 3 bits per channel can survive corruption that
-destroys bit 0 alone, and would pass a test that should fail.
-
-If the browser path proves unreliable, escalate to a hand-rolled PNG decoder in Rust (inflate plus
-unfilter). More work, but exact, and a strong addition to the project in its own right.
+Other formats still use `createImageBitmap` with color conversion and alpha premultiplication
+disabled. That route is suitable for display and format coverage, but not for any detector that
+claims the low bits of translucent pixels are exact.
 
 ---
 
 ## 7. Scope
 
-Three categories. Steganography ships first and completely, then crypto, then forensics. Do not
-start a category before the previous one passes its tests.
+Steganography, cryptography, and guarded web exploration are working today. Forensics has ZIP and
+metadata coverage but remains the unfinished category. `ROADMAP.md` is the source of truth for what
+is done and what remains.
 
 ### v1 — steganography (Cuttlefish)
 
@@ -271,6 +274,8 @@ start a category before the previous one passes its tests.
 - Bit-plane extraction: 8 planes × up to 4 channels, each renderable as a 1-bit image
 - LSB parameter sweep across channel order, bit order, bit plane, and traversal direction
 - Palette analysis for PNG-8/GIF: duplicate entries, ordering anomalies
+- All-frame GIF analysis: every composited displayed frame and each consecutive difference run through
+  the same detectors, budgeted to 128 frames and capped counts
 
 **Steganalysis**
 
@@ -287,6 +292,8 @@ start a category before the previous one passes its tests.
 
 - Encoding chain detection and automatic peeling: base64, base32, base85, hex, URL, HTML entities,
   ROT47, morse, binary. Detect, decode, repeat until the output stops scoring as encoded.
+- Compression-aware peeling: when a layer peels to a gzip or zlib stream, the stream is inflated in
+  the browser and peeled after, sharing the same six-layer budget; cycles and bomb bounds stop the walk.
 - Caesar/ROT-N solved by scoring all 26 shifts against English quadgram log-probabilities
 - Vigenère: key length from index of coincidence and Kasiski examination, then per-column solve
 - Simple substitution by hill climbing against the quadgram model
@@ -297,24 +304,30 @@ start a category before the previous one passes its tests.
 
 ### v3 — forensics
 
-- File carving: locate by signature, extract to a downloadable blob
-- ZIP central directory walker: encrypted entries, size mismatches, comments
-- PDF object and stream walker
-- Windows registry hive parser aimed at USB artifacts: `USBSTOR`, mounted device GUIDs, timestamps
+- [x] File carving: locate by signature and extract to a downloadable blob
+- [x] ZIP local-header and central-directory comparison, including hidden entries, mismatches,
+      comments, recursive scanning, and inflate
+- [x] Recursive embedded-file analysis: ZIP entries and carved files scanned with the same checks,
+      budgeted to depth 3, 32 children, 1 MiB per child, and 8 MiB expanded in total
+- [ ] PDF object and stream walker
+- [ ] Windows registry hive parser aimed at USB artifacts: `USBSTOR`, mounted device GUIDs, timestamps
 
 ### Later
 
-- WAV: LSB extraction, and an FFT spectrogram (hidden images in spectrograms are a CTF staple)
-- JPEG DCT coefficient analysis for JSteg and F5 detection
 - Sample Pair Analysis as a third estimator to cross-check chi-square and RS
 - Embedding mode, to generate practice challenges
-- Hand-rolled PNG decoder in Rust for guaranteed bit fidelity
+
+WAV LSB extraction, the FFT spectrogram, JSteg coefficient extraction, and the exact Rust PNG
+decoder have shipped. F5 detection remains open because its published comparison needs a
+re-compressed copy of the original; see `ROADMAP.md`.
 
 ### Explicitly out of scope
 
-No accounts, no cloud, no history, no sharing, no CLI.
+No accounts, no cloud storage, no history, and no sharing.
 
-No pwn or web categories. Both need a live remote target, which a static page cannot provide.
+No pwn. It needs a persistent live target. Web challenges are covered only through Remora, a separate
+scanner the user starts on their own machine, because a static page cannot reach an arbitrary target
+safely on its own.
 
 No password cracking against steghide or encrypted archives. Wordlist attacks belong on hardware the
 user controls.
@@ -377,9 +390,9 @@ trace**: chi-square plotted against byte offset, drawn as an oscilloscope line i
 sequential embedding appears as a visible cliff at the payload boundary. Nothing else on the page
 competes with these two things.
 
-**Motion** — one orchestrated moment only. Detectors finish at different speeds, so let results
-stream into the triage panel as they land, and let the suspicion trace draw left-to-right as the
-chi-square sweep advances. That's motion encoding real progress. Everything else is static.
+**Motion** — use it only for real state changes: loading, moving between tools, opening a dialog, or
+drawing a trace whose position carries data. The current analysis arrives as one worker response, so
+do not fake staggered detector completion. Everything else stays static.
 
 **Copy** — plain and declarative. "34% of the image shows sequential LSB embedding." Not "Suspicious
 activity detected". An empty triage panel says what was checked and found clean, not "No results".
@@ -392,7 +405,8 @@ activity detected". An empty triage panel says what was checked and found clean,
 - `README.md` explains the math, not just the install steps. Diagrams over prose where possible.
 - A `/fixtures` directory with the test inputs and a script that generates them, so anyone can
   reproduce the test results. Checked-in binaries with no provenance are not acceptable.
-- `docs/` for devlogs — I'm writing these as I go, and they're part of the deliverable.
+- `README.md` and `ROADMAP.md` carry the public project record. Do not invent a parallel docs tree
+  unless a real document needs it.
 - MIT license.
 
 ## 10. How I want you to work

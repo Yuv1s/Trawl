@@ -65,6 +65,13 @@ function withTextChunk(png: Uint8Array, keyword: string, text: string): Uint8Arr
 }
 
 export type SampleFile = { name: string; bytes: Uint8Array; mime: string };
+export type SampleEntry = {
+	name: string;
+	mime: string;
+	blurb: string;
+	build?: () => SampleFile;
+	url?: string;
+};
 
 /** A cover image with a flag hidden in its low bits, built from source at
  *  tour time instead of shipped as a binary. Nothing here is uploaded, and
@@ -112,21 +119,64 @@ export function buildAudioDemo(): SampleFile {
 	};
 }
 
-export const SAMPLE_FILES: { build: () => SampleFile; blurb: string }[] = [
+export const SAMPLE_FILES: SampleEntry[] = [
 	{
+		name: 'trawl-demo.png',
+		mime: 'image/png',
 		build: buildPixelDemo,
 		blurb: 'The file from the tour. A flag sits in the low bit of the red channel.'
 	},
 	{
+		name: 'trawl-trailing.png',
+		mime: 'image/png',
 		build: buildTrailingDemo,
 		blurb:
 			'A flag stuck on after the image ends. The pixels are clean, so the LSB sweep finds nothing, but a byte scan will.'
 	},
 	{
+		name: 'trawl-audio.wav',
+		mime: 'audio/wav',
 		build: buildAudioDemo,
 		blurb: 'A short tone with a flag written into the low bit of every sample.'
+	},
+	{
+		name: 'spectrogram-source.png',
+		mime: 'image/png',
+		url: '/samples/spectrogram-source.png',
+		blurb: 'The source picture drawn into the matching WAV spectrogram.'
+	},
+	{
+		name: 'spectrogram-and-lsb.wav',
+		mime: 'audio/wav',
+		url: '/samples/spectrogram-and-lsb.wav',
+		blurb: 'A picture in the spectrogram and text in the sample low bits.'
+	},
+	{
+		name: 'palette-clean.png',
+		mime: 'image/png',
+		url: '/samples/palette-clean.png',
+		blurb: 'The clean indexed PNG used as the palette control.'
+	},
+	{
+		name: 'palette-duplicate.png',
+		mime: 'image/png',
+		url: '/samples/palette-duplicate.png',
+		blurb: 'The same picture with duplicate palette entries that carry hidden capacity.'
 	}
 ];
+
+export async function loadSample(entry: SampleEntry): Promise<SampleFile> {
+	if (entry.build) return entry.build();
+	if (!entry.url) throw new Error(`No source for ${entry.name}`);
+
+	const response = await fetch(entry.url);
+	if (!response.ok) throw new Error(`Could not load ${entry.name} (${response.status})`);
+	return {
+		name: entry.name,
+		bytes: new Uint8Array(await response.arrayBuffer()),
+		mime: entry.mime
+	};
+}
 
 export function downloadSample(file: SampleFile): void {
 	const url = URL.createObjectURL(

@@ -6,8 +6,11 @@ import {
 	type AudioSweep,
 	type ChiSquare,
 	type FlagHit,
+	type GifAnalysis,
 	type JpegError,
 	type JpegStego,
+	type NestedAnalysis,
+	type NestedArtifact,
 	type PaletteStego,
 	type PlaneWall,
 	type RsAnalysis,
@@ -27,7 +30,7 @@ export type ToolStatus = 'hit' | 'clear' | 'ready' | 'pending';
  * `png` needs the chunk walker, which no other format has. `audio` needs samples.
  * `jpeg` needs the coefficient decoder.
  */
-export type ToolScope = 'bytes' | 'pixels' | 'png' | 'audio' | 'jpeg' | 'zip';
+export type ToolScope = 'bytes' | 'pixels' | 'png' | 'audio' | 'jpeg' | 'zip' | 'gif';
 
 /**
  * The two halves of the rack. Survey reads the file as it sits on disk;
@@ -112,7 +115,27 @@ export type Findings = {
 	audio?: AudioSweep | null;
 	spectrogram?: Spectrogram | null;
 	zip?: ZipArchive | null;
+	nested?: NestedAnalysis | null;
+	gif?: GifAnalysis | null;
 };
+
+/** Every finding anywhere in the nested tree, each carrying its full path. */
+export function nestedFindings(roots: NestedArtifact[]): { text: string; origin: string }[] {
+	const out: { text: string; origin: string }[] = [];
+	const walk = (artifact: NestedArtifact, path: string) => {
+		const here = path ? `${path} / ${artifact.name}` : artifact.name;
+		for (const finding of artifact.findings)
+			out.push({ text: finding.text, origin: finding.origin });
+		for (const child of artifact.children) walk(child, here);
+	};
+	for (const root of roots) walk(root, '');
+	return out;
+}
+
+/** Whether the automatic walk stopped because a budget ran out. */
+function nestedCapped(nested: NestedAnalysis | null): boolean {
+	return nested?.capped ?? false;
+}
 
 /**
  * Whether an archive shows any sign of having been edited.
@@ -159,6 +182,7 @@ function archiveNote(zip: ZipArchive): string {
 export function tools(found: Findings): Tool[] {
 	const { survey, structure = null, sweep = null, wall = null, chi = null, rs = null } = found;
 	const { audio = null, spectrogram = null, paletteStego = null, zip = null } = found;
+	const { nested = null, gif = null } = found;
 	const aes = found.aes ?? [];
 	const wav = found.wav && !isWavError(found.wav) ? found.wav : null;
 	const jpeg = found.jpeg && !isJpegError(found.jpeg) ? found.jpeg : null;
@@ -238,6 +262,15 @@ export function tools(found: Findings): Tool[] {
 			group: 'survey',
 			status: embedded.length ? 'hit' : 'clear',
 			value: embedded.length ? `${embedded.length} to extract` : 'none'
+		},
+		{
+			id: 'gif',
+			name: 'GIF frames',
+			measures: 'Checks every frame and the gaps between them for hidden bits',
+			scope: 'gif',
+			group: 'cuttlefish',
+			status: gifFrameStatus(gif),
+			value: gifFrameValue(gif, nested)
 		},
 		pixel({
 			id: 'lsb',
@@ -451,6 +484,28 @@ export function tools(found: Findings): Tool[] {
 			value: headerBroken ? 'blocked' : 'verified'
 		})
 	];
+}
+
+function gifFrameStatus(gif: GifAnalysis | null): ToolStatus {
+	if (!gif) return 'pending';
+	if (gif.error) return 'clear';
+	if (gif.sources.length === 0) return 'clear';
+	if (gif.sources.some((s) => s.lsb.candidates.length > 0 || s.chi?.detected || s.rs?.detected))
+		return 'hit';
+	return 'clear';
+}
+
+function gifFrameValue(gif: GifAnalysis | null, nested: NestedAnalysis | null): string {
+	if (!gif) return 'pixels unavailable';
+	if (gif.error) return `error: ${gif.error}`;
+	if (gif.sources.length === 0) return 'no frames analysed';
+	const frames = gif.sources.filter((s) => s.kind === 'frame').length;
+	const diffs = gif.sources.filter((s) => s.kind === 'difference').length;
+	let msg = `${frames} frame${frames === 1 ? '' : 's'} analysed`;
+	if (diffs > 0) msg += `, ${diffs} difference${diffs === 1 ? '' : 's'} checked`;
+	if (gif.capped) msg += ' · capped';
+	if (nestedCapped(nested)) msg += ' · walk capped';
+	return msg;
 }
 
 /** Named so the rack shows the whole instrument, not only the parts that work. */
