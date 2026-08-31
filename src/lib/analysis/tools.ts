@@ -570,15 +570,6 @@ function gifFrameValue(gif: GifAnalysis | null, nested: NestedAnalysis | null): 
 	return msg;
 }
 
-/** Named so the rack shows the whole instrument, not only the parts that work. */
-export const PLANNED: Tool[] = [
-	{
-		id: 'zip',
-		name: 'Archive walk',
-		measures: 'Looks inside ZIP and PDF files',
-		scope: 'bytes',
-		group: 'survey',
-		status: 'pending',
-		value: ''
-	}
-];
+/** Named so the rack shows the whole instrument, not only the parts that work.
+ *  Empty when everything the rack currently advertises has shipped. */
+export const PLANNED: Tool[] = [];

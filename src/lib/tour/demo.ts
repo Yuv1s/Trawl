@@ -311,6 +311,18 @@ export const SAMPLE_GROUPS: SampleGroup[] = [
 		]
 	},
 	{
+		title: 'PDF documents',
+		entries: [
+			{
+				name: 'orphaned-revision.pdf',
+				mime: 'application/pdf',
+				url: '/samples/documents/orphaned-revision.pdf',
+				blurb:
+					"A page edited out in a second revision. The old page's content stream is still in the file and the cross-reference table no longer lists it, and its own text reads flag{leftover_in_the_pdf}."
+			}
+		]
+	},
+	{
 		title: 'Cuttlefish: images',
 		entries: [
 			{

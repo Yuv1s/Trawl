@@ -592,6 +592,10 @@
 		gap: var(--s2);
 	}
 
+	.identity :global(.logo) {
+		color: var(--muted);
+	}
+
 	.home {
 		display: flex;
 		background: none;

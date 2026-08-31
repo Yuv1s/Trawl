@@ -62,7 +62,9 @@
 				['Metadata', 'Camera details and notes saved with the photo'],
 				['Entropy window', 'Finds compressed or encrypted regions'],
 				['Chunk walk', 'Lists every part of the file'],
-				['Readable text', 'Text anywhere in the file, plain or wide']
+				['Readable text', 'Text anywhere in the file, plain or wide'],
+				['Archive entries', 'Reads a ZIP twice and reports where the two copies disagree'],
+				['PDF structure', 'Walks a PDF for every object, and what the index leaves out']
 			]
 		},
 		{
@@ -190,18 +192,20 @@
 			</ul>
 		{/each}
 
-		<div class="rack-head sub">
-			<h2 class="label">Not built yet</h2>
-			<span class="label count mono">{PLANNED.length}</span>
-		</div>
-		<ul class="planned">
-			{#each PLANNED as tool (tool.id)}
-				<li>
-					<span class="name">{tool.name}</span>
-					<span class="measures">{tool.measures}</span>
-				</li>
-			{/each}
-		</ul>
+		{#if PLANNED.length > 0}
+			<div class="rack-head sub">
+				<h2 class="label">Not built yet</h2>
+				<span class="label count mono">{PLANNED.length}</span>
+			</div>
+			<ul class="planned">
+				{#each PLANNED as tool (tool.id)}
+					<li>
+						<span class="name">{tool.name}</span>
+						<span class="measures">{tool.measures}</span>
+					</li>
+				{/each}
+			</ul>
+		{/if}
 	</div>
 
 	<footer>

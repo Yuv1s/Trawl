@@ -98,6 +98,16 @@ fn walks_every_object_regardless_of_the_table() {
 }
 
 #[test]
+fn reads_a_type_written_with_a_space_before_the_name() {
+    // "/Type/Catalog" with no space is what this file's own fixtures write,
+    // but "/Type /Catalog" is what real PDF writers do, and both are valid.
+    let doc = read(&build(&[Put::new(1, "<< /Type /Catalog /Pages 2 0 R >>"), Put::new(2, INFO)]))
+        .unwrap();
+
+    assert_eq!(doc.objects[0].kind.as_deref(), Some("Catalog"));
+}
+
+#[test]
 fn reads_the_info_dictionary_through_the_trailer() {
     let doc = read(&build(&[Put::new(1, CATALOG), Put::new(2, INFO)])).unwrap();
 

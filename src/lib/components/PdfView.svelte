@@ -33,7 +33,7 @@
 <div class="pdf">
 	{#if orphaned.length > 0 || carrying.length > 0 || notes.length > 0}
 		<ul class="findings">
-			{#each carrying as object (object.number)}
+			{#each carrying as object (object.offset)}
 				{#each object.flags ?? [] as flag (flag)}
 					<li class="flagged">
 						<span class="mono big">{flag}</span>
@@ -41,7 +41,7 @@
 					</li>
 				{/each}
 			{/each}
-			{#each orphaned as object (object.number)}
+			{#each orphaned as object (object.offset)}
 				<li class="flagged">
 					<span class="mono">{objectLabel(object)}</span> is in the file but the cross-reference table
 					no longer points at it, so no ordinary reader will open it
@@ -87,7 +87,7 @@
 			</tr>
 		</thead>
 		<tbody>
-			{#each doc.objects as object (object.number)}
+			{#each doc.objects as object (object.offset)}
 				<tr class:odd={object.orphaned || (object.flags?.length ?? 0) > 0}>
 					<td>
 						<span class="mono name">{objectLabel(object)}</span>

@@ -29,6 +29,15 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
       automatically scanned through the same pipelines. A shared budget limits
       depth (3), total children (32), per-child bytes (1 MiB), and aggregate
       bytes (8 MiB). Skipped and errored children are reported in place.
+- [x] PDF documents, walked the way a ZIP is: every object found independent of
+      the cross-reference table, then the table read separately and compared.
+      An object the table no longer points at is a leftover from an earlier
+      revision that a reader would never open. Streams are inflated the same
+      way a compressed PNG chunk is, so a flag hiding in one is read rather
+      than reported as unread; the document's own `/Info` metadata, whether it
+      is encrypted, and what it attaches are read too. A cross-reference stream
+      rather than the classic table is detected but not decoded, so an object's
+      standing against it is left unmarked rather than guessed at
 
 ### Cuttlefish, the steganography half
 
@@ -90,8 +99,23 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
       three, five and two letters is one cipher with a thirty letter key, and
       thirty letters is an ordinary key given a page to find it in
 - [x] Affine, all 312 keys tried, of which Caesar is twenty-six
+- [x] Hill, the 2x2 case: every invertible key mod 26 tried, roughly 211,000 of
+      them, the same brute force affine's smaller space gets. A 3x3 key is 26⁹
+      and stays out of reach
+- [x] Playfair's grid, enciphered and deciphered, but not solved blind: a single
+      swap in the key square changes almost every digraph it produces, so
+      nothing short of the exact grid reads, and no realistic search finds one
+      grid out of 25! by trying swaps. Measured rather than assumed, and applied
+      in the key box instead, the same as a Vigenère guess
 - [x] Transposition, rail fence and columnar, where the letters were never
       changed and only moved
+- [x] Columnar transposition wider than eight columns, where trying every
+      arrangement stops being possible: the order is built up instead, a few
+      chunks at a time by which trigrams continue best, several candidate
+      starts kept alive rather than committed to the first one, then polished
+      by the same kind of swap a narrower grid solves outright. Needs enough
+      rows per column to say anything at all, and says nothing rather than
+      guessing below that
 - [x] Simple substitution, climbed rather than counted, against a trigram census
       of English measured from a corpus and committed as text
 - [x] A letter frequency table, with the index of coincidence and every repeated
@@ -181,13 +205,6 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 
 ## Next
 
-### Mantis
-
-- [ ] Playfair and Hill, the two classical ciphers left that are not variations
-      on something above
-- [ ] Columnar transposition wider than eight columns, which needs the column
-      order built up rather than tried exhaustively
-
 ### Remora
 
 - [ ] Flows that take more than one request: a value decoded out of one response
@@ -198,7 +215,6 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 
 ### Forensics
 
-- [ ] Looking inside PDF files
 - [ ] Windows registry, for tracing which USB stick was plugged in when
 
 ### Steganography still open

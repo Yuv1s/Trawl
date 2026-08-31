@@ -117,11 +117,13 @@ fn literal_field(dict: &str, key: &str) -> Option<String> {
     Some(unescape_literal(&bytes[1..end - 1]))
 }
 
-/// The value of `/Key /Name` inside a dictionary's text.
+/// The value of `/Key /Name` inside a dictionary's text, the space between
+/// them optional: most real PDF writers put one there, and the format
+/// permits either.
 fn name_field(dict: &str, key: &str) -> Option<String> {
-    let needle = format!("/{key}/");
-    let start = dict.find(&needle)?.checked_add(needle.len() - 1)?;
-    let rest = &dict[start + 1..];
+    let needle = format!("/{key}");
+    let after = dict[dict.find(&needle)? + needle.len()..].trim_start();
+    let rest = after.strip_prefix('/')?;
     let end = rest
         .find(|c: char| c.is_whitespace() || "/<>[]()".contains(c))
         .unwrap_or(rest.len());
@@ -151,8 +153,9 @@ fn reference_field(dict: &str, key: &str) -> Option<u32> {
 pub struct Stream {
     pub offset: usize,
     pub length: usize,
-    /// The filter chain named in `/Filter`, joined with " then ": empty when
-    /// the stream carries its bytes uncompressed.
+    /// The name of the stream's own `/Filter`, empty when it carries its
+    /// bytes uncompressed or names its filter as an array rather than a
+    /// single name, which this does not walk.
     pub filter: String,
 }
 
@@ -320,26 +323,10 @@ fn objects(data: &[u8]) -> Vec<Object> {
                 .map(|n| n as usize)
                 .unwrap_or(end.saturating_sub(start));
 
-            let filters: Vec<String> = std::iter::successors(Some(dict_text.as_str()), |rest| {
-                let idx = rest.find("/Filter")?;
-                Some(&rest[idx + "/Filter".len()..])
-            })
-            .skip(1)
-            .take(1)
-            .filter_map(|rest| {
-                let rest = rest.trim_start();
-                if rest.starts_with('/') {
-                    name_field(&format!("/Filter{rest}"), "Filter")
-                } else {
-                    None
-                }
-            })
-            .collect();
-
             Some(Stream {
                 offset: start,
                 length: length.min(end.saturating_sub(start)),
-                filter: filters.join(" then "),
+                filter: name_field(&dict_text, "Filter").unwrap_or_default(),
             })
         });
 
