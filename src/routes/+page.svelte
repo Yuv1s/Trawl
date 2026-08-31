@@ -15,6 +15,7 @@
 	import type { TourStep } from '$lib/tour/types';
 	import { attack as attackRsa, looksLikeRsa, type Report } from '$lib/analysis/rsa';
 	import Logo from '$lib/components/Logo.svelte';
+	import banner from '$lib/assets/TrawlBanner.png';
 	import ToolRack from '$lib/components/ToolRack.svelte';
 	import Recovered from '$lib/components/Recovered.svelte';
 	import ChunkList from '$lib/components/ChunkList.svelte';
@@ -711,7 +712,11 @@
 		content="Local CTF toolkit for steganography, cryptography and forensics. Nothing leaves your machine."
 	/>
 	<meta property="og:url" content="https://trawlctf.vercel.app/" />
-	<meta name="twitter:card" content="summary" />
+	<meta property="og:image" content="https://trawlctf.vercel.app{banner}" />
+	<meta property="og:image:width" content="1600" />
+	<meta property="og:image:height" content="500" />
+	<meta name="twitter:card" content="summary_large_image" />
+	<meta name="twitter:image" content="https://trawlctf.vercel.app{banner}" />
 </svelte:head>
 
 {#if view.phase === 'idle'}
@@ -743,7 +748,9 @@
 	>
 		<header>
 			<div class="identity" data-tour="identity">
-				<Logo size={22} />
+				<button type="button" class="home" onclick={reset} aria-label="Back to Trawl">
+					<Logo size={22} />
+				</button>
 				<span class="name">{view.phase === 'working' ? view.name : view.result.name}</span>
 				{#if view.phase === 'done'}
 					<span class="meta mono">{view.result.size.toLocaleString()} B</span>
@@ -1157,6 +1164,9 @@
 	}
 
 	header {
+		position: sticky;
+		top: 0;
+		z-index: 2;
 		display: flex;
 		flex-wrap: wrap;
 		gap: var(--s2) var(--s5);
@@ -1177,6 +1187,21 @@
 
 	.identity :global(.logo) {
 		color: var(--muted);
+	}
+
+	.home {
+		display: flex;
+		background: none;
+		border: none;
+		padding: 0;
+		margin: 0;
+		cursor: pointer;
+		border-radius: var(--radius);
+		transition: opacity 120ms var(--ease);
+	}
+
+	.home:hover {
+		opacity: 0.72;
 	}
 
 	.name {

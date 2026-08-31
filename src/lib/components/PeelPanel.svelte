@@ -276,7 +276,9 @@
 <div class="shell">
 	<header>
 		<div class="identity">
-			<Logo size={22} />
+			<button type="button" class="home" onclick={onreset} aria-label="Back to Trawl">
+				<Logo size={22} />
+			</button>
 			<span class="name">Pasted text</span>
 			<span class="meta mono">{input.length.toLocaleString()} characters</span>
 		</div>
@@ -691,6 +693,9 @@
 	}
 
 	header {
+		position: sticky;
+		top: 0;
+		z-index: 2;
 		display: flex;
 		flex-wrap: wrap;
 		gap: var(--s2) var(--s5);
@@ -711,6 +716,21 @@
 
 	.identity :global(.logo) {
 		color: var(--muted);
+	}
+
+	.home {
+		display: flex;
+		background: none;
+		border: none;
+		padding: 0;
+		margin: 0;
+		cursor: pointer;
+		border-radius: var(--radius);
+		transition: opacity 120ms var(--ease);
+	}
+
+	.home:hover {
+		opacity: 0.72;
 	}
 
 	.name {
