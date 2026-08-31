@@ -11,7 +11,7 @@
 	import TourPrompt from '$lib/components/TourPrompt.svelte';
 	import TourOverlay from '$lib/components/TourOverlay.svelte';
 	import DownloadPrompt from '$lib/components/DownloadPrompt.svelte';
-	import { buildPixelDemo, type SampleFile } from '$lib/tour/demo';
+	import { buildPixelDemo, type SampleFile, type SampleOpen } from '$lib/tour/demo';
 	import type { TourStep } from '$lib/tour/types';
 	import { attack as attackRsa, looksLikeRsa, type Report } from '$lib/analysis/rsa';
 	import Logo from '$lib/components/Logo.svelte';
@@ -267,11 +267,13 @@
 		showDownloadPrompt = true;
 	}
 
-	/** Load a sample straight into the analyser, so a newcomer can watch the tools
-	 *  run without downloading a file and dropping it back in. */
-	function runSample(file: SampleFile) {
+	/** Load a sample straight into the tools, so a newcomer can watch them run
+	 *  without downloading a file and dropping it back in. A paste sample goes to
+	 *  Mantis as text, exactly as if its one line had been pasted in. */
+	function runSample(file: SampleFile, open: SampleOpen = 'drop') {
 		showDownloadPrompt = false;
-		analyseBytes(file.bytes, file.name);
+		if (open === 'paste') acceptText(new TextDecoder().decode(file.bytes).trim());
+		else analyseBytes(file.bytes, file.name);
 	}
 
 	$effect(() => {
