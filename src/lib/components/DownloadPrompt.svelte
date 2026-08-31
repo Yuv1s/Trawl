@@ -1,14 +1,39 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { SAMPLE_FILES, downloadSample, type SampleFile } from '$lib/tour/demo';
+	import {
+		SAMPLE_GROUPS,
+		downloadSample,
+		loadSample,
+		type SampleEntry,
+		type SampleFile,
+		type SampleOpen
+	} from '$lib/tour/demo';
 
-	let { onclose, onrun }: { onclose: () => void; onrun: (file: SampleFile) => void } = $props();
+	let {
+		onclose,
+		onrun
+	}: { onclose: () => void; onrun: (file: SampleFile, open: SampleOpen) => void } = $props();
 
-	const files = SAMPLE_FILES.map((f) => ({ file: f.build(), blurb: f.blurb }));
+	let searchInput: HTMLInputElement | undefined;
+	let query = $state('');
+	let loading = $state<string | null>(null);
+	let error = $state('');
 
-	let closeButton: HTMLButtonElement | undefined;
+	const total = SAMPLE_GROUPS.reduce((n, group) => n + group.entries.length, 0);
 
-	onMount(() => closeButton?.focus());
+	const filtered = $derived.by(() => {
+		const q = query.trim().toLowerCase();
+		if (!q) return SAMPLE_GROUPS;
+		return SAMPLE_GROUPS.map((group) => {
+			if (group.title.toLowerCase().includes(q)) return group;
+			const entries = group.entries.filter(
+				(entry) => entry.name.toLowerCase().includes(q) || entry.blurb.toLowerCase().includes(q)
+			);
+			return { ...group, entries };
+		}).filter((group) => group.entries.length > 0);
+	});
+
+	onMount(() => searchInput?.focus());
 
 	function keydown(event: KeyboardEvent) {
 		if (event.key === 'Escape') onclose();
@@ -17,33 +42,105 @@
 	function onScrimClick(event: MouseEvent) {
 		if (event.target === event.currentTarget) onclose();
 	}
+
+	async function useSample(entry: SampleEntry, action: 'run' | 'download') {
+		loading = `${action}:${entry.name}`;
+		error = '';
+		try {
+			const file = await loadSample(entry);
+			if (action === 'run') onrun(file, entry.open ?? 'drop');
+			else downloadSample(file);
+		} catch (cause) {
+			error = cause instanceof Error ? cause.message : `Could not load ${entry.name}`;
+		} finally {
+			loading = null;
+		}
+	}
 </script>
 
 <svelte:window onkeydown={keydown} />
 
 <div class="scrim" role="presentation" onclick={onScrimClick}>
-	<div class="dialog" tabindex="-1" role="dialog" aria-modal="true" aria-labelledby="dl-title">
-		<h2 id="dl-title">See it work</h2>
-		<p>
-			Each of these is a small file with a flag hidden somewhere different. Run one to watch every
-			tool go at it, or download it and drop it back in yourself. Nothing here leaves the tab.
-		</p>
-		<ul>
-			{#each files as { file, blurb } (file.name)}
-				<li>
-					<div class="row-text">
-						<span class="mono name">{file.name}</span>
-						<span class="blurb">{blurb}</span>
+	<div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dl-title">
+		<header class="head">
+			<span class="eyebrow">{total} samples</span>
+			<h2 id="dl-title">See it work</h2>
+			<p class="lede">
+				The whole corpus, grouped by what it exercises. Check one to watch the tools run in place,
+				or download it to drop back in yourself. Nothing here leaves the tab.
+			</p>
+			<div class="search">
+				<input
+					bind:this={searchInput}
+					bind:value={query}
+					type="search"
+					placeholder="Filter by name or what it hides"
+					aria-label="Filter samples"
+					autocomplete="off"
+					spellcheck="false"
+				/>
+			</div>
+		</header>
+
+		<div class="body" aria-busy={loading !== null}>
+			{#each filtered as group (group.title)}
+				<section class="group">
+					<div class="group-head">
+						<h3>{group.title}</h3>
+						<span class="count">{group.entries.length}</span>
 					</div>
-					<div class="row-actions">
-						<button type="button" class="run" onclick={() => onrun(file)}>Run</button>
-						<button type="button" class="get" onclick={() => downloadSample(file)}>Download</button>
-					</div>
-				</li>
+					{#if group.note}<p class="note">{group.note}</p>{/if}
+					<ul>
+						{#each group.entries as entry (entry.name)}
+							<li>
+								<div class="row-text">
+									<div class="name-line">
+										<span class="mono name">{entry.name}</span>
+										<span class="tag" class:paste={entry.open === 'paste'}>
+											{entry.open === 'paste' ? 'Paste' : 'Drop'}
+										</span>
+									</div>
+									<span class="blurb">{entry.blurb}</span>
+								</div>
+								<div class="row-actions">
+									<button
+										type="button"
+										class="run"
+										disabled={loading !== null}
+										onclick={() => useSample(entry, 'run')}
+									>
+										{loading === `run:${entry.name}` ? 'Loading' : 'Run'}
+									</button>
+									<button
+										type="button"
+										class="get"
+										disabled={loading !== null}
+										onclick={() => useSample(entry, 'download')}
+									>
+										{loading === `download:${entry.name}` ? 'Loading' : 'Download'}
+									</button>
+								</div>
+							</li>
+						{/each}
+					</ul>
+				</section>
 			{/each}
-		</ul>
+
+			{#if filtered.length === 0}
+				<div class="empty" role="status">
+					<p>
+						No sample matches <span class="mono">{query.trim()}</span>. Try a tool name, a format,
+						or part of a flag.
+					</p>
+					<button type="button" class="get" onclick={() => (query = '')}>Clear filter</button>
+				</div>
+			{/if}
+		</div>
+
+		{#if error}<p class="error" role="alert">{error}</p>{/if}
+
 		<div class="actions">
-			<button type="button" class="ghost" bind:this={closeButton} onclick={onclose}>Close</button>
+			<button type="button" class="ghost" onclick={onclose}>Close</button>
 		</div>
 	</div>
 </div>
@@ -60,31 +157,120 @@
 	}
 
 	.dialog {
-		width: min(30rem, 100%);
-		padding: var(--s6);
+		display: flex;
+		flex-direction: column;
+		width: min(44rem, 100%);
+		max-height: min(48rem, calc(100dvh - var(--s7)));
 		background: var(--panel-deep);
 		border: 1px solid var(--rule-bright);
 		border-radius: var(--radius);
+		overflow: hidden;
+	}
+
+	.head {
+		flex: none;
+		padding: var(--s6) var(--s6) var(--s4);
+	}
+
+	.eyebrow {
+		display: block;
+		font-size: 0.6875rem;
+		font-weight: 600;
+		font-variant-numeric: tabular-nums;
+		letter-spacing: 0.14em;
+		text-transform: uppercase;
+		color: var(--muted);
 	}
 
 	h2 {
-		margin: 0;
+		margin: var(--s2) 0 0;
 		font-size: var(--t-title);
 		font-weight: 600;
 	}
 
-	p {
+	.lede {
 		margin: var(--s3) 0 0;
+		max-width: 46ch;
 		color: var(--muted);
 		line-height: 1.6;
+		text-wrap: pretty;
+	}
+
+	.search {
+		margin-top: var(--s4);
+	}
+
+	input[type='search'] {
+		width: 100%;
+		font: inherit;
+		font-size: var(--t-body);
+		color: var(--text);
+		padding: var(--s3) var(--s4);
+		background: var(--panel);
+		border: 1px solid var(--rule);
+		border-radius: var(--radius);
+		transition: border-color 120ms var(--ease);
+	}
+
+	input[type='search']::placeholder {
+		color: var(--muted);
+	}
+
+	input[type='search']:focus-visible {
+		outline: none;
+		border-color: var(--signal);
+	}
+
+	.body {
+		flex: 1 1 auto;
+		min-height: 0;
+		overflow-y: auto;
+		border-top: 1px solid var(--rule);
+	}
+
+	.group-head {
+		position: sticky;
+		top: 0;
+		z-index: 1;
+		display: flex;
+		align-items: baseline;
+		gap: var(--s2);
+		padding: var(--s4) var(--s6) var(--s2);
+		background: var(--panel-deep);
+		border-bottom: 1px solid var(--rule);
+	}
+
+	h3 {
+		margin: 0;
+		font-size: var(--t-label);
+		font-weight: 600;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: var(--text);
+	}
+
+	.count {
+		font-size: 0.6875rem;
+		font-weight: 600;
+		font-variant-numeric: tabular-nums;
+		color: var(--muted);
+	}
+
+	.note {
+		margin: var(--s3) 0 0;
+		padding: 0 var(--s6);
+		font-size: var(--t-label);
+		line-height: 1.55;
+		color: var(--muted);
+		text-wrap: pretty;
 	}
 
 	ul {
 		list-style: none;
-		margin: var(--s5) 0 0;
-		padding: 0;
+		margin: 0;
+		padding: var(--s3) var(--s6) var(--s5);
 		display: grid;
-		gap: var(--s3);
+		gap: var(--s2);
 	}
 
 	li {
@@ -104,8 +290,36 @@
 		min-width: 0;
 	}
 
+	.name-line {
+		display: flex;
+		align-items: center;
+		gap: var(--s2);
+		min-width: 0;
+	}
+
 	.name {
 		font-weight: 600;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.tag {
+		flex: none;
+		font-size: 0.625rem;
+		font-weight: 600;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		padding: 2px var(--s2);
+		color: var(--muted);
+		border: 1px solid var(--rule-bright);
+		border-radius: var(--radius);
+	}
+
+	.tag.paste {
+		color: var(--signal);
+		border-color: color-mix(in srgb, var(--signal) 45%, transparent);
+		background: color-mix(in srgb, var(--signal) 12%, transparent);
 	}
 
 	.blurb {
@@ -114,10 +328,35 @@
 		line-height: 1.5;
 	}
 
+	.empty {
+		display: grid;
+		gap: var(--s4);
+		justify-items: start;
+		margin: 0;
+		padding: var(--s6);
+		color: var(--muted);
+		line-height: 1.6;
+	}
+
+	.empty p {
+		margin: 0;
+		text-wrap: pretty;
+	}
+
+	.error {
+		flex: none;
+		margin: 0;
+		padding: var(--s3) var(--s6);
+		color: var(--signal);
+		border-top: 1px solid var(--rule);
+	}
+
 	.actions {
+		flex: none;
 		display: flex;
 		justify-content: flex-end;
-		margin-top: var(--s5);
+		padding: var(--s4) var(--s6);
+		border-top: 1px solid var(--rule);
 	}
 
 	button {
@@ -129,6 +368,11 @@
 		cursor: pointer;
 		transition: background-color 120ms var(--ease);
 		flex: none;
+	}
+
+	button:disabled {
+		cursor: wait;
+		opacity: 0.6;
 	}
 
 	.row-actions {
@@ -165,5 +409,45 @@
 
 	.ghost:hover {
 		background: var(--panel-lift);
+	}
+
+	@media (max-width: 38rem) {
+		.scrim {
+			padding: var(--s4);
+		}
+
+		.dialog {
+			max-height: calc(100dvh - var(--s6));
+		}
+
+		.head {
+			padding: var(--s5) var(--s5) var(--s4);
+		}
+
+		.group-head,
+		.note,
+		ul {
+			padding-left: var(--s5);
+			padding-right: var(--s5);
+		}
+
+		.actions,
+		.error {
+			padding-left: var(--s5);
+			padding-right: var(--s5);
+		}
+
+		li {
+			align-items: stretch;
+			flex-direction: column;
+		}
+
+		.row-actions {
+			width: 100%;
+		}
+
+		.row-actions button {
+			flex: 1;
+		}
 	}
 </style>

@@ -1,5 +1,14 @@
 use super::*;
 
+/// Test shorthands that pass no configured tags, matching pre-existing callers.
+fn solve(data: &[u8]) -> Option<Candidate> {
+    super::solve(data, &[])
+}
+
+fn derive(data: &[u8]) -> Vec<Derived> {
+    super::derive(data, &[])
+}
+
 /// Long enough that letter counting has something to count. Short ciphertext is
 /// where this attack fails honestly, and the tests should not pretend otherwise.
 const PROSE: &[u8] =
@@ -404,8 +413,8 @@ fn a_flag_shape_settles_a_key_no_counting_could_reach() {
 
 #[test]
 fn the_crib_costs_nothing_when_there_is_no_flag() {
-    assert!(from_crib(b"the treasure is buried under the old oak tree").is_empty());
-    assert!(from_crib(b"").is_empty());
+    assert!(from_crib(b"the treasure is buried under the old oak tree", &[]).is_empty());
+    assert!(from_crib(b"", &[]).is_empty());
 }
 
 #[test]

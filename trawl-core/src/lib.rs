@@ -14,6 +14,7 @@ pub mod gif;
 pub mod jpeg;
 pub mod json;
 pub mod mantis;
+pub mod pdf;
 pub mod pixels;
 pub mod png;
 pub mod spectrogram;
@@ -81,12 +82,11 @@ pub fn chi_square(file: &[u8], inflated: &[u8], steps: usize) -> Result<String, 
 ///
 /// Exposed so the worker can re-scan text it decompressed itself, using the same
 /// matcher as everything else rather than a second implementation in JS.
-#[wasm_bindgen]
-pub fn find_flags(data: &[u8]) -> String {
+fn flags_json(found: &[bytes::Found]) -> String {
     use json::{push_field, push_number};
 
     let mut out = String::from("[");
-    for (i, found) in bytes::flag_candidates(data).iter().enumerate() {
+    for (i, found) in found.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
@@ -98,6 +98,22 @@ pub fn find_flags(data: &[u8]) -> String {
     }
     out.push(']');
     out
+}
+
+#[wasm_bindgen]
+pub fn find_flags(data: &[u8]) -> String {
+    flags_json(&bytes::flag_candidates(data))
+}
+
+#[wasm_bindgen]
+pub fn find_flags_for_tags(data: &[u8], tags: &str) -> String {
+    let tags: Vec<String> = tags
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect();
+    flags_json(&bytes::flag_candidates_for_tags(data, &tags))
 }
 
 /// Palette findings for an indexed image, as JSON. Null when there is no PLTE.
@@ -177,6 +193,12 @@ pub fn png_structure(file: &[u8]) -> String {
     png::structure_json(file)
 }
 
+#[wasm_bindgen]
+pub fn png_patch_ihdr(file: &[u8], width: u32, height: u32) -> Result<Vec<u8>, JsError> {
+    png::patch_ihdr(file, width, height)
+        .ok_or_else(|| JsError::new("PNG has no complete IHDR chunk"))
+}
+
 /// Concatenated IDAT payloads, to be inflated by `DecompressionStream` on the JS
 /// side and handed straight back to [`png_decode`].
 #[wasm_bindgen]
@@ -208,6 +230,47 @@ pub fn peel_encodings(data: &[u8]) -> String {
     mantis::json(data)
 }
 
+/// `peel_encodings`, with the caller's configured flag tags steering the cribs
+/// that recover keys underneath an enciphered flag.
+#[wasm_bindgen]
+pub fn peel_encodings_for_tags(data: &[u8], tags: &str) -> String {
+    let tags: Vec<String> = tags
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect();
+    mantis::json_for_tags(data, &tags)
+}
+
+/// Packed Mantis pass for the worker's alternating loop.
+///
+/// Returns a single buffer: u32 little-endian JSON length, then that many bytes
+/// of JSON metadata (the `PeelResult` shape), then the exact final result bytes.
+/// The binary tail is authoritative for compression detection and the next pass;
+/// the JSON is for the panel. Accepts a remaining depth so the worker and Rust
+/// share one six-layer budget.
+#[wasm_bindgen]
+pub fn mantis_packed_pass(data: &[u8], tags: &str, remaining_depth: usize) -> Vec<u8> {
+    let tags: Vec<String> = tags
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    let peel = mantis::peel_with_depth(data, &tags, remaining_depth);
+    let json = mantis::json_from_peel(&peel);
+    let json_bytes = json.as_bytes();
+    let result_bytes = &peel.result;
+
+    let mut out = Vec::with_capacity(4 + json_bytes.len() + result_bytes.len());
+    out.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(json_bytes);
+    out.extend_from_slice(result_bytes);
+    out
+}
+
 /// AES-CBC decryptions the file decrypts to readable text, as JSON.
 ///
 /// A file that carries its own key, IV and ciphertext is decrypted here rather
@@ -228,6 +291,18 @@ pub fn zip_structure(file: &[u8]) -> String {
     zip::json(file)
 }
 
+/// What a PDF document holds, as JSON, or null when the file is not one.
+///
+/// Walks the file for every object header independent of the cross-reference
+/// table, then reads the table separately, the same split [`zip_structure`]
+/// makes between local headers and the central directory. An object the
+/// table no longer lists is a leftover from an earlier revision that a
+/// reader will never show.
+#[wasm_bindgen]
+pub fn pdf_structure(file: &[u8]) -> String {
+    pdf::json(file)
+}
+
 /// Applies a key somebody already has, across every cipher that takes one.
 ///
 /// Separate from `peel_encodings` because it answers a different question.
@@ -238,6 +313,18 @@ pub fn zip_structure(file: &[u8]) -> String {
 #[wasm_bindgen]
 pub fn mantis_with_key(data: &[u8], key: &str) -> String {
     mantis::keyed::json(&mantis::keyed::with_key(data, key))
+}
+
+/// `mantis_with_key`, with the caller's configured flag tags steering the cribs.
+#[wasm_bindgen]
+pub fn mantis_with_key_for_tags(data: &[u8], key: &str, tags: &str) -> String {
+    let tags: Vec<String> = tags
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect();
+    mantis::keyed::json(&mantis::keyed::with_key_for_tags(data, key, &tags))
 }
 
 /// JPEG coefficient analysis as JSON: the chi-square attack, the coefficient
@@ -317,6 +404,7 @@ pub fn wav_lsb_sweep(file: &[u8], max_bytes: usize) -> Result<String, JsError> {
     Ok(cuttlefish::audio::sweep_json(
         &samples,
         parsed.format.channels,
+        parsed.format.sample_rate,
         max_bytes,
     ))
 }
@@ -373,4 +461,138 @@ pub fn wav_spectrogram(
     out.extend_from_slice(json.as_bytes());
     out.extend_from_slice(&spec.pixels);
     Ok(out)
+}
+
+/// Automatic GIF frame and difference analysis.
+///
+/// For each displayed frame and each consecutive difference, runs the existing
+/// Cuttlefish detectors (sweep, chi-square, RS) on the RGBA pixels. Returns a
+/// compact JSON summary with findings; the raw pixels and plane walls stay behind.
+/// The packed binary tail is unnecessary — we only need metadata and detector results.
+#[wasm_bindgen]
+pub fn gif_frame_analysis(
+	file: &[u8],
+	_tags: &str,
+	max_bytes: usize,
+	chi_steps: usize,
+) -> Result<String, JsError> {
+	if !gif::has_signature(file) {
+		return Ok("null".to_string());
+	}
+
+	let (header, frames, differences, capped) = gif::decode_frames(file)
+		.map_err(|e| JsError::new(&e.to_string()))?;
+
+	use crate::json::{push_bool, push_field, push_number, push_string};
+
+	let mut out = String::from("{");
+	push_number(&mut out, "width", header.width);
+	out.push(',');
+	push_number(&mut out, "height", header.height);
+	out.push(',');
+	push_number(&mut out, "declaredFrames", header.declared_frames);
+	out.push(',');
+	push_number(&mut out, "analysedFrames", frames.len());
+	out.push(',');
+	push_bool(&mut out, "capped", capped);
+	out.push(',');
+	push_string(&mut out, "error");
+	out.push_str(":null");
+	out.push(',');
+	push_string(&mut out, "sources");
+	out.push_str(":[");
+
+	let mut source_index = 0;
+
+	// Analyze each displayed frame
+	for (frame_idx, frame) in frames.iter().enumerate() {
+		if source_index > 0 {
+			out.push(',');
+		}
+		source_index += 1;
+
+		out.push('{');
+		push_field(&mut out, "kind", "frame");
+		out.push(',');
+		push_number(&mut out, "from", frame_idx + 1); // one-based
+		out.push(',');
+		push_string(&mut out, "to");
+		out.push_str(":null");
+		out.push(',');
+		push_number(&mut out, "delay", 0);
+		out.push(',');
+		push_string(&mut out, "disposal");
+		out.push_str(":null");
+		out.push(',');
+
+		// Run detectors on this frame
+		let sweep_json = cuttlefish::sweep_json(frame, header.width, header.height, false, max_bytes);
+		let chi_json = cuttlefish::chi_square_json(frame, chi_steps);
+		let rs_json = cuttlefish::rs::analyse(frame, header.width, header.height, 3);
+		let rs_json_str = cuttlefish::rs::json(&rs_json);
+
+		push_string(&mut out, "lsb");
+		out.push(':');
+		out.push_str(&sweep_json);
+		out.push(',');
+
+		push_string(&mut out, "chi");
+		out.push(':');
+		// Parse chi JSON and extract just detected/embeddedFraction
+		// For simplicity, include the full chi result
+		out.push_str(&chi_json);
+		out.push(',');
+
+		push_string(&mut out, "rs");
+		out.push(':');
+		out.push_str(&rs_json_str);
+
+		out.push('}');
+	}
+
+	// Analyze each consecutive difference
+	for (diff_idx, diff) in differences.iter().enumerate() {
+		if source_index > 0 {
+			out.push(',');
+		}
+		source_index += 1;
+
+		out.push('{');
+		push_field(&mut out, "kind", "difference");
+		out.push(',');
+		push_number(&mut out, "from", diff_idx + 1); // one-based
+		out.push(',');
+		push_number(&mut out, "to", diff_idx + 2); // the later frame
+		out.push(',');
+		push_number(&mut out, "delay", 0);
+		out.push(',');
+		push_string(&mut out, "disposal");
+		out.push_str(":null");
+		out.push(',');
+
+		// Run detectors on this difference
+		let sweep_json = cuttlefish::sweep_json(diff, header.width, header.height, false, max_bytes);
+		let chi_json = cuttlefish::chi_square_json(diff, chi_steps);
+		let rs_json = cuttlefish::rs::analyse(diff, header.width, header.height, 3);
+		let rs_json_str = cuttlefish::rs::json(&rs_json);
+
+		push_string(&mut out, "lsb");
+		out.push(':');
+		out.push_str(&sweep_json);
+		out.push(',');
+
+		push_string(&mut out, "chi");
+		out.push(':');
+		out.push_str(&chi_json);
+		out.push(',');
+
+		push_string(&mut out, "rs");
+		out.push(':');
+		out.push_str(&rs_json_str);
+
+		out.push('}');
+	}
+
+	out.push_str("]}");
+	Ok(out)
 }

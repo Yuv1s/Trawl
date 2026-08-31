@@ -60,7 +60,7 @@ const MAX_INPUT: usize = 4096;
 const MIN_INPUT: usize = 4;
 
 fn judge(how: String, text: Vec<u8>) -> Reading {
-    let steps = unwrap_structural(&text);
+    let steps = unwrap_structural(&text, &[], 6);
 
     let then = (!steps.is_empty()).then(|| {
         let result = steps.last().map(|s| s.output.clone()).unwrap_or_default();
@@ -73,7 +73,7 @@ fn judge(how: String, text: Vec<u8>) -> Reading {
 
     // A flag anywhere in the chain settles it, whether it turned up in the
     // rotation itself or in what the rotation decoded to.
-    let found = conclusive(&text).or_else(|| then.as_ref().and_then(|c| conclusive(&c.result)));
+    let found = conclusive(&text, &[]).or_else(|| then.as_ref().and_then(|c| conclusive(&c.result, &[])));
 
     Reading {
         score: plainness(&text),

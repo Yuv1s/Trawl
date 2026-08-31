@@ -1,5 +1,7 @@
 ![Trawl](src/lib/assets/TrawlBanner.png)
 
+Live at **[trawlctf.vercel.app](https://trawlctf.vercel.app)**.
+
 Drop a file into the page, or paste a string, and Trawl looks for whatever is
 hidden in it. Nothing leaves your computer.
 
@@ -31,7 +33,9 @@ Drop in a PNG, BMP, GIF, WAV or JPEG and it runs everything that applies.
 
 It reads what the file says about itself: hidden text, camera metadata, other
 files buried inside it, and anything stuck on the end where a viewer would never
-look. Buried files can be saved out with one click.
+look. Buried files can be saved out with one click, and files inside a ZIP or
+carved out of the middle are scanned with the same checks automatically, a few
+levels deep, until a shared budget stops the walk.
 
 Then Cuttlefish, the steganography half, goes after the data itself. It shows
 every layer of an image at once so an odd one stands out. It tries up to 84 different
@@ -43,12 +47,17 @@ instead of listening to it. JPEGs get their compressed numbers read directly,
 which is where JPEG payloads live, whether the file is an ordinary one or the
 progressive kind that loads in passes. Images that paint by numbers get their
 palette read too, since two entries holding the same colour let a pixel pick
-either one and that choice carries a message no viewer can show you.
+either one and that choice carries a message no viewer can show you. An animated
+GIF is read one frame at a time, every displayed frame and the difference between
+each pair put through the same detectors, so a flag hidden in one frame or in the
+jump between two frames does not survive the playback.
 
 Paste a string instead of dropping a file and Mantis takes over, the
 cryptography half. It works out what the string has been through and undoes it,
 layer by layer: base64 wrapped around hex wrapped around a rotation, unwound
-until something readable falls out. If what is underneath turns out to be
+until something readable falls out. When a layer peels to a compressed stream,
+gzip or zlib, that layer is inflated and peeled after, within the same layer
+budget. If what is underneath turns out to be
 encrypted rather than encoded, it attacks it: XOR, Caesar, Vigenère, affine,
 rail fence and columnar transposition, and simple substitution, each recovering
 its own key rather than asking you for one. When none of them fires it shows the
@@ -58,6 +67,18 @@ answer that is a token rather than a sentence reads like nothing to a scorer, an
 saying so beats picking one at random and sounding sure.
 
 Everything found collects in the Cod-end, the panel at the top of the page.
+Its header carries the list of flag shapes the detectors report against:
+`flag{`, `CTF{`, `key{` and a few more on by default, and you can add your own.
+A button next to it hands the whole analysis back as a Markdown writeup, to the
+clipboard or as a file.
+
+On first load a short tour walks through what to drop in and what to look for.
+The three files it uses are built in your browser, each with a flag hidden a
+different way: in the low bits of an image, in the bytes after the image ends,
+and in the samples of a tone. The demos panel keeps those and four larger
+practice files available anytime: a picture drawn into a WAV spectrogram, the
+same WAV with text in its low bits, and a clean/modified pair for checking
+duplicate PNG palette entries. Run any of them in place or save it for later.
 
 A link is the newest kind of input. Remora, the web-exploration half, is for a
 challenge that lives on a site rather than in a file you were handed. A browser
@@ -166,6 +187,16 @@ cd trawl-core && cargo test           # the analysis core
 
 Test files are built from scratch by `fixtures/generate.mjs`, so every result the
 tests claim can be reproduced rather than taken on trust.
+
+## Sample files
+
+A labelled [sample library](static/samples/README.md) covers the common survey,
+steganography, archive, AES, and Mantis tools. Each entry names the expected
+result and whether to drop the file into Trawl or paste its contents. Clean PNG,
+JPEG, and WAV controls are included beside the planted samples.
+
+The library stays under `static/samples/` because SvelteKit serves it at
+`/samples/`, which is also where the built-in practice panel loads its files.
 
 Remora, the web scanner, is a separate crate under `trawl-scan`. It is the one
 part that reaches the network, so it is kept apart from the offline core. From a

@@ -18,8 +18,10 @@ pub mod affine;
 pub mod encodings;
 pub mod frequency;
 pub mod hashes;
+pub mod hill;
 pub mod keyed;
 pub mod ngram;
+pub mod playfair;
 pub mod shortlist;
 pub mod substitution;
 pub mod transposition;
@@ -247,7 +249,7 @@ pub const CODECS: [Codec; 14] = [
 const MIN_GAIN: f32 = 0.08;
 
 /// How deep a chain will be followed. Real ones are two or three layers.
-const MAX_DEPTH: usize = 6;
+pub const MAX_DEPTH: usize = 6;
 
 /// Beats any plainness score, so a flag always wins.
 const CONCLUSIVE: f32 = 2.0;
@@ -276,19 +278,26 @@ const MAX_INPUT: usize = 1 << 18;
 /// True when a result is worth keeping whatever the score says.
 ///
 /// A flag or a file signature is the answer, and letting a frequency heuristic
-/// veto it would be absurd.
-fn conclusive(data: &[u8]) -> Option<String> {
+/// veto it would be absurd. A configured tag turns a flag shape conclusive too:
+/// it was named, not merely recognised, so it outweighs a readability guess.
+fn conclusive(data: &[u8], tags: &[String]) -> Option<String> {
     if let Some(format) = bytes::identify(data) {
         return Some(format!("{format} signature"));
     }
 
-    bytes::flag_candidates(data)
-        .first()
+    let flags = bytes::flag_candidates(data);
+    // A configured tag is the strongest claim: it was named, not merely guessed,
+    // so it outweighs the brace shape alone. Falls back to the plain shape, which
+    // is what recognised flags always were.
+    flags
+        .iter()
+        .find(|found| bytes::tag_is_known_for(&found.text, tags))
+        .or(flags.first())
         .map(|found| format!("flag shape, {}", found.text))
 }
 
-fn rate(data: &[u8]) -> f32 {
-    if conclusive(data).is_some() {
+fn rate(data: &[u8], tags: &[String]) -> f32 {
+    if conclusive(data, tags).is_some() {
         CONCLUSIVE
     } else {
         plainness(data)
@@ -334,7 +343,7 @@ fn grouped(name: &str, data: &[u8]) -> bool {
     data.iter().filter(|b| !b.is_ascii_whitespace()).count() % group == 0
 }
 
-fn candidates(data: &[u8]) -> Vec<(&'static str, Vec<u8>, bool)> {
+fn candidates(data: &[u8], tags: &[String]) -> Vec<(&'static str, Vec<u8>, bool)> {
     let mut out = Vec::new();
 
     for (name, decode, structural) in CODECS {
@@ -351,7 +360,7 @@ fn candidates(data: &[u8]) -> Vec<(&'static str, Vec<u8>, bool)> {
             return;
         }
         let score = plainness(&rotated);
-        if (score >= ROTATION_BAR && score >= here + MIN_GAIN) || conclusive(&rotated).is_some() {
+        if (score >= ROTATION_BAR && score >= here + MIN_GAIN) || conclusive(&rotated, tags).is_some() {
             out.push((name, rotated, false));
         }
     };
@@ -395,31 +404,30 @@ fn candidates(data: &[u8]) -> Vec<(&'static str, Vec<u8>, bool)> {
 /// wall of hex digits, which reads no more like English than the base64 did. A
 /// peeler that demands an improvement at every step stops there and never
 /// reaches the sentence underneath.
-fn explore(data: &[u8], seen: &mut Vec<Vec<u8>>, depth: usize) -> (f32, Vec<Step>) {
-    let here = rate(data);
-    if depth >= MAX_DEPTH || here == CONCLUSIVE || data.len() > MAX_INPUT {
+fn explore(data: &[u8], seen: &mut Vec<Vec<u8>>, tags: &[String], depth: usize, depth_budget: usize) -> (f32, Vec<Step>) {
+    let here = rate(data, tags);
+    if depth >= depth_budget || here == CONCLUSIVE || data.len() > MAX_INPUT {
         return (here, Vec::new());
     }
 
     let mut best = (here, Vec::new());
 
-    for (encoding, output, structural) in candidates(data) {
+    for (encoding, output, structural) in candidates(data, tags) {
         if seen.contains(&output) {
             continue;
         }
 
         seen.push(output.clone());
-        let (reachable, rest) = explore(&output, seen, depth + 1);
+        let (reachable, rest) = explore(&output, seen, tags, depth + 1, depth_budget);
         seen.pop();
 
-        // What this branch is worth, once its own step is paid for.
         let score = reachable - STEP_COST;
         if score <= best.0 {
             continue;
         }
 
-        let gain = rate(&output) - here;
-        let reason = match conclusive(&output) {
+        let gain = rate(&output, tags) - here;
+        let reason = match conclusive(&output, tags) {
             Some(why) => why,
             None if gain >= MIN_GAIN => format!("reads {:.0}% more like text", gain * 100.0),
             None => "a layer on the way down".to_string(),
@@ -447,20 +455,15 @@ fn explore(data: &[u8], seen: &mut Vec<Vec<u8>>, depth: usize) -> (f32, Vec<Step
 /// is hex whatever it decodes to, and when what it decodes to is a cipher the
 /// search will never take the step because the ciphertext reads no better than
 /// the hex did. Refusing to unwrap it would leave the cipher invisible.
-fn unwrap_structural(data: &[u8]) -> Vec<Step> {
+pub fn unwrap_structural(data: &[u8], tags: &[String], depth_budget: usize) -> Vec<Step> {
     let mut steps = Vec::new();
     let mut current = data.to_vec();
 
-    while steps.len() < MAX_DEPTH {
-        // Already readable, so this is the answer rather than a wrapper. Pure
-        // hex reads as hex, and "deadbeefdeadbeef" should be left as it is.
+    while steps.len() < depth_budget {
         if plainness(&current) >= ROTATION_BAR {
             break;
         }
 
-        // A digest is the end of the road. Thirty-two hex digits unwrap
-        // perfectly well into sixteen bytes that were never text, and before
-        // this the peeler did exactly that and presented the noise as a result.
         if hashes::is_digest(&current) {
             break;
         }
@@ -477,7 +480,7 @@ fn unwrap_structural(data: &[u8]) -> Vec<Step> {
         let Some((encoding, output)) = found else {
             break;
         };
-        let gain = rate(&output) - rate(&current);
+        let gain = rate(&output, tags) - rate(&current, tags);
 
         current = output.clone();
         steps.push(Step {
@@ -488,7 +491,7 @@ fn unwrap_structural(data: &[u8]) -> Vec<Step> {
             structural: true,
         });
 
-        if conclusive(&current).is_some() {
+        if conclusive(&current, tags).is_some() {
             break;
         }
     }
@@ -497,26 +500,23 @@ fn unwrap_structural(data: &[u8]) -> Vec<Step> {
 }
 
 /// Peels layer after layer until nothing improves.
-pub fn peel(data: &[u8]) -> Peel {
-    let mut seen = vec![data.to_vec()];
-    let (score, steps) = explore(data, &mut seen, 0);
+fn peel_with(data: &[u8], tags: &[String]) -> Peel {
+    peel_with_depth(data, tags, MAX_DEPTH)
+}
 
-    // The whole chain has to be worth it, not just the last step of it.
-    //
-    // A chain of purely structural peels counts even when it ends somewhere
-    // unreadable. That is the shape of a cipher wrapped for transport: the hex
-    // comes off cleanly and what is underneath is still encrypted. Demanding a
-    // readability gain there would refuse to unwrap it and leave the cipher
-    // invisible.
+/// Internal peeler that accepts a remaining depth budget.
+/// Used by the worker to share one six-layer budget across Rust and platform layers.
+pub fn peel_with_depth(data: &[u8], tags: &[String], depth_budget: usize) -> Peel {
+    let mut seen = vec![data.to_vec()];
+    let (score, steps) = explore(data, &mut seen, tags, 0, depth_budget);
+
     let structural_only = steps.iter().all(|step| step.structural);
     let worth_it = score == CONCLUSIVE || score >= plainness(data) + MIN_GAIN || structural_only;
 
     let steps = if worth_it && !steps.is_empty() {
         steps
     } else {
-        // Nothing scored its way through, so fall back to what the form alone
-        // justifies. Usually that is nothing at all.
-        unwrap_structural(data)
+        unwrap_structural(data, tags, depth_budget)
     };
 
     if steps.is_empty() {
@@ -535,6 +535,71 @@ pub fn peel(data: &[u8]) -> Peel {
     }
 }
 
+/// Serialises a Peel (steps + final result) into the JSON shape the worker expects.
+/// Does not re-run attacks — used when the worker has already combined layers.
+pub fn json_from_peel(peel: &Peel) -> String {
+    use crate::json::{push_field, push_number, push_string};
+
+    let mut out = String::from("{");
+
+    push_number(&mut out, "depth", peel.steps.len());
+    out.push(',');
+    push_string(&mut out, "score");
+    out.push_str(&format!(":{:.3}", peel.score));
+    out.push(',');
+    push_field(&mut out, "result", &crate::json::latin1(&peel.result));
+    out.push(',');
+
+    push_string(&mut out, "steps");
+    out.push_str(":[");
+    for (i, step) in peel.steps.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        push_field(&mut out, "encoding", step.encoding);
+        out.push(',');
+        push_field(&mut out, "reason", &step.reason);
+        out.push(',');
+        push_field(&mut out, "output", &crate::json::latin1(&step.output));
+        out.push('}');
+    }
+    out.push_str("],");
+
+    // Empty/null placeholders for attack fields — the worker fills these
+    // after the final pass on the exact tail bytes.
+    push_string(&mut out, "xor");
+    out.push_str(":[],");
+    push_string(&mut out, "vigenere");
+    out.push_str(":null,");
+    push_string(&mut out, "affine");
+    out.push_str(":null,");
+    push_string(&mut out, "hill");
+    out.push_str(":null,");
+    push_string(&mut out, "transposition");
+    out.push_str(":null,");
+    push_string(&mut out, "substitution");
+    out.push_str(":null,");
+    push_string(&mut out, "derivedKeys");
+    out.push_str(":[],");
+    push_string(&mut out, "dictionary");
+    out.push_str(":null,");
+    push_string(&mut out, "shortlist");
+    out.push_str(":[],");
+    push_string(&mut out, "frequency");
+    out.push(':');
+    out.push_str(&frequency::json(&peel.result));
+    out.push(',');
+    push_string(&mut out, "hash");
+    out.push_str(":null}");
+    out
+}
+
+/// Peels layer after layer until nothing improves, with no configured tags.
+pub fn peel(data: &[u8]) -> Peel {
+    peel_with(data, &[])
+}
+
 /// Everything Mantis makes of a pasted string.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Reading {
@@ -547,6 +612,8 @@ pub struct Reading {
     pub vigenere: Option<vigenere::Candidate>,
     /// Set when the text turned out to be affine, which includes Caesar.
     pub affine: Option<affine::Candidate>,
+    /// Set when the text turned out to be a 2x2 Hill cipher.
+    pub hill: Option<hill::Candidate>,
     /// Set when the letters were the right ones in the wrong order.
     pub transposition: Option<transposition::Candidate>,
     /// Set when the alphabet was replaced wholesale.
@@ -570,13 +637,14 @@ pub struct Reading {
 /// XORed and the result is unreadable, so it gets hex or base64 wrapped to
 /// survive being pasted around. Unwrapping first is what makes the cipher
 /// visible at all.
-pub fn read(data: &[u8]) -> Reading {
+pub fn read_for_tags(data: &[u8], tags: &[String]) -> Reading {
     let nothing = |peel: Peel| Reading {
         peel,
         xor: xor::Recovery::default(),
         hash: None,
         vigenere: None,
         affine: None,
+        hill: None,
         transposition: None,
         substitution: None,
         dictionary: None,
@@ -597,7 +665,7 @@ pub fn read(data: &[u8]) -> Reading {
         };
     }
 
-    let peel = peel(data);
+    let peel = peel_with(data, tags);
     let inner = if peel.steps.is_empty() {
         data
     } else {
@@ -613,19 +681,20 @@ pub fn read(data: &[u8]) -> Reading {
     // shape stops the attacks before they start, on exactly the input most
     // likely to be an enciphered flag.
     let produced = !peel.steps.is_empty();
-    if (produced && conclusive(inner).is_some()) || plainness(inner) >= 0.5 {
+    if (produced && conclusive(inner, tags).is_some()) || plainness(inner) >= 0.5 {
         return nothing(peel);
     }
 
-    let xor = xor::recover(inner);
+    let xor = xor::recover(inner, tags);
 
     // Vigenère only ever produces letters, so a run of bytes that is not
     // mostly letters was never enciphered with it.
-    let vigenere = vigenere::solve(inner);
+    let vigenere = vigenere::solve(inner, tags);
 
     // Each of these answers on its own evidence, against a bar measured in
     // `tests::probe_bars`, rather than on whether another attack came up empty.
     let affine = affine::solve(inner);
+    let hill = hill::solve(inner);
     let transposition = transposition::solve(inner);
 
     // Affine is a substitution with a rule to it, so a text this reads will also
@@ -642,6 +711,7 @@ pub fn read(data: &[u8]) -> Reading {
     let settled = xor.found()
         || vigenere.is_some()
         || affine.is_some()
+        || hill.is_some()
         || transposition.is_some()
         || substitution.is_some();
 
@@ -667,7 +737,7 @@ pub fn read(data: &[u8]) -> Reading {
     // The working, shown whether or not an attack landed above. Text that
     // already reads never gets this far, which is right: forty ways of
     // rearranging a readable sentence is not evidence, it is clutter.
-    let derived = vigenere::derive(inner);
+    let derived = vigenere::derive(inner, tags);
 
     let shortlist = if settled {
         Vec::new()
@@ -683,6 +753,7 @@ pub fn read(data: &[u8]) -> Reading {
         hash: None,
         vigenere,
         affine,
+        hill,
         transposition,
         substitution,
         dictionary,
@@ -691,10 +762,20 @@ pub fn read(data: &[u8]) -> Reading {
     }
 }
 
+/// Reads a string the way Mantis would by default, with no configured tags.
+pub fn read(data: &[u8]) -> Reading {
+    read_for_tags(data, &[])
+}
+
 pub fn json(data: &[u8]) -> String {
+    json_for_tags(data, &[])
+}
+
+/// The peel, attacks, and working, for a caller that has configured flag tags.
+pub fn json_for_tags(data: &[u8], tags: &[String]) -> String {
     use crate::json::{push_field, push_number, push_string};
 
-    let reading = read(data);
+    let reading = read_for_tags(data, tags);
     let peeled = &reading.peel;
     let mut out = String::from("{");
 
@@ -773,6 +854,34 @@ pub fn json(data: &[u8]) -> String {
             push_number(&mut out, "a", found.a as usize);
             out.push(',');
             push_number(&mut out, "b", found.b as usize);
+            out.push(',');
+            push_string(&mut out, "score");
+            out.push_str(&format!(":{:.3}", found.score));
+            out.push(',');
+            push_field(
+                &mut out,
+                "plaintext",
+                &crate::json::latin1(&found.plaintext),
+            );
+            out.push('}');
+        }
+        None => out.push_str(":null"),
+    }
+    out.push(',');
+
+    push_string(&mut out, "hill");
+    match &reading.hill {
+        Some(found) => {
+            out.push_str(":{");
+            push_string(&mut out, "matrix");
+            out.push_str(":[");
+            for (i, &value) in found.key.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&value.to_string());
+            }
+            out.push(']');
             out.push(',');
             push_string(&mut out, "score");
             out.push_str(&format!(":{:.3}", found.score));

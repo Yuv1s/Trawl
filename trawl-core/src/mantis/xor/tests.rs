@@ -8,7 +8,7 @@ fn best(found: &[Candidate]) -> String {
 
 #[test]
 fn recovers_a_single_byte_key() {
-    let found = single_byte(&apply(PROSE, &[0x42]));
+    let found = single_byte(&apply(PROSE, &[0x42]), &[]);
 
     assert!(!found.is_empty(), "nothing came back");
     assert_eq!(found[0].key, vec![0x42]);
@@ -21,7 +21,7 @@ fn recovers_every_single_byte_key_there_is() {
     let mut missed = Vec::new();
 
     for key in 1..=255u8 {
-        let found = single_byte(&apply(PROSE, &[key]));
+        let found = single_byte(&apply(PROSE, &[key]), &[]);
         if found.first().map(|c| c.plaintext.as_slice()) != Some(PROSE) {
             missed.push(key);
         }
@@ -46,7 +46,7 @@ fn works_out_how_long_a_repeating_key_is() {
 #[test]
 fn recovers_a_repeating_key() {
     let long = PROSE.repeat(3);
-    let found = repeating(&apply(&long, b"SECRET")).expect("nothing came back");
+    let found = repeating(&apply(&long, b"SECRET"), &[]).expect("nothing came back");
 
     assert_eq!(found.key, b"SECRET".to_vec());
     assert_eq!(found.plaintext, long);
@@ -56,7 +56,7 @@ fn recovers_a_repeating_key() {
 fn recovers_a_repeating_key_of_an_awkward_length() {
     for key in [b"ab".as_slice(), b"key".as_slice(), b"longerkey".as_slice()] {
         let long = PROSE.repeat(4);
-        let found = repeating(&apply(&long, key))
+        let found = repeating(&apply(&long, key), &[])
             .unwrap_or_else(|| panic!("nothing back for key {:?}", String::from_utf8_lossy(key)));
 
         assert_eq!(
@@ -73,7 +73,7 @@ fn finds_a_flag_even_when_it_reads_like_nothing() {
     // Braces and underscores score badly as English, so a flag has to override
     // the readability bar rather than be filtered out by it.
     let flag = b"flag{x0r_k3y_r3c0v3r3d}";
-    let found = single_byte(&apply(flag, &[0x1f]));
+    let found = single_byte(&apply(flag, &[0x1f]), &[]);
 
     assert!(!found.is_empty(), "the flag was scored away");
     assert_eq!(found[0].plaintext, flag.to_vec());
@@ -94,7 +94,7 @@ fn reports_nothing_on_random_bytes() {
         })
         .collect();
 
-    let found = recover(&noise);
+    let found = recover(&noise, &[]);
     assert!(
         !found.found(),
         "invented {:?} out of noise",
@@ -115,14 +115,14 @@ fn reports_nothing_on_a_compressed_looking_blob() {
         .map(|i| ((i.wrapping_mul(2654435761)) >> 13) as u8)
         .collect();
 
-    assert!(!recover(&blob).found());
+    assert!(!recover(&blob, &[]).found());
 }
 
 #[test]
 fn leaves_plain_english_alone() {
     // Already readable, so the identity key is the only one that would "work",
     // and reporting it as a discovery would be noise.
-    let found = single_byte(PROSE);
+    let found = single_byte(PROSE, &[]);
     assert!(
         found.iter().all(|c| c.plaintext != PROSE),
         "claimed to have decrypted text that was never encrypted"
@@ -131,8 +131,8 @@ fn leaves_plain_english_alone() {
 
 #[test]
 fn declines_a_run_too_short_to_judge() {
-    assert!(repeating(b"short").is_none());
-    assert!(!recover(b"hi").found());
+    assert!(repeating(b"short", &[]).is_none());
+    assert!(!recover(b"hi", &[]).found());
 }
 
 #[test]
@@ -154,6 +154,7 @@ fn prints_a_readable_key_as_text_and_a_binary_one_as_hex() {
         plaintext: Vec::new(),
         score: 0.0,
         flags: Vec::new(),
+        convincing: false,
     };
     assert_eq!(text.key_text(), "\"SECRET\"");
 
@@ -162,6 +163,7 @@ fn prints_a_readable_key_as_text_and_a_binary_one_as_hex() {
         plaintext: Vec::new(),
         score: 0.0,
         flags: Vec::new(),
+        convincing: false,
     };
     assert_eq!(binary.key_text(), "00 ff");
 }
@@ -177,7 +179,7 @@ fn reports_the_shortest_key_rather_than_a_multiple_of_it() {
     // Any multiple of the real key decrypts perfectly, so the length search
     // often lands on one. "KEYKEY" is not wrong, but it is not the answer.
     let long = PROSE.repeat(4);
-    let found = repeating(&apply(&long, b"KEY")).expect("nothing came back");
+    let found = repeating(&apply(&long, b"KEY"), &[]).expect("nothing came back");
 
     assert_eq!(found.key, b"KEY".to_vec());
     assert_eq!(found.plaintext, long);

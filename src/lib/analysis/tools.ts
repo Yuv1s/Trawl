@@ -6,9 +6,13 @@ import {
 	type AudioSweep,
 	type ChiSquare,
 	type FlagHit,
+	type GifAnalysis,
 	type JpegError,
 	type JpegStego,
+	type NestedAnalysis,
+	type NestedArtifact,
 	type PaletteStego,
+	type PdfStructure,
 	type PlaneWall,
 	type RsAnalysis,
 	type Spectrogram,
@@ -27,7 +31,7 @@ export type ToolStatus = 'hit' | 'clear' | 'ready' | 'pending';
  * `png` needs the chunk walker, which no other format has. `audio` needs samples.
  * `jpeg` needs the coefficient decoder.
  */
-export type ToolScope = 'bytes' | 'pixels' | 'png' | 'audio' | 'jpeg' | 'zip';
+export type ToolScope = 'bytes' | 'pixels' | 'png' | 'audio' | 'jpeg' | 'zip' | 'pdf' | 'gif';
 
 /**
  * The two halves of the rack. Survey reads the file as it sits on disk;
@@ -82,6 +86,7 @@ const NO_WALKER = 'PNG only, for now';
 const NO_DECODER = 'no decoder for this format';
 const NO_AUDIO = 'not an audio file';
 const NO_ARCHIVE = 'not a ZIP archive';
+const NO_PDF = 'not a PDF document';
 const NO_COEFFICIENTS = 'no readable JPEG coefficients';
 
 /** Metadata fields a person types into, as opposed to ones a camera fills in. */
@@ -112,7 +117,28 @@ export type Findings = {
 	audio?: AudioSweep | null;
 	spectrogram?: Spectrogram | null;
 	zip?: ZipArchive | null;
+	pdf?: PdfStructure | null;
+	nested?: NestedAnalysis | null;
+	gif?: GifAnalysis | null;
 };
+
+/** Every finding anywhere in the nested tree, each carrying its full path. */
+export function nestedFindings(roots: NestedArtifact[]): { text: string; origin: string }[] {
+	const out: { text: string; origin: string }[] = [];
+	const walk = (artifact: NestedArtifact, path: string) => {
+		const here = path ? `${path} / ${artifact.name}` : artifact.name;
+		for (const finding of artifact.findings)
+			out.push({ text: finding.text, origin: finding.origin });
+		for (const child of artifact.children) walk(child, here);
+	};
+	for (const root of roots) walk(root, '');
+	return out;
+}
+
+/** Whether the automatic walk stopped because a budget ran out. */
+function nestedCapped(nested: NestedAnalysis | null): boolean {
+	return nested?.capped ?? false;
+}
 
 /**
  * Whether an archive shows any sign of having been edited.
@@ -156,9 +182,56 @@ function archiveNote(zip: ZipArchive): string {
 	return `${count} ${count === 1 ? 'entry' : 'entries'}, nothing out of place`;
 }
 
+/**
+ * Whether a PDF shows any sign of carrying more than it currently declares.
+ *
+ * A reader follows the trailer and the cross-reference table; it does not
+ * read the file. An object those no longer list, more than one `%%EOF`, or
+ * bytes past the last one are all ways a document holds something a reader
+ * would never show.
+ */
+function pdfOdd(pdf: PdfStructure): boolean {
+	return (
+		pdf.objects.some((o) => o.orphaned || (o.flags?.length ?? 0) > 0) ||
+		pdf.revisions > 1 ||
+		pdf.trailing > 0 ||
+		pdf.encrypted ||
+		pdf.embeddedFiles.length > 0
+	);
+}
+
+/** What to say about a PDF in one line of a tool rack. */
+function pdfNote(pdf: PdfStructure): string {
+	const withFlag = pdf.objects.filter((o) => (o.flags?.length ?? 0) > 0).length;
+	if (withFlag > 0) {
+		return `flag in ${withFlag === 1 ? 'a stream' : `${withFlag} streams`}`;
+	}
+	const orphaned = pdf.objects.filter((o) => o.orphaned).length;
+	if (orphaned > 0) {
+		return `${orphaned} not in the cross-reference table`;
+	}
+	if (pdf.embeddedFiles.length > 0) {
+		return `${pdf.embeddedFiles.length} attached`;
+	}
+	if (pdf.trailing > 0) {
+		return `${pdf.trailing.toLocaleString()} B appended`;
+	}
+	if (pdf.revisions > 1) {
+		return `${pdf.revisions} revisions`;
+	}
+	if (pdf.encrypted) {
+		return 'encrypted';
+	}
+
+	const count = pdf.objects.length;
+	return `${count} object${count === 1 ? '' : 's'}, nothing out of place`;
+}
+
 export function tools(found: Findings): Tool[] {
 	const { survey, structure = null, sweep = null, wall = null, chi = null, rs = null } = found;
 	const { audio = null, spectrogram = null, paletteStego = null, zip = null } = found;
+	const { pdf = null } = found;
+	const { nested = null, gif = null } = found;
 	const aes = found.aes ?? [];
 	const wav = found.wav && !isWavError(found.wav) ? found.wav : null;
 	const jpeg = found.jpeg && !isJpegError(found.jpeg) ? found.jpeg : null;
@@ -206,6 +279,11 @@ export function tools(found: Findings): Tool[] {
 			? { ...tool, scope: 'zip', group: 'survey' }
 			: { ...tool, scope: 'zip', group: 'survey', status: 'pending', value: NO_ARCHIVE };
 
+	const pdfTool = (tool: Partial): Tool =>
+		pdf
+			? { ...tool, scope: 'pdf', group: 'survey' }
+			: { ...tool, scope: 'pdf', group: 'survey', status: 'pending', value: NO_PDF };
+
 	const sound = (tool: Partial, group: ToolGroup = 'cuttlefish'): Tool =>
 		wav
 			? { ...tool, scope: 'audio', group }
@@ -230,6 +308,14 @@ export function tools(found: Findings): Tool[] {
 			status: zip && archiveOdd(zip) ? 'hit' : 'clear',
 			value: zip ? archiveNote(zip) : ''
 		}),
+		pdfTool({
+			id: 'pdf',
+			name: 'PDF structure',
+			measures:
+				'Walks a PDF for every object, and reports what the cross-reference table leaves out',
+			status: pdf && pdfOdd(pdf) ? 'hit' : 'clear',
+			value: pdf ? pdfNote(pdf) : ''
+		}),
 		{
 			id: 'magic',
 			name: 'Embedded files',
@@ -238,6 +324,15 @@ export function tools(found: Findings): Tool[] {
 			group: 'survey',
 			status: embedded.length ? 'hit' : 'clear',
 			value: embedded.length ? `${embedded.length} to extract` : 'none'
+		},
+		{
+			id: 'gif',
+			name: 'GIF frames',
+			measures: 'Checks every frame and the gaps between them for hidden bits',
+			scope: 'gif',
+			group: 'cuttlefish',
+			status: gifFrameStatus(gif),
+			value: gifFrameValue(gif, nested)
 		},
 		pixel({
 			id: 'lsb',
@@ -343,12 +438,14 @@ export function tools(found: Findings): Tool[] {
 		}),
 		sound({
 			id: 'spectrogram',
-			name: 'Spectrogram',
-			measures: 'Draws the sound, in case a picture is hiding in it',
-			status: spectrogram ? 'ready' : 'pending',
-			value: spectrogram
-				? `${spectrogram.seconds.toFixed(1)}s up to ${(spectrogram.maxFrequency / 1000).toFixed(1)} kHz`
-				: 'the clip is too short to draw'
+			name: 'Spectrogram & tones',
+			measures: 'Draws the sound and reads Morse or DTMF tones',
+			status: audio?.tones?.length ? 'hit' : spectrogram ? 'ready' : 'pending',
+			value: audio?.tones?.length
+				? audio.tones!.map((tone) => `${tone.kind}: ${tone.decoded}`).join(' · ')
+				: spectrogram
+					? `${spectrogram.seconds.toFixed(1)}s up to ${(spectrogram.maxFrequency / 1000).toFixed(1)} kHz`
+					: 'the clip is too short to draw'
 		}),
 		sound({
 			id: 'audio-lsb',
@@ -449,6 +546,28 @@ export function tools(found: Findings): Tool[] {
 			value: headerBroken ? 'blocked' : 'verified'
 		})
 	];
+}
+
+function gifFrameStatus(gif: GifAnalysis | null): ToolStatus {
+	if (!gif) return 'pending';
+	if (gif.error) return 'clear';
+	if (gif.sources.length === 0) return 'clear';
+	if (gif.sources.some((s) => s.lsb.candidates.length > 0 || s.chi?.detected || s.rs?.detected))
+		return 'hit';
+	return 'clear';
+}
+
+function gifFrameValue(gif: GifAnalysis | null, nested: NestedAnalysis | null): string {
+	if (!gif) return 'pixels unavailable';
+	if (gif.error) return `error: ${gif.error}`;
+	if (gif.sources.length === 0) return 'no frames analysed';
+	const frames = gif.sources.filter((s) => s.kind === 'frame').length;
+	const diffs = gif.sources.filter((s) => s.kind === 'difference').length;
+	let msg = `${frames} frame${frames === 1 ? '' : 's'} analysed`;
+	if (diffs > 0) msg += `, ${diffs} difference${diffs === 1 ? '' : 's'} checked`;
+	if (gif.capped) msg += ' · capped';
+	if (nestedCapped(nested)) msg += ' · walk capped';
+	return msg;
 }
 
 /** Named so the rack shows the whole instrument, not only the parts that work. */

@@ -99,10 +99,20 @@ export type Sweep = {
 	candidates: SweepCandidate[];
 };
 
+export type IhdrRepair = {
+	declaredWidth: number;
+	declaredHeight: number;
+	recoveredWidth: number;
+	recoveredHeight: number;
+	targetCrc: string;
+	field: 'width' | 'height';
+};
+
 export type Structure = {
 	signature: boolean;
 	size: number;
 	header: Header;
+	ihdrRepair?: IhdrRepair | null;
 	chunks: Chunk[];
 	text: TextChunk[];
 	flags: FlagHit[];
@@ -174,6 +184,8 @@ export type ZipEntry = {
 	text?: string;
 	/** Filled in by the worker: flag shapes found in the decompressed content. */
 	flags?: string[];
+	/** Filled in by the worker when the entry is small enough for in-memory re-analysis. */
+	bytes?: Uint8Array;
 	/** Set when the worker tried to decompress this entry and could not. */
 	readError?: string;
 };
@@ -199,12 +211,68 @@ export type ZipArchive = {
 	declared: number;
 };
 
+/** A stream's raw bytes inside a PDF object, wherever compression leaves them. */
+export type PdfStream = {
+	offset: number;
+	length: number;
+	/** The filter chain named in `/Filter`, joined with " then ". Empty when
+	 *  the stream carries its bytes uncompressed. */
+	filter: string;
+	/** Filled in once the worker has inflated a FlateDecode stream. Rust
+	 *  locates the bytes; inflate is a platform call. */
+	text?: string;
+	error?: string;
+};
+
+/** One `N G obj ... endobj` block. */
+export type PdfObject = {
+	number: number;
+	generation: number;
+	offset: number;
+	type: string | null;
+	subtype: string | null;
+	/** True when the document's own cross-reference table no longer lists
+	 *  this object's offset: bytes left over from an earlier revision that a
+	 *  reader following the table would never see. */
+	orphaned: boolean;
+	stream: PdfStream | null;
+	/** Flags found after inflating a compressed stream. Set by the worker,
+	 *  never by Rust: a flag hiding in a FlateDecode stream is invisible to
+	 *  any byte-level scan that ran before the stream was inflated. */
+	flags?: string[];
+};
+
+export type PdfStructure = {
+	/** The version named in the file's own `%PDF-` header. */
+	version: string;
+	/** Bytes after the last `%%EOF`, appended by something other than
+	 *  whatever wrote the document. */
+	trailing: number;
+	encrypted: boolean;
+	/** True when the cross-reference table is a stream rather than the
+	 *  classic plain-text form, which this reads without decoding: it is
+	 *  itself compressed, so every object's `orphaned` flag stays false
+	 *  rather than guessing. */
+	usesXrefStream: boolean;
+	/** How many `%%EOF` markers the file holds. More than one means the
+	 *  document has been incrementally updated at least once. */
+	revisions: number;
+	/** `/Info` dictionary fields this reads: Title, Author, Subject,
+	 *  Producer, Creator, CreationDate, ModDate. */
+	info: { key: string; value: string }[];
+	/** Object numbers whose `/Subtype` names them as a file attachment. */
+	embeddedFiles: number[];
+	objects: PdfObject[];
+};
+
 /** One encoding layer removed from a pasted string. */
 export type PeelStep = {
 	encoding: string;
 	/** Why it was kept: a gain in readability, a flag, or a file signature. */
 	reason: string;
 	output: string;
+	/** Set when the step was a gzip or zlib decompression done by the platform. */
+	compressed?: boolean;
 };
 
 /** A recovered XOR key and what it decrypted to. */
@@ -243,6 +311,8 @@ export type PeelResult = {
 	vigenere: { key: string; score: number; plaintext: string } | null;
 	/** Set when the text turned out to be affine, which includes Caesar. */
 	affine: AffineBreak | null;
+	/** Set when the text turned out to be a 2x2 Hill cipher. */
+	hill: HillBreak | null;
 	/** Set when the letters were the right ones in the wrong order. */
 	transposition: TranspositionBreak | null;
 	/** Set when the alphabet was replaced wholesale. */
@@ -324,6 +394,16 @@ export type Rotation = {
 export type AffineBreak = {
 	a: number;
 	b: number;
+	score: number;
+	plaintext: string;
+};
+
+/**
+ * A recovered Hill key: a 2x2 matrix mod 26, read left to right, top to
+ * bottom, that every pair of letters was multiplied by.
+ */
+export type HillBreak = {
+	matrix: [number, number, number, number];
 	score: number;
 	plaintext: string;
 };
@@ -441,10 +521,18 @@ export type AudioCandidate = {
 	flags: string[];
 };
 
+export type ToneFinding = {
+	kind: 'Morse' | 'DTMF';
+	decoded: string;
+	confidence: number;
+	units: number;
+};
+
 export type AudioSweep = {
 	samples: number;
 	combinations: number;
 	candidates: AudioCandidate[];
+	tones?: ToneFinding[];
 };
 
 export type Spectrogram = {
@@ -502,11 +590,91 @@ export type PlaneWall = {
 	thumbnails: Uint8Array;
 };
 
+/** One compact result for a displayed GIF frame or a consecutive pair. */
+export type GifSource = {
+	kind: 'frame' | 'difference';
+	/** One-based frame this source came from. */
+	from: number;
+	/** Present only for a difference: the earlier frame it is measured against. */
+	to: number | null;
+	/** Delay in hundredths of a second, and the disposal method, for a plain frame. */
+	delay: number | null;
+	disposal: string | null;
+	/** LSB sweep over this exact frame or difference. */
+	lsb: Sweep;
+	/** The chi-square verdict over the same pixels. */
+	chi: { detected: boolean; embeddedFraction: number } | null;
+	/** The RS verdict over the same pixels. */
+	rs: { detected: boolean; rate: number } | null;
+};
+
+/**
+ * What automatic frame analysis found, for GIF files.
+ *
+ * Compact on purpose: the per-frame pixels and plane walls stay behind, and a
+ * frame worth a closer look gets the ordinary full analysis.
+ */
+export type GifAnalysis = {
+	width: number;
+	height: number;
+	declaredFrames: number;
+	analysedFrames: number;
+	/** True when a work budget stopped the walk before every frame. */
+	capped: boolean;
+	/** Why no frame could be read, when the file is a GIF this reader refuses. */
+	error: string | null;
+	sources: GifSource[];
+};
+
+/** One finding recovered from a nested file, headed back to the root by origin. */
+export type DerivedFinding = {
+	text: string;
+	/** The detector that reported it, in words a person would use. */
+	detector: string;
+	/** Path from the root down: `outer.zip / images/clue.gif`. */
+	origin: string;
+	/** Short reason or preview where the detector offers one. */
+	reason: string;
+};
+
+/** One automatically analysed child of the root file. */
+export type NestedArtifact = {
+	/** Stable across the analysis, and unique within it. */
+	id: string;
+	name: string;
+	/** Where the child came from inside its parent. */
+	source: 'zip' | 'carved';
+	/** Offset in the parent: a local header for a ZIP entry, the marker for a carved file. */
+	offset: number;
+	format: string | null;
+	size: number;
+	depth: number;
+	status: 'analysed' | 'skipped' | 'error';
+	/** Set when status is not `analysed`: what stopped the walk. */
+	reason?: string;
+	/** This child's findings and everything below it. */
+	findings: DerivedFinding[];
+	children: NestedArtifact[];
+};
+
+/** Budget accounting for the recursive walk over embedded files. */
+export type NestedAnalysis = {
+	roots: NestedArtifact[];
+	/** Files fully analysed, across the whole tree. */
+	analysed: number;
+	/** Files skipped without a full run. */
+	skipped: number;
+	/** Child bytes decompressed or carved, tracked against the aggregate cap. */
+	expandedBytes: number;
+	/** True when a depth, count, per-file, or aggregate budget stopped the walk. */
+	capped: boolean;
+};
+
 export type AnalysisRequest =
-	| { kind: 'analyse'; id: number; name: string; bytes: ArrayBuffer }
+	| { kind: 'analyse'; id: number; name: string; bytes: ArrayBuffer; flagTags: string }
 	| { kind: 'plane'; id: number; channel: number; bit: number }
 	| { kind: 'extract'; id: number; channels: string; bit: number; msbFirst: boolean }
-	| { kind: 'peel'; id: number; text: string }
+	| { kind: 'peel'; id: number; text: string; flagTags: string }
 	| { kind: 'extractPalette'; id: number; msbFirst: boolean }
 	| {
 			kind: 'extractJpeg';
@@ -514,7 +682,7 @@ export type AnalysisRequest =
 			includeDc: boolean;
 			msbFirst: boolean;
 	  }
-	| { kind: 'withKey'; id: number; text: string; key: string }
+	| { kind: 'withKey'; id: number; text: string; key: string; flagTags: string }
 	| {
 			kind: 'extractAudio';
 			id: number;
@@ -541,6 +709,8 @@ export type AnalysisResponse =
 			paletteStego: PaletteStego | null;
 			/** Null when the file is not a ZIP archive. */
 			zip: ZipArchive | null;
+			/** Null when the file is not a PDF document. */
+			pdf: PdfStructure | null;
 			/** AES-CBC decryptions the file's own key and payload produced. Empty for most files. */
 			aes: AesSolved[];
 			sweep: Sweep | null;
@@ -551,6 +721,10 @@ export type AnalysisResponse =
 			spectrogram: Spectrogram | null;
 			pixelError: string | null;
 			audioError: string | null;
+			/** Recursive analysis of files inside this file; null only when nothing was attempted. */
+			nested: NestedAnalysis | null;
+			/** Automatic per-frame and per-difference analysis for GIF files. */
+			gif: GifAnalysis | null;
 	  }
 	| { id: number; status: 'peel'; input: string; peel: PeelResult }
 	| { id: number; status: 'keyed'; key: string; attempts: KeyAttempt[] }

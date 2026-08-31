@@ -80,6 +80,30 @@ fn payload(len: usize, base: u8) -> Vec<u8> {
 }
 
 #[test]
+fn recovers_a_tampered_ihdr_height_from_its_stored_crc() {
+    let mut file = png(320, 240, 8, 2, &[]);
+    let ihdr = chunks(&file).into_iter().find(|c| c.is(b"IHDR")).unwrap();
+    file[ihdr.data_offset + 4..ihdr.data_offset + 8].copy_from_slice(&100u32.to_be_bytes());
+
+    let repair = recover_ihdr_dimensions(&file, 1024).unwrap();
+    assert_eq!(repair.field, "height");
+    assert_eq!(repair.declared_height, 100);
+    assert_eq!(repair.recovered_width, 320);
+    assert_eq!(repair.recovered_height, 240);
+}
+
+#[test]
+fn patches_ihdr_dimensions_and_recalculates_the_crc() {
+    let file = png(320, 100, 8, 2, &[]);
+    let patched = patch_ihdr(&file, 320, 240).unwrap();
+    let header = header(&patched).unwrap();
+    let ihdr = chunks(&patched).into_iter().find(|c| c.is(b"IHDR")).unwrap();
+
+    assert_eq!((header.width, header.height), (320, 240));
+    assert!(ihdr.crc_ok);
+}
+
+#[test]
 fn paeth_picks_the_predictor_nearest_the_estimate() {
     assert_eq!(paeth(0, 0, 0), 0);
     assert_eq!(paeth(10, 20, 30), 10, "p=0, a is nearest");

@@ -62,6 +62,16 @@ impl Chunk {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IhdrRepair {
+    pub declared_width: u32,
+    pub declared_height: u32,
+    pub recovered_width: u32,
+    pub recovered_height: u32,
+    pub target_crc: u32,
+    pub field: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PngError {
     NotPng,
     MissingHeader,
@@ -182,6 +192,75 @@ pub fn chunks(file: &[u8]) -> Vec<Chunk> {
 
 fn chunk_data(file: &[u8], chunk: Chunk) -> &[u8] {
     &file[chunk.data_offset..chunk.data_offset + chunk.length]
+}
+
+pub fn recover_ihdr_dimensions(file: &[u8], max_dimension: u32) -> Option<IhdrRepair> {
+    if !has_signature(file) {
+        return None;
+    }
+
+    let ihdr = chunks(file)
+        .into_iter()
+        .find(|c| c.is(b"IHDR") && c.length == 13 && !c.crc_ok)?;
+    let data = chunk_data(file, ihdr);
+    let declared_width = be_u32(data, 0)?;
+    let declared_height = be_u32(data, 4)?;
+    let target_crc = be_u32(file, ihdr.data_offset + ihdr.length)?;
+
+    let mut candidate = [0u8; 17];
+    candidate[..4].copy_from_slice(b"IHDR");
+    candidate[4..].copy_from_slice(data);
+
+    for recovered_height in 1..=max_dimension {
+        if recovered_height == declared_height {
+            continue;
+        }
+        candidate[8..12].copy_from_slice(&recovered_height.to_be_bytes());
+        if crc32(&candidate) == target_crc {
+            return Some(IhdrRepair {
+                declared_width,
+                declared_height,
+                recovered_width: declared_width,
+                recovered_height,
+                target_crc,
+                field: "height",
+            });
+        }
+    }
+
+    candidate[8..12].copy_from_slice(&declared_height.to_be_bytes());
+    for recovered_width in 1..=max_dimension {
+        if recovered_width == declared_width {
+            continue;
+        }
+        candidate[4..8].copy_from_slice(&recovered_width.to_be_bytes());
+        if crc32(&candidate) == target_crc {
+            return Some(IhdrRepair {
+                declared_width,
+                declared_height,
+                recovered_width,
+                recovered_height: declared_height,
+                target_crc,
+                field: "width",
+            });
+        }
+    }
+
+    None
+}
+
+pub fn patch_ihdr(file: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    let ihdr = chunks(file)
+        .into_iter()
+        .find(|c| c.is(b"IHDR") && c.length == 13)?;
+    let mut patched = file.to_vec();
+    patched[ihdr.data_offset..ihdr.data_offset + 4].copy_from_slice(&width.to_be_bytes());
+    patched[ihdr.data_offset + 4..ihdr.data_offset + 8].copy_from_slice(&height.to_be_bytes());
+
+    let crc_at = ihdr.data_offset + ihdr.length;
+    let crc = crc32(&patched[ihdr.offset + 4..crc_at]);
+    patched[crc_at..crc_at + 4].copy_from_slice(&crc.to_be_bytes());
+    Some(patched)
 }
 
 pub fn header(file: &[u8]) -> Result<Header, PngError> {
@@ -810,6 +889,28 @@ pub fn structure_json(file: &[u8]) -> String {
             push_field(&mut out, "error", &e.to_string());
             out.push('}');
         }
+    }
+
+    out.push(',');
+    push_string(&mut out, "ihdrRepair");
+    out.push(':');
+    match recover_ihdr_dimensions(file, 16_384) {
+        Some(repair) => {
+            out.push('{');
+            push_number(&mut out, "declaredWidth", repair.declared_width as usize);
+            out.push(',');
+            push_number(&mut out, "declaredHeight", repair.declared_height as usize);
+            out.push(',');
+            push_number(&mut out, "recoveredWidth", repair.recovered_width as usize);
+            out.push(',');
+            push_number(&mut out, "recoveredHeight", repair.recovered_height as usize);
+            out.push(',');
+            push_field(&mut out, "targetCrc", &format!("{:08x}", repair.target_crc));
+            out.push(',');
+            push_field(&mut out, "field", repair.field);
+            out.push('}');
+        }
+        None => out.push_str("null"),
     }
 
     out.push(',');

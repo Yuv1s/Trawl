@@ -1,7 +1,15 @@
 <script lang="ts">
-	import type { Spectrogram } from '$lib/worker/protocol';
+	import type { Spectrogram, ToneFinding } from '$lib/worker/protocol';
 
-	let { spectrogram, error }: { spectrogram: Spectrogram | null; error: string | null } = $props();
+	let {
+		spectrogram,
+		toneFindings = [],
+		error
+	}: {
+		spectrogram: Spectrogram | null;
+		toneFindings?: ToneFinding[];
+		error: string | null;
+	} = $props();
 
 	/**
 	 * A picture drawn at the bottom of the dynamic range is nearly black against
@@ -88,6 +96,18 @@
 		hz >= 1000 ? `${(hz / 1000).toFixed(1)}k` : Math.round(hz).toString();
 </script>
 
+{#if toneFindings.length > 0}
+	<ul class="tones" aria-label="Decoded audio tones">
+		{#each toneFindings as finding (finding.kind + finding.decoded)}
+			<li>
+				<span class="label">{finding.kind}</span>
+				<output class="mono">{finding.decoded}</output>
+				<span class="muted mono">{Math.round(finding.confidence * 100)}% signal fit</span>
+			</li>
+		{/each}
+	</ul>
+{/if}
+
 {#if !spectrogram}
 	<p class="clear">
 		No spectrogram was drawn.{error
@@ -165,6 +185,34 @@
 {/if}
 
 <style>
+	.tones {
+		list-style: none;
+		margin: 0 0 var(--s4);
+		padding: var(--s3) var(--s4);
+		background: var(--panel-deep);
+		border: 1px solid var(--rule);
+		display: grid;
+		gap: var(--s3);
+	}
+
+	.tones li {
+		display: grid;
+		grid-template-columns: auto minmax(0, 1fr) auto;
+		align-items: baseline;
+		gap: var(--s3);
+	}
+
+	.tones output {
+		color: var(--signal);
+		font-size: var(--t-mid);
+		overflow-wrap: anywhere;
+	}
+
+	.tones .muted {
+		font-size: var(--t-label);
+		color: var(--muted);
+	}
+
 	.clear {
 		margin: 0;
 		color: var(--muted);

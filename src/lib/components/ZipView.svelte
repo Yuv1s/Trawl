@@ -1,7 +1,17 @@
 <script lang="ts">
-	import type { ZipArchive } from '$lib/worker/protocol';
+	import type { ZipArchive, ZipEntry, NestedArtifact, NestedAnalysis } from '$lib/worker/protocol';
 
-	let { archive }: { archive: ZipArchive } = $props();
+	let {
+		archive,
+		onanalyse,
+		onpeel,
+		nested
+	}: {
+		archive: ZipArchive;
+		onanalyse?: (bytes: Uint8Array, name: string) => void;
+		onpeel?: (text: string) => void;
+		nested?: NestedAnalysis | null;
+	} = $props();
 
 	const listed = $derived(archive.entries.filter((e) => !e.undeclared).length);
 	const hidden = $derived(archive.entries.filter((e) => e.undeclared));
@@ -24,6 +34,42 @@
 
 	const bytes = (n: number) => `${n.toLocaleString()} B`;
 	const hex = (n: number) => `0x${n.toString(16).padStart(6, '0')}`;
+
+	/** Find nested analysis matching this entry by name and/or offset. */
+	function nestedFor(entry: ZipEntry): NestedArtifact | undefined {
+		if (!nested) return undefined;
+		const walk = (roots: NestedArtifact[]): NestedArtifact | undefined => {
+			for (const child of roots) {
+				if (
+					child.source === 'zip' &&
+					(child.name === entry.name || child.offset === entry.offset)
+				) {
+					return child;
+				}
+				const deeper = walk(child.children);
+				if (deeper) return deeper;
+			}
+			return undefined;
+		};
+		return walk(nested.roots);
+	}
+
+	function statusChip(status: 'analysed' | 'skipped' | 'error', reason?: string): string {
+		switch (status) {
+			case 'analysed':
+				return '✓ analysed';
+			case 'skipped':
+				return reason ? `skipped: ${reason}` : 'skipped';
+			case 'error':
+				return reason ? `error: ${reason}` : 'error';
+		}
+	}
+
+	function findingsCount(artifact: NestedArtifact): number {
+		let count = artifact.findings.length;
+		for (const child of artifact.children) count += findingsCount(child);
+		return count;
+	}
 </script>
 
 <div class="zip">
@@ -79,6 +125,7 @@
 				<th scope="col" class="label num">Stored</th>
 				<th scope="col" class="label num">Actual</th>
 				<th scope="col" class="label">Offset</th>
+				<th scope="col" class="label">Auto-analysis</th>
 			</tr>
 		</thead>
 		<tbody>
@@ -86,6 +133,15 @@
 				<tr class:odd={entry.undeclared || entry.disagreement !== null}>
 					<td>
 						<span class="mono name">{entry.name}</span>
+						{#if entry.bytes && onanalyse}
+							<button
+								class="entry-action"
+								type="button"
+								onclick={() => onanalyse?.(entry.bytes!, entry.name)}
+							>
+								Analyse
+							</button>
+						{/if}
 						{#if entry.undeclared}
 							<span class="mono chip flagged">not in the directory</span>
 						{/if}
@@ -97,6 +153,19 @@
 					<td class="mono num">{bytes(entry.compressed)}</td>
 					<td class="mono num">{bytes(entry.uncompressed)}</td>
 					<td class="mono muted">{hex(entry.offset)}</td>
+					<td class="muted">
+						{#if nestedFor(entry)}
+							{@const child = nestedFor(entry)!}
+							<span class="chip">{statusChip(child.status, child.reason)}</span>
+							{#if findingsCount(child) > 0}
+								<span class="mono chip flagged"
+									>{findingsCount(child)} finding{findingsCount(child) === 1 ? '' : 's'}</span
+								>
+							{/if}
+						{:else}
+							<span class="muted">not analysed</span>
+						{/if}
+					</td>
 				</tr>
 				{#if entry.comment}
 					<tr class="aside">
@@ -106,7 +175,13 @@
 				{#if entry.text}
 					<tr class="aside">
 						<td colspan="5">
-							<span class="label">content</span>
+							<div class="content-head">
+								<span class="label">content</span>
+								{#if onpeel}
+									<button type="button" onclick={() => onpeel?.(entry.text!)}>Send to Mantis</button
+									>
+								{/if}
+							</div>
 							<pre class="content mono">{entry.text}</pre>
 						</td>
 					</tr>
@@ -211,6 +286,31 @@
 
 	.name {
 		overflow-wrap: anywhere;
+	}
+
+	.entry-action,
+	.content-head button {
+		margin-left: var(--s2);
+		background: none;
+		border: 1px solid var(--rule-bright);
+		color: var(--text);
+		font: inherit;
+		font-size: var(--t-label);
+		padding: 1px var(--s2);
+		cursor: pointer;
+	}
+
+	.entry-action:focus-visible,
+	.content-head button:focus-visible {
+		outline: 2px solid var(--signal);
+		outline-offset: 2px;
+	}
+
+	.content-head {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: var(--s3);
 	}
 
 	/* A row worth a second look, marked on the edge rather than by filling it,

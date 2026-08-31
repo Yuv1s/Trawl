@@ -1,7 +1,11 @@
 <script lang="ts">
 	import type { Found } from '$lib/worker/protocol';
 
-	let { total, sample }: { total: number; sample: Found[] } = $props();
+	let {
+		total,
+		sample,
+		onpeel
+	}: { total: number; sample: Found[]; onpeel?: (text: string) => void } = $props();
 
 	let filter = $state('');
 
@@ -36,6 +40,9 @@
 				<li>
 					<span class="offset">{found.offset.toString(16).padStart(6, '0')}</span>
 					<span class="text">{found.text}</span>
+					{#if onpeel}
+						<button type="button" onclick={() => onpeel?.(found.text)}>Peel</button>
+					{/if}
 				</li>
 			{/each}
 		</ul>
@@ -86,7 +93,7 @@
 
 	li {
 		display: grid;
-		grid-template-columns: 7ch 1fr;
+		grid-template-columns: 7ch minmax(0, 1fr) auto;
 		gap: var(--s3);
 		padding: 2px 0;
 		border-bottom: 1px solid color-mix(in srgb, var(--rule) 45%, transparent);
@@ -98,6 +105,21 @@
 
 	.text {
 		overflow-wrap: anywhere;
+	}
+
+	li button {
+		background: none;
+		border: 0;
+		color: var(--muted);
+		font: inherit;
+		font-size: var(--t-label);
+		padding: 0 var(--s1);
+		cursor: pointer;
+	}
+
+	li button:focus-visible {
+		outline: 2px solid var(--signal);
+		outline-offset: 2px;
 	}
 
 	.empty,

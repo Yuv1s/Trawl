@@ -436,6 +436,33 @@ const CRIB_TAGS: [&str; 10] = [
     "picoctf", "testctf", "crypto", "flag", "pico", "ctf", "htb", "thm", "key", "the",
 ];
 
+/// The tags worth cribbing, configured ones first.
+///
+/// Anything the owner has listed as a flag prefix is the strongest thing a crib
+/// can claim: it was named, not just guessed. They arrive longest first so a
+/// longer match pins more positions, then the built-in list fills out the rest.
+fn crib_tags(tags: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = tags
+        .iter()
+        .filter_map(|tag| {
+            let letters: String = tag
+                .chars()
+                .filter(|c| c.is_ascii_alphabetic())
+                .flat_map(|c| c.to_lowercase())
+                .collect();
+            if letters.is_empty() {
+                None
+            } else {
+                Some(letters)
+            }
+        })
+        .collect();
+
+    out.sort_by_key(|tag| core::cmp::Reverse(tag.len()));
+    out.extend(CRIB_TAGS.iter().map(|tag| (*tag).to_string()));
+    out
+}
+
 /// How many of the best tails to keep once a crib has settled the rest.
 ///
 /// More than one because the last position is where the evidence runs out. With
@@ -534,7 +561,7 @@ fn climb_free(start: &[u8], fixed: &[bool], score: impl Fn(&[u8]) -> f64) -> (Ve
 ///
 /// It costs nothing when it is wrong, because a wrong crib produces a key like
 /// any other and is judged like any other.
-pub fn from_crib(data: &[u8]) -> Vec<(Vec<u8>, usize, usize)> {
+pub fn from_crib(data: &[u8], tags: &[String]) -> Vec<(Vec<u8>, usize, usize)> {
     let letters = indices(data);
     if letters.len() < COUNTABLE * 2 {
         return Vec::new();
@@ -549,7 +576,7 @@ pub fn from_crib(data: &[u8]) -> Vec<(Vec<u8>, usize, usize)> {
     let mut out: Vec<(Vec<u8>, usize, usize)> = Vec::new();
 
     for (start, run) in sites {
-        for tag in CRIB_TAGS {
+        for tag in crib_tags(tags) {
             if tag.len() > run {
                 continue;
             }
@@ -787,7 +814,7 @@ const COUNTABLE: usize = 2;
 /// name their shift confidently and two letters name it by coin toss, which is
 /// why [`Derived::per_column`] is reported alongside and why this is a list to
 /// read rather than an answer to take.
-pub fn derive(data: &[u8]) -> Vec<Derived> {
+pub fn derive(data: &[u8], tags: &[String]) -> Vec<Derived> {
     let letters = letters_of(data);
     if letters.len() < COUNTABLE * 2 {
         return Vec::new();
@@ -801,7 +828,7 @@ pub fn derive(data: &[u8]) -> Vec<Derived> {
     // Keys a flag shape settles outright come first, because they were not
     // guessed at: four letters of a crib subtract four key positions straight
     // out of the ciphertext, and only what is left has to be searched for.
-    let mut candidates: Vec<(Vec<u8>, usize, usize)> = from_crib(data);
+    let mut candidates: Vec<(Vec<u8>, usize, usize)> = from_crib(data, tags);
 
     for length in 1..=longest {
         candidates.push((best_of_length(data, &numbered, length, &mut rng), 0, 0));
@@ -953,7 +980,7 @@ const SOLVE_BELOW: usize = 5;
 ///
 /// What has not changed is the refusal to guess. A key is reported only when
 /// the text it produces reads, and on a short ciphertext nothing will.
-pub fn solve(data: &[u8]) -> Option<Candidate> {
+pub fn solve(data: &[u8], tags: &[String]) -> Option<Candidate> {
     let letters = letters_of(data);
     if letters.len() < MIN_LETTERS {
         return None;
@@ -961,7 +988,7 @@ pub fn solve(data: &[u8]) -> Option<Candidate> {
 
     let before = plainness(data);
 
-    derive(data)
+    derive(data, tags)
         .into_iter()
         .filter(|found| {
             found.per_column >= SOLVE_BELOW

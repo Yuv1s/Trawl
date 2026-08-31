@@ -520,8 +520,16 @@ pub fn uuencode(data: &[u8]) -> Option<Vec<u8>> {
             continue;
         }
 
+        // Exactly, not merely enough: a real uuencode line is fully spent by
+        // its own declared length, and accepting extra trailing bytes is what
+        // let an arbitrary run of letters through. A plain Hill or Playfair
+        // ciphertext is nothing but uppercase letters with no line breaks at
+        // all, so the whole string became "one line," and a length byte plus
+        // enough characters after it was true of nearly any such string long
+        // enough to hold a message — matching the shape without ever being
+        // uuencode.
         let quads = length.div_ceil(3);
-        if raw.len() < 1 + quads * 4 {
+        if raw.len() != 1 + quads * 4 {
             return None;
         }
 

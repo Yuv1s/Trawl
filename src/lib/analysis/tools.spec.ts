@@ -1,6 +1,17 @@
 ﻿import { describe, expect, it } from 'vitest';
 import { flagsOf, PLANNED, tools } from './tools';
-import type { Chunk, Structure, Survey, WavStructure } from '$lib/worker/protocol';
+import type {
+	Chunk,
+	GifAnalysis,
+	NestedAnalysis,
+	Structure,
+	Survey,
+	Sweep,
+	SweepCandidate,
+	WavStructure,
+	ZipArchive,
+	ZipEntry
+} from '$lib/worker/protocol';
 
 const chunk = (kind: string, offset: number, length = 0, crcOk = true): Chunk => ({
 	kind,
@@ -273,6 +284,264 @@ describe('audio', () => {
 		const broken = { error: 'no fmt chunk, so the samples cannot be read', chunks: [] };
 		const level = tools({ survey, wav: broken }).filter((t) => t.scope === 'audio');
 		expect(level.every((t) => t.status === 'pending')).toBe(true);
+	});
+});
+
+describe('gif frames', () => {
+	const gif = (over: Partial<GifAnalysis> = {}): GifAnalysis =>
+		({
+			width: 16,
+			height: 16,
+			declaredFrames: 1,
+			analysedFrames: 1,
+			capped: false,
+			error: null,
+			sources: [],
+			...over
+		}) as GifAnalysis;
+
+	const lsb = (preview: string, flags: string[]): SweepCandidate => ({
+		channels: 'rgb',
+		bit: 0,
+		msbFirst: false,
+		reason: 'text at offset 0',
+		preview,
+		readable: preview.length,
+		bytesRead: 4096,
+		flags
+	});
+
+	const emptySweep = (): Sweep => ({ pixels: 4096, combinations: 0, candidates: [] });
+
+	const withGif = (g: GifAnalysis | null, nested: NestedAnalysis | null = null) =>
+		tools({ survey, gif: g, nested }).find((t) => t.id === 'gif');
+
+	it('stands the GIF tool down on a file with no frame analysis', () => {
+		expect(withGif(null)?.status).toBe('pending');
+		expect(withGif(null)?.value).toBe('pixels unavailable');
+	});
+
+	it('reports an error instead of claiming a finding', () => {
+		const broken = gif({ error: 'no image data', sources: [] });
+		const g = withGif(broken)!;
+		expect(g.status).toBe('clear');
+		expect(g.value).toBe('error: no image data');
+	});
+
+	it('reports analysed frames and differences but no find on a clean animation', () => {
+		const clean = gif({
+			declaredFrames: 3,
+			analysedFrames: 3,
+			sources: [
+				{
+					kind: 'frame',
+					from: 1,
+					to: null,
+					delay: 5,
+					disposal: null,
+					lsb: emptySweep(),
+					chi: null,
+					rs: null
+				},
+				{
+					kind: 'frame',
+					from: 2,
+					to: null,
+					delay: 5,
+					disposal: null,
+					lsb: emptySweep(),
+					chi: null,
+					rs: null
+				},
+				{
+					kind: 'frame',
+					from: 3,
+					to: null,
+					delay: 5,
+					disposal: null,
+					lsb: emptySweep(),
+					chi: null,
+					rs: null
+				},
+				{
+					kind: 'difference',
+					from: 1,
+					to: 2,
+					delay: null,
+					disposal: null,
+					lsb: emptySweep(),
+					chi: null,
+					rs: null
+				},
+				{
+					kind: 'difference',
+					from: 2,
+					to: 3,
+					delay: null,
+					disposal: null,
+					lsb: emptySweep(),
+					chi: null,
+					rs: null
+				}
+			]
+		});
+		expect(withGif(clean)?.status).toBe('clear');
+		expect(withGif(clean)?.value).toBe('3 frames analysed, 2 differences checked');
+	});
+
+	it('calls out the hidden bits as a hit with origin context', () => {
+		const stealthy = gif({
+			declaredFrames: 2,
+			analysedFrames: 2,
+			sources: [
+				{
+					kind: 'difference',
+					from: 1,
+					to: 2,
+					delay: null,
+					disposal: null,
+					lsb: { pixels: 4096, combinations: 0, candidates: [lsb('flag{blink}', ['flag{blink}'])] },
+					chi: null,
+					rs: null
+				}
+			]
+		});
+		expect(withGif(stealthy)?.status).toBe('hit');
+	});
+
+	it('signals a frame budget that stopped the walk', () => {
+		const cappedFlow = gif({
+			declaredFrames: 200,
+			analysedFrames: 128,
+			capped: true,
+			sources: [
+				{
+					kind: 'frame',
+					from: 1,
+					to: null,
+					delay: 5,
+					disposal: null,
+					lsb: emptySweep(),
+					chi: null,
+					rs: null
+				}
+			]
+		});
+		expect(withGif(cappedFlow)?.value).toContain('capped');
+	});
+
+	it('notes when the nested walk capped alongside the frame analysis', () => {
+		const nested = { capped: true } as NestedAnalysis;
+		const cappedFlow = gif({
+			declaredFrames: 200,
+			analysedFrames: 128,
+			capped: true,
+			sources: [
+				{
+					kind: 'frame',
+					from: 1,
+					to: null,
+					delay: 5,
+					disposal: null,
+					lsb: emptySweep(),
+					chi: null,
+					rs: null
+				}
+			]
+		});
+		expect(withGif(cappedFlow, nested)?.value).toContain('walk capped');
+	});
+});
+
+describe('nested analysis', () => {
+	const root = (over: Partial<NestedAnalysis> = {}): NestedAnalysis => ({
+		analysed: 0,
+		skipped: 0,
+		expandedBytes: 0,
+		capped: false,
+		roots: [],
+		...over
+	});
+
+	it('reports a hit on the archive tool when a nested child carried a flag', () => {
+		// The root survey announces a ZIP; the nested walk found a flag inside an entry.
+		const s: Survey = {
+			...survey,
+			magic: [{ offset: 0, label: 'ZIP archive', length: 1024, bounded: true, embedded: false }]
+		};
+		const entry: ZipEntry = {
+			name: 'readme.txt',
+			method: 'stored',
+			compressed: 10,
+			uncompressed: 40,
+			offset: 4,
+			dataOffset: 8,
+			crc: '00000000',
+			encrypted: false,
+			undeclared: false,
+			comment: '',
+			disagreement: null,
+			flags: ['flag{inner}']
+		};
+		const zip: ZipArchive = {
+			prefix: 0,
+			trailing: 0,
+			declared: 1,
+			comment: '',
+			entries: [entry]
+		};
+		const nested = root({
+			analysed: 1,
+			roots: [
+				{
+					id: 'zip-0',
+					name: 'readme.txt',
+					source: 'zip',
+					offset: 4,
+					format: 'text',
+					size: 40,
+					depth: 1,
+					status: 'analysed',
+					findings: [
+						{ text: 'flag{inner}', detector: 'flag scan', origin: 'archive.zip', reason: '' }
+					],
+					children: []
+				}
+			]
+		});
+		const g = tools({ survey: s, zip, nested }).find((t) => t.id === 'archive')!;
+		expect(g.status).toBe('hit');
+		expect(g.value).toBe('flag in an entry');
+	});
+
+	it('backs the embedded-file tool, staying clear when carved children find nothing', () => {
+		// Skipped and empty children surface as an analysed count but carry no finding.
+		const nested = root({
+			analysed: 2,
+			skipped: 1,
+			roots: [
+				{
+					id: 'carved-0',
+					name: 'stray.bmp',
+					source: 'carved',
+					offset: 9000,
+					format: 'BMP image',
+					size: 512,
+					depth: 1,
+					status: 'analysed',
+					findings: [],
+					children: []
+				}
+			]
+		});
+		expect(tools({ survey, nested }).some((t) => t.status === 'hit')).toBe(false);
+	});
+
+	it('reports a walk that was capped for budget', () => {
+		const nested = root({ analysed: 30, skipped: 2, expandedBytes: 8388608, capped: true });
+		// A capped walk is still honest clear when it found nothing.
+		const tool = tools({ survey, nested }).find((t) => t.id === 'magic')!;
+		expect(tool.status).toBe('clear');
 	});
 });
 

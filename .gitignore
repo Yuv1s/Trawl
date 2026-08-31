@@ -29,6 +29,7 @@ Thumbs.db
 !.env.example
 !.env.test
 .claude/
+skills-lock.json
 .agents/
 
 # Vite
