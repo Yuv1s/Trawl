@@ -69,6 +69,7 @@
 			!peel.hash &&
 			!peel.vigenere &&
 			!peel.affine &&
+			!peel.hill &&
 			!peel.transposition &&
 			!peel.substitution &&
 			broken.length === 0
@@ -511,6 +512,22 @@
 						{/if}
 					</div>
 					<pre class="excerpt mono">{clip(peel.affine.plaintext)}</pre>
+				</section>
+			{/if}
+
+			{#if peel.hill}
+				<section class="cipher">
+					<h3 class="label">Hill cipher underneath</h3>
+					<p class="clear">
+						Every pair of letters was multiplied by a 2x2 matrix. There are roughly 211,000 keys
+						that can be undone at all, and every one of them was tried.
+					</p>
+
+					<div class="key-head">
+						<span class="mono key">{peel.hill.matrix.join(' ')}</span>
+						<span class="mono chip">2x2, mod 26</span>
+					</div>
+					<pre class="excerpt mono">{clip(peel.hill.plaintext)}</pre>
 				</section>
 			{/if}
 

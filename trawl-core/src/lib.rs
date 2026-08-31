@@ -14,6 +14,7 @@ pub mod gif;
 pub mod jpeg;
 pub mod json;
 pub mod mantis;
+pub mod pdf;
 pub mod pixels;
 pub mod png;
 pub mod spectrogram;
@@ -288,6 +289,18 @@ pub fn aes_probe(file: &[u8]) -> String {
 #[wasm_bindgen]
 pub fn zip_structure(file: &[u8]) -> String {
     zip::json(file)
+}
+
+/// What a PDF document holds, as JSON, or null when the file is not one.
+///
+/// Walks the file for every object header independent of the cross-reference
+/// table, then reads the table separately, the same split [`zip_structure`]
+/// makes between local headers and the central directory. An object the
+/// table no longer lists is a leftover from an earlier revision that a
+/// reader will never show.
+#[wasm_bindgen]
+pub fn pdf_structure(file: &[u8]) -> String {
+    pdf::json(file)
 }
 
 /// Applies a key somebody already has, across every cipher that takes one.

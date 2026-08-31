@@ -20,6 +20,7 @@
 	import Recovered from '$lib/components/Recovered.svelte';
 	import ChunkList from '$lib/components/ChunkList.svelte';
 	import ZipView from '$lib/components/ZipView.svelte';
+	import PdfView from '$lib/components/PdfView.svelte';
 	import GifFramesView from '$lib/components/GifFramesView.svelte';
 	import HexView from '$lib/components/HexView.svelte';
 	import StringsView from '$lib/components/StringsView.svelte';
@@ -503,6 +504,10 @@
 		view.phase === 'done' && view.result.status === 'ok' ? view.result.zip : null
 	);
 
+	const pdf = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.pdf : null
+	);
+
 	const nested = $derived(
 		view.phase === 'done' && view.result.status === 'ok' ? view.result.nested : null
 	);
@@ -539,6 +544,7 @@
 					audio,
 					spectrogram,
 					zip,
+					pdf,
 					aes,
 					nested,
 					gif
@@ -594,6 +600,12 @@
 					[]),
 				...(zip?.entries.flatMap((e) =>
 					(e.flags ?? []).map((text) => ({ text, origin: `from ${e.name}, inside the archive` }))
+				) ?? []),
+				...(pdf?.objects.flatMap((o) =>
+					(o.flags ?? []).map((text) => ({
+						text,
+						origin: `from object ${o.number}, inside the PDF stream`
+					}))
 				) ?? []),
 				...nestedFindings(nested?.roots ?? []).map((found) => ({
 					text: found.text,
@@ -900,6 +912,12 @@
 							<ZipView archive={zip} {nested} onanalyse={analyseBytes} onpeel={acceptText} />
 						{:else}
 							<p class="clear">This file is not a ZIP archive, so there is nothing to read.</p>
+						{/if}
+					{:else if activeTool === 'pdf'}
+						{#if pdf}
+							<PdfView doc={pdf} onpeel={acceptText} />
+						{:else}
+							<p class="clear">This file is not a PDF document, so there is nothing to read.</p>
 						{/if}
 					{:else if activeTool === 'gif'}
 						<GifFramesView {gif} {nested} />

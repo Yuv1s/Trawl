@@ -19,7 +19,7 @@
 //! over key it does have to be judged, because a list long enough to be useful
 //! is long enough to throw up something that reads by luck.
 
-use super::{bytes, ngram, plainness, vigenere};
+use super::{bytes, ngram, plainness, playfair, vigenere};
 
 /// What one cipher made of the key.
 #[derive(Debug, Clone, PartialEq)]
@@ -145,6 +145,11 @@ fn attempts(data: &[u8], key: &str) -> Vec<Attempt> {
             "Vigenère, enciphering",
             key,
             vigenere::encipher(data, &letters),
+        ),
+        judge(
+            "Playfair",
+            key,
+            playfair::decipher(data, &playfair::grid_from_keyword(key.as_bytes())),
         ),
     ];
 

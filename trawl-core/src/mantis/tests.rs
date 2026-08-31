@@ -375,6 +375,22 @@ fn finds_an_affine_end_to_end() {
 }
 
 #[test]
+fn finds_a_hill_cipher_end_to_end() {
+    // Caught a real bug on the way in: Hill ciphertext is a long run of
+    // uppercase letters with no line breaks, which `uuencode`'s structural
+    // check used to accept on nothing more than a length-looking first byte
+    // and enough characters after it, peeling it into garbage before this
+    // reached `hill::solve` at all. `encodings::tests` covers the decoder
+    // fix; this covers the pipeline actually reaching the cipher now.
+    let message = b"the treasure is buried under the old oak tree at the north end of the wide open field";
+    let key: hill::Key = [3, 2, 5, 7];
+    let reading = read(&hill::encipher(message, &key));
+
+    let found = reading.hill.expect("the hill cipher was missed");
+    assert_eq!(found.key, key);
+}
+
+#[test]
 fn finds_a_substitution_end_to_end() {
     let message: &[u8] = b"the museum keeps its oldest maps in a locked room beneath the reading \
 hall, where the air is kept dry and the light is kept low. visitors are welcome on the first \

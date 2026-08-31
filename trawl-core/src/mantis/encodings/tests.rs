@@ -255,6 +255,17 @@ fn uuencode_declines_a_line_that_lies_about_its_length() {
 }
 
 #[test]
+fn uuencode_declines_a_line_with_extra_bytes_past_its_declared_length() {
+    // The length byte only ever promised the four bytes right after it. A
+    // Hill or Playfair ciphertext is a long run of uppercase letters with no
+    // line breaks in it at all, which becomes exactly this: one "line" whose
+    // first letter looks like a length and has plenty of characters
+    // following it, without the rest of the string having anything to do
+    // with what that byte declared.
+    assert_eq!(uuencode(b"#0V%Tsomelongtrailingrunoflettersthatisnotencodeddata"), None);
+}
+
+#[test]
 fn base36_rotation_carries_letters_into_digits() {
     // The whole point of the wider ring: Y plus eleven leaves the letters.
     assert_eq!(rot_base36(b"Y", 11), b"9".to_vec());

@@ -18,8 +18,10 @@ pub mod affine;
 pub mod encodings;
 pub mod frequency;
 pub mod hashes;
+pub mod hill;
 pub mod keyed;
 pub mod ngram;
+pub mod playfair;
 pub mod shortlist;
 pub mod substitution;
 pub mod transposition;
@@ -572,6 +574,8 @@ pub fn json_from_peel(peel: &Peel) -> String {
     out.push_str(":null,");
     push_string(&mut out, "affine");
     out.push_str(":null,");
+    push_string(&mut out, "hill");
+    out.push_str(":null,");
     push_string(&mut out, "transposition");
     out.push_str(":null,");
     push_string(&mut out, "substitution");
@@ -608,6 +612,8 @@ pub struct Reading {
     pub vigenere: Option<vigenere::Candidate>,
     /// Set when the text turned out to be affine, which includes Caesar.
     pub affine: Option<affine::Candidate>,
+    /// Set when the text turned out to be a 2x2 Hill cipher.
+    pub hill: Option<hill::Candidate>,
     /// Set when the letters were the right ones in the wrong order.
     pub transposition: Option<transposition::Candidate>,
     /// Set when the alphabet was replaced wholesale.
@@ -638,6 +644,7 @@ pub fn read_for_tags(data: &[u8], tags: &[String]) -> Reading {
         hash: None,
         vigenere: None,
         affine: None,
+        hill: None,
         transposition: None,
         substitution: None,
         dictionary: None,
@@ -687,6 +694,7 @@ pub fn read_for_tags(data: &[u8], tags: &[String]) -> Reading {
     // Each of these answers on its own evidence, against a bar measured in
     // `tests::probe_bars`, rather than on whether another attack came up empty.
     let affine = affine::solve(inner);
+    let hill = hill::solve(inner);
     let transposition = transposition::solve(inner);
 
     // Affine is a substitution with a rule to it, so a text this reads will also
@@ -703,6 +711,7 @@ pub fn read_for_tags(data: &[u8], tags: &[String]) -> Reading {
     let settled = xor.found()
         || vigenere.is_some()
         || affine.is_some()
+        || hill.is_some()
         || transposition.is_some()
         || substitution.is_some();
 
@@ -744,6 +753,7 @@ pub fn read_for_tags(data: &[u8], tags: &[String]) -> Reading {
         hash: None,
         vigenere,
         affine,
+        hill,
         transposition,
         substitution,
         dictionary,
@@ -844,6 +854,34 @@ pub fn json_for_tags(data: &[u8], tags: &[String]) -> String {
             push_number(&mut out, "a", found.a as usize);
             out.push(',');
             push_number(&mut out, "b", found.b as usize);
+            out.push(',');
+            push_string(&mut out, "score");
+            out.push_str(&format!(":{:.3}", found.score));
+            out.push(',');
+            push_field(
+                &mut out,
+                "plaintext",
+                &crate::json::latin1(&found.plaintext),
+            );
+            out.push('}');
+        }
+        None => out.push_str(":null"),
+    }
+    out.push(',');
+
+    push_string(&mut out, "hill");
+    match &reading.hill {
+        Some(found) => {
+            out.push_str(":{");
+            push_string(&mut out, "matrix");
+            out.push_str(":[");
+            for (i, &value) in found.key.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&value.to_string());
+            }
+            out.push(']');
             out.push(',');
             push_string(&mut out, "score");
             out.push_str(&format!(":{:.3}", found.score));

@@ -211,6 +211,60 @@ export type ZipArchive = {
 	declared: number;
 };
 
+/** A stream's raw bytes inside a PDF object, wherever compression leaves them. */
+export type PdfStream = {
+	offset: number;
+	length: number;
+	/** The filter chain named in `/Filter`, joined with " then ". Empty when
+	 *  the stream carries its bytes uncompressed. */
+	filter: string;
+	/** Filled in once the worker has inflated a FlateDecode stream. Rust
+	 *  locates the bytes; inflate is a platform call. */
+	text?: string;
+	error?: string;
+};
+
+/** One `N G obj ... endobj` block. */
+export type PdfObject = {
+	number: number;
+	generation: number;
+	offset: number;
+	type: string | null;
+	subtype: string | null;
+	/** True when the document's own cross-reference table no longer lists
+	 *  this object's offset: bytes left over from an earlier revision that a
+	 *  reader following the table would never see. */
+	orphaned: boolean;
+	stream: PdfStream | null;
+	/** Flags found after inflating a compressed stream. Set by the worker,
+	 *  never by Rust: a flag hiding in a FlateDecode stream is invisible to
+	 *  any byte-level scan that ran before the stream was inflated. */
+	flags?: string[];
+};
+
+export type PdfStructure = {
+	/** The version named in the file's own `%PDF-` header. */
+	version: string;
+	/** Bytes after the last `%%EOF`, appended by something other than
+	 *  whatever wrote the document. */
+	trailing: number;
+	encrypted: boolean;
+	/** True when the cross-reference table is a stream rather than the
+	 *  classic plain-text form, which this reads without decoding: it is
+	 *  itself compressed, so every object's `orphaned` flag stays false
+	 *  rather than guessing. */
+	usesXrefStream: boolean;
+	/** How many `%%EOF` markers the file holds. More than one means the
+	 *  document has been incrementally updated at least once. */
+	revisions: number;
+	/** `/Info` dictionary fields this reads: Title, Author, Subject,
+	 *  Producer, Creator, CreationDate, ModDate. */
+	info: { key: string; value: string }[];
+	/** Object numbers whose `/Subtype` names them as a file attachment. */
+	embeddedFiles: number[];
+	objects: PdfObject[];
+};
+
 /** One encoding layer removed from a pasted string. */
 export type PeelStep = {
 	encoding: string;
@@ -257,6 +311,8 @@ export type PeelResult = {
 	vigenere: { key: string; score: number; plaintext: string } | null;
 	/** Set when the text turned out to be affine, which includes Caesar. */
 	affine: AffineBreak | null;
+	/** Set when the text turned out to be a 2x2 Hill cipher. */
+	hill: HillBreak | null;
 	/** Set when the letters were the right ones in the wrong order. */
 	transposition: TranspositionBreak | null;
 	/** Set when the alphabet was replaced wholesale. */
@@ -338,6 +394,16 @@ export type Rotation = {
 export type AffineBreak = {
 	a: number;
 	b: number;
+	score: number;
+	plaintext: string;
+};
+
+/**
+ * A recovered Hill key: a 2x2 matrix mod 26, read left to right, top to
+ * bottom, that every pair of letters was multiplied by.
+ */
+export type HillBreak = {
+	matrix: [number, number, number, number];
 	score: number;
 	plaintext: string;
 };
@@ -643,6 +709,8 @@ export type AnalysisResponse =
 			paletteStego: PaletteStego | null;
 			/** Null when the file is not a ZIP archive. */
 			zip: ZipArchive | null;
+			/** Null when the file is not a PDF document. */
+			pdf: PdfStructure | null;
 			/** AES-CBC decryptions the file's own key and payload produced. Empty for most files. */
 			aes: AesSolved[];
 			sweep: Sweep | null;

@@ -12,6 +12,7 @@ import {
 	type NestedAnalysis,
 	type NestedArtifact,
 	type PaletteStego,
+	type PdfStructure,
 	type PlaneWall,
 	type RsAnalysis,
 	type Spectrogram,
@@ -30,7 +31,7 @@ export type ToolStatus = 'hit' | 'clear' | 'ready' | 'pending';
  * `png` needs the chunk walker, which no other format has. `audio` needs samples.
  * `jpeg` needs the coefficient decoder.
  */
-export type ToolScope = 'bytes' | 'pixels' | 'png' | 'audio' | 'jpeg' | 'zip' | 'gif';
+export type ToolScope = 'bytes' | 'pixels' | 'png' | 'audio' | 'jpeg' | 'zip' | 'pdf' | 'gif';
 
 /**
  * The two halves of the rack. Survey reads the file as it sits on disk;
@@ -85,6 +86,7 @@ const NO_WALKER = 'PNG only, for now';
 const NO_DECODER = 'no decoder for this format';
 const NO_AUDIO = 'not an audio file';
 const NO_ARCHIVE = 'not a ZIP archive';
+const NO_PDF = 'not a PDF document';
 const NO_COEFFICIENTS = 'no readable JPEG coefficients';
 
 /** Metadata fields a person types into, as opposed to ones a camera fills in. */
@@ -115,6 +117,7 @@ export type Findings = {
 	audio?: AudioSweep | null;
 	spectrogram?: Spectrogram | null;
 	zip?: ZipArchive | null;
+	pdf?: PdfStructure | null;
 	nested?: NestedAnalysis | null;
 	gif?: GifAnalysis | null;
 };
@@ -179,9 +182,55 @@ function archiveNote(zip: ZipArchive): string {
 	return `${count} ${count === 1 ? 'entry' : 'entries'}, nothing out of place`;
 }
 
+/**
+ * Whether a PDF shows any sign of carrying more than it currently declares.
+ *
+ * A reader follows the trailer and the cross-reference table; it does not
+ * read the file. An object those no longer list, more than one `%%EOF`, or
+ * bytes past the last one are all ways a document holds something a reader
+ * would never show.
+ */
+function pdfOdd(pdf: PdfStructure): boolean {
+	return (
+		pdf.objects.some((o) => o.orphaned || (o.flags?.length ?? 0) > 0) ||
+		pdf.revisions > 1 ||
+		pdf.trailing > 0 ||
+		pdf.encrypted ||
+		pdf.embeddedFiles.length > 0
+	);
+}
+
+/** What to say about a PDF in one line of a tool rack. */
+function pdfNote(pdf: PdfStructure): string {
+	const withFlag = pdf.objects.filter((o) => (o.flags?.length ?? 0) > 0).length;
+	if (withFlag > 0) {
+		return `flag in ${withFlag === 1 ? 'a stream' : `${withFlag} streams`}`;
+	}
+	const orphaned = pdf.objects.filter((o) => o.orphaned).length;
+	if (orphaned > 0) {
+		return `${orphaned} not in the cross-reference table`;
+	}
+	if (pdf.embeddedFiles.length > 0) {
+		return `${pdf.embeddedFiles.length} attached`;
+	}
+	if (pdf.trailing > 0) {
+		return `${pdf.trailing.toLocaleString()} B appended`;
+	}
+	if (pdf.revisions > 1) {
+		return `${pdf.revisions} revisions`;
+	}
+	if (pdf.encrypted) {
+		return 'encrypted';
+	}
+
+	const count = pdf.objects.length;
+	return `${count} object${count === 1 ? '' : 's'}, nothing out of place`;
+}
+
 export function tools(found: Findings): Tool[] {
 	const { survey, structure = null, sweep = null, wall = null, chi = null, rs = null } = found;
 	const { audio = null, spectrogram = null, paletteStego = null, zip = null } = found;
+	const { pdf = null } = found;
 	const { nested = null, gif = null } = found;
 	const aes = found.aes ?? [];
 	const wav = found.wav && !isWavError(found.wav) ? found.wav : null;
@@ -230,6 +279,11 @@ export function tools(found: Findings): Tool[] {
 			? { ...tool, scope: 'zip', group: 'survey' }
 			: { ...tool, scope: 'zip', group: 'survey', status: 'pending', value: NO_ARCHIVE };
 
+	const pdfTool = (tool: Partial): Tool =>
+		pdf
+			? { ...tool, scope: 'pdf', group: 'survey' }
+			: { ...tool, scope: 'pdf', group: 'survey', status: 'pending', value: NO_PDF };
+
 	const sound = (tool: Partial, group: ToolGroup = 'cuttlefish'): Tool =>
 		wav
 			? { ...tool, scope: 'audio', group }
@@ -253,6 +307,14 @@ export function tools(found: Findings): Tool[] {
 			measures: 'Reads a ZIP twice and reports where the two copies disagree',
 			status: zip && archiveOdd(zip) ? 'hit' : 'clear',
 			value: zip ? archiveNote(zip) : ''
+		}),
+		pdfTool({
+			id: 'pdf',
+			name: 'PDF structure',
+			measures:
+				'Walks a PDF for every object, and reports what the cross-reference table leaves out',
+			status: pdf && pdfOdd(pdf) ? 'hit' : 'clear',
+			value: pdf ? pdfNote(pdf) : ''
 		}),
 		{
 			id: 'magic',

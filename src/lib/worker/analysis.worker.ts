@@ -23,6 +23,7 @@ import init, {
 	wav_spectrogram,
 	wav_structure,
 	zip_structure,
+	pdf_structure,
 	gif_frame_analysis
 } from '$lib/wasm/trawl_core';
 import type {
@@ -39,6 +40,7 @@ import type {
 	NestedAnalysis,
 	NestedArtifact,
 	PaletteStego,
+	PdfStructure,
 	PeelResult,
 	PeelStep,
 	PlaneWall,
@@ -179,6 +181,38 @@ async function inflateTextChunks(
 			}
 		} catch (error: unknown) {
 			chunk.error = error instanceof Error ? error.message : String(error);
+		}
+	}
+}
+
+/**
+ * Inflates every FlateDecode stream a PDF's objects carry, and flag-scans
+ * the result.
+ *
+ * Rust locates the stream but does not decompress it, for the same reason
+ * `inflateTextChunks` does not: inflate is a platform call. A flag or a
+ * signature living inside a compressed stream is invisible to the raw
+ * byte-level survey, which runs before any of this, so this is the only
+ * place it is ever found.
+ */
+async function inflatePdfStreams(
+	bytes: Uint8Array,
+	pdf: PdfStructure,
+	flagTags: string
+): Promise<void> {
+	for (const object of pdf.objects) {
+		const stream = object.stream;
+		if (!stream || stream.filter !== 'FlateDecode' || stream.length === 0) continue;
+
+		try {
+			const packed = bytes.subarray(stream.offset, stream.offset + stream.length);
+			const raw = await inflate(packed);
+			stream.text = new TextDecoder('utf-8', { fatal: false }).decode(raw);
+
+			const found = JSON.parse(find_flags_for_tags(raw, flagTags)) as Found[];
+			if (found.length > 0) object.flags = found.map((f) => f.text);
+		} catch (error: unknown) {
+			stream.error = error instanceof Error ? error.message : String(error);
 		}
 	}
 }
@@ -745,6 +779,9 @@ async function analyseRoot(
 	const zip = JSON.parse(zip_structure(bytes)) as ZipArchive | null;
 	if (zip) await inflateZipEntries(bytes, zip, flagTags);
 
+	const pdf = JSON.parse(pdf_structure(bytes)) as PdfStructure | null;
+	if (pdf) await inflatePdfStreams(bytes, pdf, flagTags);
+
 	const aes = JSON.parse(aes_probe(withInflatedText(bytes, structure))) as AesSolved[];
 	const jpeg = JSON.parse(jpeg_stego(bytes, SWEEP_BYTES, CHI_STEPS_JPEG)) as
 		JpegStego | JpegError | null;
@@ -831,6 +868,7 @@ async function analyseRoot(
 		jpeg,
 		paletteStego,
 		zip,
+		pdf,
 		aes,
 		sweep,
 		wall,
