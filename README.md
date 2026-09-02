@@ -206,7 +206,7 @@ one line the page gives them.
 ## The names
 
 Trawling is dragging a net through water and sorting whatever comes up, which is
-close to what this does with a dropped file.
+close to what this program does with a dropped file.
 
 **Cuttlefish** is the steganography half. Cuttlefish hide by rewriting their own
 surface, which is what hiding a message in an image does to the picture. Their
