@@ -64,7 +64,8 @@
 				['Chunk walk', 'Lists every part of the file'],
 				['Readable text', 'Text anywhere in the file, plain or wide'],
 				['Archive entries', 'Reads a ZIP twice and reports where the two copies disagree'],
-				['PDF structure', 'Walks a PDF for every object, and what the index leaves out']
+				['PDF structure', 'Walks a PDF for every object, and what the index leaves out'],
+				['Binary structure', 'Reads what an ELF declares, down to its own defences']
 			]
 		},
 		{

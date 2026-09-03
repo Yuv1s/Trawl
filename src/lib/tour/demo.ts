@@ -323,6 +323,26 @@ export const SAMPLE_GROUPS: SampleGroup[] = [
 		]
 	},
 	{
+		title: 'Binaries',
+		note: 'Two ELF executables built from one source file, differing only in how they were compiled.',
+		entries: [
+			{
+				name: 'vulnerable-elf',
+				mime: 'application/x-executable',
+				url: '/samples/binaries/vulnerable-elf',
+				blurb:
+					'Built with every protection off: an executable stack, a fixed load address, no RELRO and no stack guard. Carries flag{the_symbols_gave_it_away} in a named symbol.'
+			},
+			{
+				name: 'hardened-elf',
+				mime: 'application/x-executable',
+				url: '/samples/binaries/hardened-elf',
+				blurb:
+					'The same source with the protections on, so the defence rack reads the other way and the tool stays quiet.'
+			}
+		]
+	},
+	{
 		title: 'Cuttlefish: images',
 		entries: [
 			{

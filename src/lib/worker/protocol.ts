@@ -265,6 +265,81 @@ export type PdfStructure = {
 	objects: PdfObject[];
 };
 
+export type ElfSection = {
+	name: string;
+	kind: string;
+	/** Where the section sits once loaded, as hex. Zero for a section that
+	 *  occupies no memory at run time. */
+	address: string;
+	offset: number;
+	size: number;
+	/** Which of alloc, write and execute the section header declares. */
+	flags: string;
+};
+
+export type ElfSegment = {
+	kind: string;
+	/** `rwx` shorthand, a dash where the permission is absent. */
+	permissions: string;
+	address: string;
+	offset: number;
+	fileSize: number;
+	memorySize: number;
+};
+
+export type ElfSymbol = {
+	name: string;
+	kind: string;
+	address: string;
+};
+
+/** What an ELF's own tables declare about it. Nothing here is disassembled:
+ *  every field is read from a header, a section table, or the dynamic symbol
+ *  table, so each one is a fact at a byte offset rather than an inference
+ *  about what the code does. */
+export type ElfStructure = {
+	class: string;
+	endianness: string;
+	machine: string;
+	kind: string;
+	entry: string;
+	/** The dynamic loader named in `PT_INTERP`, present only on a file meant
+	 *  to be run rather than linked against. */
+	interpreter: string | null;
+	/** A library search path baked into the binary, which decides where its
+	 *  libraries come from. */
+	runpath: string | null;
+	/** True when no `.symtab` survives, so every local name is gone. */
+	stripped: boolean;
+	/** "on", "off", or "not declared". The third is not the second: a binary
+	 *  with no `PT_GNU_STACK` header makes no claim either way and the kernel
+	 *  decides, so reporting it as off would invent a field the file lacks. */
+	nx: string;
+	/** "yes", "no", or "shared object", since a position-independent
+	 *  executable and a library share a type and are told apart by whether
+	 *  the file names an interpreter. */
+	pie: string;
+	/** "none", "partial", or "full". */
+	relro: string;
+	/** True when `__stack_chk_fail` is linked, which a compiler emits only
+	 *  for the functions it guarded. */
+	canary: boolean;
+	/** True when a `__*_chk` fortified libc call is linked. */
+	fortify: boolean;
+	/** True totals, which `imports` and `exports` are capped copies of. */
+	importCount: number;
+	exportCount: number;
+	/** Libraries named by `DT_NEEDED`, in the order the dynamic table lists them. */
+	needed: string[];
+	sections: ElfSection[];
+	segments: ElfSegment[];
+	/** Undefined dynamic symbols: what this binary calls and something else
+	 *  has to provide. */
+	imports: ElfSymbol[];
+	/** Defined, globally bound dynamic symbols: what this binary offers. */
+	exports: ElfSymbol[];
+};
+
 /** One encoding layer removed from a pasted string. */
 export type PeelStep = {
 	encoding: string;
@@ -711,6 +786,8 @@ export type AnalysisResponse =
 			zip: ZipArchive | null;
 			/** Null when the file is not a PDF document. */
 			pdf: PdfStructure | null;
+			/** Null when the file is not an ELF binary. */
+			elf: ElfStructure | null;
 			/** AES-CBC decryptions the file's own key and payload produced. Empty for most files. */
 			aes: AesSolved[];
 			sweep: Sweep | null;

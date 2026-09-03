@@ -13,6 +13,7 @@ import {
 	type NestedArtifact,
 	type PaletteStego,
 	type PdfStructure,
+	type ElfStructure,
 	type PlaneWall,
 	type RsAnalysis,
 	type Spectrogram,
@@ -31,7 +32,8 @@ export type ToolStatus = 'hit' | 'clear' | 'ready' | 'pending';
  * `png` needs the chunk walker, which no other format has. `audio` needs samples.
  * `jpeg` needs the coefficient decoder.
  */
-export type ToolScope = 'bytes' | 'pixels' | 'png' | 'audio' | 'jpeg' | 'zip' | 'pdf' | 'gif';
+export type ToolScope =
+	'bytes' | 'pixels' | 'png' | 'audio' | 'jpeg' | 'zip' | 'pdf' | 'binary' | 'gif';
 
 /**
  * The two halves of the rack. Survey reads the file as it sits on disk;
@@ -87,6 +89,7 @@ const NO_DECODER = 'no decoder for this format';
 const NO_AUDIO = 'not an audio file';
 const NO_ARCHIVE = 'not a ZIP archive';
 const NO_PDF = 'not a PDF document';
+const NO_BINARY = 'not an ELF binary';
 const NO_COEFFICIENTS = 'no readable JPEG coefficients';
 
 /** Metadata fields a person types into, as opposed to ones a camera fills in. */
@@ -118,6 +121,7 @@ export type Findings = {
 	spectrogram?: Spectrogram | null;
 	zip?: ZipArchive | null;
 	pdf?: PdfStructure | null;
+	elf?: ElfStructure | null;
 	nested?: NestedAnalysis | null;
 	gif?: GifAnalysis | null;
 };
@@ -227,10 +231,37 @@ function pdfNote(pdf: PdfStructure): string {
 	return `${count} object${count === 1 ? '' : 's'}, nothing out of place`;
 }
 
+/**
+ * Whether a binary leaves open any of the protections its own format can
+ * declare.
+ *
+ * A shared object is not counted as missing PIE: a library has no fixed load
+ * address to give up, so the field does not apply to it. Nothing here is a
+ * judgement about the code, only about which defences the file says it was
+ * built with.
+ */
+function binaryWeak(elf: ElfStructure): boolean {
+	return elf.nx !== 'on' || elf.pie === 'no' || elf.relro === 'none' || !elf.canary;
+}
+
+/** What to say about a binary in one line of a tool rack. */
+function binaryNote(elf: ElfStructure): string {
+	const open = [
+		elf.nx === 'off' && 'executable stack',
+		elf.nx === 'not declared' && 'no stack header',
+		elf.pie === 'no' && 'no PIE',
+		elf.relro === 'none' && 'no RELRO',
+		!elf.canary && 'no canary'
+	].filter((note): note is string => typeof note === 'string');
+
+	if (open.length > 0) return open.join(', ');
+	return `${elf.machine}, hardened${elf.stripped ? ' and stripped' : ''}`;
+}
+
 export function tools(found: Findings): Tool[] {
 	const { survey, structure = null, sweep = null, wall = null, chi = null, rs = null } = found;
 	const { audio = null, spectrogram = null, paletteStego = null, zip = null } = found;
-	const { pdf = null } = found;
+	const { pdf = null, elf = null } = found;
 	const { nested = null, gif = null } = found;
 	const aes = found.aes ?? [];
 	const wav = found.wav && !isWavError(found.wav) ? found.wav : null;
@@ -284,6 +315,11 @@ export function tools(found: Findings): Tool[] {
 			? { ...tool, scope: 'pdf', group: 'survey' }
 			: { ...tool, scope: 'pdf', group: 'survey', status: 'pending', value: NO_PDF };
 
+	const binary = (tool: Partial): Tool =>
+		elf
+			? { ...tool, scope: 'binary', group: 'survey' }
+			: { ...tool, scope: 'binary', group: 'survey', status: 'pending', value: NO_BINARY };
+
 	const sound = (tool: Partial, group: ToolGroup = 'cuttlefish'): Tool =>
 		wav
 			? { ...tool, scope: 'audio', group }
@@ -315,6 +351,13 @@ export function tools(found: Findings): Tool[] {
 				'Walks a PDF for every object, and reports what the cross-reference table leaves out',
 			status: pdf && pdfOdd(pdf) ? 'hit' : 'clear',
 			value: pdf ? pdfNote(pdf) : ''
+		}),
+		binary({
+			id: 'binary',
+			name: 'Binary structure',
+			measures: 'Reads what an ELF declares: its sections, what it calls, and its own defences',
+			status: elf && binaryWeak(elf) ? 'hit' : 'clear',
+			value: elf ? binaryNote(elf) : ''
 		}),
 		{
 			id: 'magic',

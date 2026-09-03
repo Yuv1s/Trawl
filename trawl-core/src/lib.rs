@@ -9,6 +9,7 @@ pub mod aes;
 pub mod bmp;
 pub mod bytes;
 pub mod cuttlefish;
+pub mod elf;
 pub mod exif;
 pub mod gif;
 pub mod jpeg;
@@ -301,6 +302,18 @@ pub fn zip_structure(file: &[u8]) -> String {
 #[wasm_bindgen]
 pub fn pdf_structure(file: &[u8]) -> String {
     pdf::json(file)
+}
+
+/// What an ELF binary declares about itself, as JSON, or null when the file
+/// is not one.
+///
+/// The header, the section table, the program headers and the dynamic
+/// symbols, each read and reported. Nothing here decodes an instruction: the
+/// question this answers is what the file says it is, which the format
+/// states outright, rather than what its code does, which it does not.
+#[wasm_bindgen]
+pub fn elf_structure(file: &[u8]) -> String {
+    elf::json(file)
 }
 
 /// Applies a key somebody already has, across every cipher that takes one.

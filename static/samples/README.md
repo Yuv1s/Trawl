@@ -53,6 +53,15 @@ The four files at the top of this directory stay at fixed paths because the in-a
 | --- | --- | --- |
 | [`documents/orphaned-revision.pdf`](documents/orphaned-revision.pdf) | PDF structure, flag scan | Two revisions; the first revision's page content stream is dropped from the second revision's cross-reference table but still sits in the file. Reports that object as present but not in the table and reads `flag{leftover_in_the_pdf}` from its inflated stream. |
 
+## Binaries
+
+Both are ELF executables compiled from one source file on Debian, differing only in their compiler flags, so the defence rack is the only thing that changes between them.
+
+| File | Main tools | Expected result |
+| --- | --- | --- |
+| [`binaries/vulnerable-elf`](binaries/vulnerable-elf) | Binary structure, flag scan | Reports an executable stack, a fixed load address, no RELRO and no stack guard, and reads `flag{the_symbols_gave_it_away}` out of the binary. |
+| [`binaries/hardened-elf`](binaries/hardened-elf) | Binary structure | The same program built with `-pie -fstack-protector-all -D_FORTIFY_SOURCE=2 -z relro -z now`. Every protection reads on, so the tool stays quiet. |
+
 ## Cuttlefish image tools
 
 | File | Main tools | Expected result |
@@ -99,4 +108,4 @@ Mantis accepts pasted text. Open a `.txt` file below, copy its single encoded li
 
 ## Regeneration
 
-Most files in this public corpus are copies of deterministic fixtures produced by [`fixtures/generate.mjs`](../../fixtures/generate.mjs). The focused archive, PDF, GIF, tone, AES, compression, carving, and entropy samples were generated with Node built-ins for this corpus. No application source or runtime dependency is required to use them.
+Most files in this public corpus are copies of deterministic fixtures produced by [`fixtures/generate.mjs`](../../fixtures/generate.mjs). The focused archive, PDF, GIF, tone, AES, compression, carving, and entropy samples were generated with Node built-ins for this corpus. The two binaries were compiled with `gcc` from a single source file, once with every protection disabled and once with them on; the flags for each are in the table above. No application source or runtime dependency is required to use them.

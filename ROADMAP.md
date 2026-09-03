@@ -39,6 +39,16 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
       rather than the classic table is detected but not decoded, so an object's
       standing against it is left unmarked rather than guessed at
 
+- [x] ELF binaries, read for what their own tables declare: the header, the
+      section table, the segments the loader maps, the libraries needed, and
+      the dynamic symbols split into what the file calls and what it offers.
+      The defences are read the same way, from the headers that carry them,
+      and a protection the file never mentions is reported as undeclared
+      rather than as off, since a missing `PT_GNU_STACK` is the kernel's
+      decision to make and not a claim the binary made. Nothing is
+      disassembled: what the code does is a different question, and answering
+      it wants a tool built around a session that outlasts one file
+
 ### Cuttlefish, the steganography half
 
 - [x] Bit-plane wall: every layer of an image shown at once
@@ -216,6 +226,10 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 ### Forensics
 
 - [ ] Windows registry, for tracing which USB stick was plugged in when
+- [ ] PE binaries, the Windows half of what ELF already reads. Its import and
+      export tables are addressed by where they land in memory rather than by
+      where they sit in the file, so reaching them means walking the section
+      table to translate between the two, which ELF never asks for
 
 ### Steganography still open
 

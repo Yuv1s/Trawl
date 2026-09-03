@@ -2,6 +2,7 @@
 import { flagsOf, PLANNED, tools } from './tools';
 import type {
 	Chunk,
+	ElfStructure,
 	GifAnalysis,
 	NestedAnalysis,
 	Structure,
@@ -542,6 +543,75 @@ describe('nested analysis', () => {
 		// A capped walk is still honest clear when it found nothing.
 		const tool = tools({ survey, nested }).find((t) => t.id === 'magic')!;
 		expect(tool.status).toBe('clear');
+	});
+});
+
+describe('binary structure', () => {
+	const elf = (over: Partial<ElfStructure> = {}): ElfStructure => ({
+		class: '64-bit',
+		endianness: 'little',
+		machine: 'x86-64',
+		kind: 'executable',
+		entry: '0x401060',
+		interpreter: '/lib64/ld-linux-x86-64.so.2',
+		runpath: null,
+		stripped: false,
+		nx: 'on',
+		pie: 'yes',
+		relro: 'full',
+		canary: true,
+		fortify: true,
+		importCount: 0,
+		exportCount: 0,
+		needed: [],
+		sections: [],
+		segments: [],
+		imports: [],
+		exports: [],
+		...over
+	});
+
+	it('stands down on a file that is not an ELF', () => {
+		const tool = tools({ survey, structure }).find((t) => t.id === 'binary')!;
+		expect(tool.status).toBe('pending');
+		expect(tool.value).toBe('not an ELF binary');
+	});
+
+	it('stays clear on a binary built with every protection on', () => {
+		const tool = tools({ survey, elf: elf() }).find((t) => t.id === 'binary')!;
+		expect(tool.status).toBe('clear');
+		expect(tool.value).toContain('hardened');
+	});
+
+	it('reports each protection the file leaves open', () => {
+		const tool = tools({
+			survey,
+			elf: elf({ nx: 'off', pie: 'no', relro: 'none', canary: false })
+		}).find((t) => t.id === 'binary')!;
+
+		expect(tool.status).toBe('hit');
+		expect(tool.value).toBe('executable stack, no PIE, no RELRO, no canary');
+	});
+
+	it('treats a stack header that is missing as unresolved rather than off', () => {
+		// The file makes no claim, so the note says so instead of reporting a
+		// protection as disabled that the binary never mentions.
+		const tool = tools({ survey, elf: elf({ nx: 'not declared' }) }).find(
+			(t) => t.id === 'binary'
+		)!;
+		expect(tool.status).toBe('hit');
+		expect(tool.value).toBe('no stack header');
+	});
+
+	it('does not hold a shared library to PIE, which does not apply to it', () => {
+		const library = elf({ kind: 'shared object', pie: 'shared object', interpreter: null });
+		const tool = tools({ survey, elf: library }).find((t) => t.id === 'binary')!;
+		expect(tool.status).toBe('clear');
+	});
+
+	it('says a hardened binary was stripped when it was', () => {
+		const tool = tools({ survey, elf: elf({ stripped: true }) }).find((t) => t.id === 'binary')!;
+		expect(tool.value).toContain('stripped');
 	});
 });
 

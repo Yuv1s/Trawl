@@ -21,6 +21,7 @@
 	import ChunkList from '$lib/components/ChunkList.svelte';
 	import ZipView from '$lib/components/ZipView.svelte';
 	import PdfView from '$lib/components/PdfView.svelte';
+	import BinaryView from '$lib/components/BinaryView.svelte';
 	import GifFramesView from '$lib/components/GifFramesView.svelte';
 	import HexView from '$lib/components/HexView.svelte';
 	import StringsView from '$lib/components/StringsView.svelte';
@@ -508,6 +509,10 @@
 		view.phase === 'done' && view.result.status === 'ok' ? view.result.pdf : null
 	);
 
+	const elf = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.elf : null
+	);
+
 	const nested = $derived(
 		view.phase === 'done' && view.result.status === 'ok' ? view.result.nested : null
 	);
@@ -545,6 +550,7 @@
 					spectrogram,
 					zip,
 					pdf,
+					elf,
 					aes,
 					nested,
 					gif
@@ -918,6 +924,12 @@
 							<PdfView doc={pdf} onpeel={acceptText} />
 						{:else}
 							<p class="clear">This file is not a PDF document, so there is nothing to read.</p>
+						{/if}
+					{:else if activeTool === 'binary'}
+						{#if elf}
+							<BinaryView binary={elf} />
+						{:else}
+							<p class="clear">This file is not an ELF binary, so there is nothing to read.</p>
 						{/if}
 					{:else if activeTool === 'gif'}
 						<GifFramesView {gif} {nested} />
