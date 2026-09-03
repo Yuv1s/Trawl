@@ -509,8 +509,8 @@
 		view.phase === 'done' && view.result.status === 'ok' ? view.result.pdf : null
 	);
 
-	const elf = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.elf : null
+	const binary = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.binary : null
 	);
 
 	const nested = $derived(
@@ -550,7 +550,7 @@
 					spectrogram,
 					zip,
 					pdf,
-					elf,
+					binary,
 					aes,
 					nested,
 					gif
@@ -926,10 +926,12 @@
 							<p class="clear">This file is not a PDF document, so there is nothing to read.</p>
 						{/if}
 					{:else if activeTool === 'binary'}
-						{#if elf}
-							<BinaryView binary={elf} />
+						{#if binary}
+							<BinaryView {binary} />
 						{:else}
-							<p class="clear">This file is not an ELF binary, so there is nothing to read.</p>
+							<p class="clear">
+								This file is not an executable this reads, so there is nothing to read.
+							</p>
 						{/if}
 					{:else if activeTool === 'gif'}
 						<GifFramesView {gif} {nested} />

@@ -265,7 +265,7 @@ export type PdfStructure = {
 	objects: PdfObject[];
 };
 
-export type ElfSection = {
+export type BinarySection = {
 	name: string;
 	kind: string;
 	/** Where the section sits once loaded, as hex. Zero for a section that
@@ -277,7 +277,7 @@ export type ElfSection = {
 	flags: string;
 };
 
-export type ElfSegment = {
+export type BinarySegment = {
 	kind: string;
 	/** `rwx` shorthand, a dash where the permission is absent. */
 	permissions: string;
@@ -287,57 +287,72 @@ export type ElfSegment = {
 	memorySize: number;
 };
 
-export type ElfSymbol = {
+export type BinarySymbol = {
 	name: string;
 	kind: string;
 	address: string;
+	/** Which library the name is imported from. PE names one per import; ELF
+	 *  does not say, and leaves this null. */
+	from: string | null;
 };
 
 /** What an ELF's own tables declare about it. Nothing here is disassembled:
  *  every field is read from a header, a section table, or the dynamic symbol
  *  table, so each one is a fact at a byte offset rather than an inference
  *  about what the code does. */
-export type ElfStructure = {
+export type BinaryStructure = {
+	/** "ELF" or "PE". Where a field belongs to one format and has no
+	 *  counterpart in the other it comes back null rather than being given a
+	 *  value invented to fill the column. */
+	format: string;
 	class: string;
 	endianness: string;
 	machine: string;
 	kind: string;
 	entry: string;
-	/** The dynamic loader named in `PT_INTERP`, present only on a file meant
-	 *  to be run rather than linked against. */
+	/** The dynamic loader named in `PT_INTERP`. ELF only. */
 	interpreter: string | null;
 	/** A library search path baked into the binary, which decides where its
-	 *  libraries come from. */
+	 *  libraries come from. ELF only. */
 	runpath: string | null;
-	/** True when no `.symtab` survives, so every local name is gone. */
+	/** Which Windows subsystem the image asks for. PE only. */
+	subsystem: string | null;
+	/** The build path of the debug database, which a linker writes verbatim
+	 *  and which therefore carries whatever the build machine's directories
+	 *  were called. PE only. */
+	pdbPath: string | null;
+	/** True when the file carries no symbol table of its own. */
 	stripped: boolean;
-	/** "on", "off", or "not declared". The third is not the second: a binary
+	/** "on", "off", or "not declared". The third is not the second: an ELF
 	 *  with no `PT_GNU_STACK` header makes no claim either way and the kernel
-	 *  decides, so reporting it as off would invent a field the file lacks. */
+	 *  decides, so reporting it as off would invent a field the file lacks.
+	 *  A PE always carries the bit, so it never reports the third. */
 	nx: string;
-	/** "yes", "no", or "shared object", since a position-independent
-	 *  executable and a library share a type and are told apart by whether
-	 *  the file names an interpreter. */
+	/** "yes", "no", or "shared object": whether the image can be loaded at an
+	 *  address it did not choose. */
 	pie: string;
-	/** "none", "partial", or "full". */
-	relro: string;
-	/** True when `__stack_chk_fail` is linked, which a compiler emits only
-	 *  for the functions it guarded. */
+	/** "none", "partial", or "full". ELF only; PE has no counterpart. */
+	relro: string | null;
+	/** True when the file carries the evidence of a stack guard: a linked
+	 *  `__stack_chk_fail` in an ELF, a cookie named by the load configuration
+	 *  in a PE. */
 	canary: boolean;
-	/** True when a `__*_chk` fortified libc call is linked. */
-	fortify: boolean;
+	/** True when a `__*_chk` fortified libc call is linked. ELF only. */
+	fortify: boolean | null;
+	/** True when Control Flow Guard is on. PE only. */
+	cfg: boolean | null;
 	/** True totals, which `imports` and `exports` are capped copies of. */
 	importCount: number;
 	exportCount: number;
 	/** Libraries named by `DT_NEEDED`, in the order the dynamic table lists them. */
 	needed: string[];
-	sections: ElfSection[];
-	segments: ElfSegment[];
+	sections: BinarySection[];
+	segments: BinarySegment[];
 	/** Undefined dynamic symbols: what this binary calls and something else
 	 *  has to provide. */
-	imports: ElfSymbol[];
+	imports: BinarySymbol[];
 	/** Defined, globally bound dynamic symbols: what this binary offers. */
-	exports: ElfSymbol[];
+	exports: BinarySymbol[];
 };
 
 /** One encoding layer removed from a pasted string. */
@@ -786,8 +801,8 @@ export type AnalysisResponse =
 			zip: ZipArchive | null;
 			/** Null when the file is not a PDF document. */
 			pdf: PdfStructure | null;
-			/** Null when the file is not an ELF binary. */
-			elf: ElfStructure | null;
+			/** Null when the file is neither an ELF nor a PE. */
+			binary: BinaryStructure | null;
 			/** AES-CBC decryptions the file's own key and payload produced. Empty for most files. */
 			aes: AesSolved[];
 			sweep: Sweep | null;

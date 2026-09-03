@@ -324,7 +324,7 @@ export const SAMPLE_GROUPS: SampleGroup[] = [
 	},
 	{
 		title: 'Binaries',
-		note: 'Two ELF executables built from one source file, differing only in how they were compiled.',
+		note: 'Two pairs, each differing only in what it was built with, so the defence rack is the only thing that changes.',
 		entries: [
 			{
 				name: 'vulnerable-elf',
@@ -339,6 +339,20 @@ export const SAMPLE_GROUPS: SampleGroup[] = [
 				url: '/samples/binaries/hardened-elf',
 				blurb:
 					'The same source with the protections on, so the defence rack reads the other way and the tool stays quiet.'
+			},
+			{
+				name: 'vulnerable-pe.bin',
+				mime: 'application/octet-stream',
+				url: '/samples/binaries/vulnerable-pe.bin',
+				blurb:
+					'A Windows image with no NX, no ASLR and no stack cookie. Carries no code, only headers and flag{the_headers_told_on_it}, so it reads like an executable without being one.'
+			},
+			{
+				name: 'hardened-pe.bin',
+				mime: 'application/octet-stream',
+				url: '/samples/binaries/hardened-pe.bin',
+				blurb:
+					'The same image with NX, ASLR, Control Flow Guard and a stack cookie declared, for the contrast.'
 			}
 		]
 	},

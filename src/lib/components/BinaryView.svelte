@@ -1,7 +1,7 @@
 <script lang="ts">
-	import type { ElfStructure } from '$lib/worker/protocol';
+	import type { BinaryStructure } from '$lib/worker/protocol';
 
-	let { binary }: { binary: ElfStructure } = $props();
+	let { binary }: { binary: BinaryStructure } = $props();
 
 	/** Each protection, with the state the file actually declares. `weak` is
 	 *  what makes a binary worth a second look, and is the only state given
@@ -9,38 +9,50 @@
 	 *  the reason you would care about this file. */
 	type Guard = { label: string; value: string; weak: boolean; unknown: boolean };
 
-	const guards = $derived<Guard[]>([
-		{
-			label: 'NX',
-			value: binary.nx,
-			weak: binary.nx === 'off',
-			unknown: binary.nx === 'not declared'
-		},
-		{
-			label: 'PIE',
-			value: binary.pie,
-			weak: binary.pie === 'no',
-			unknown: binary.pie === 'shared object'
-		},
-		{
-			label: 'RELRO',
-			value: binary.relro,
-			weak: binary.relro === 'none',
-			unknown: false
-		},
-		{
-			label: 'Canary',
-			value: binary.canary ? 'on' : 'none found',
-			weak: !binary.canary,
-			unknown: false
-		},
-		{
-			label: 'Fortify',
-			value: binary.fortify ? 'on' : 'none found',
-			weak: !binary.fortify,
-			unknown: false
-		}
-	]);
+	/** A protection the format has no counterpart for is left out of the rack
+	 *  rather than shown as absent: a PE has nothing RELRO would describe, and
+	 *  saying "none" there would report a defence as missing that was never
+	 *  available to it. */
+	const guards = $derived<Guard[]>(
+		[
+			{
+				label: 'NX',
+				value: binary.nx,
+				weak: binary.nx === 'off',
+				unknown: binary.nx === 'not declared'
+			},
+			{
+				label: binary.format === 'PE' ? 'ASLR' : 'PIE',
+				value: binary.pie,
+				weak: binary.pie === 'no',
+				unknown: binary.pie === 'shared object'
+			},
+			binary.relro !== null && {
+				label: 'RELRO',
+				value: binary.relro,
+				weak: binary.relro === 'none',
+				unknown: false
+			},
+			{
+				label: 'Canary',
+				value: binary.canary ? 'on' : 'none found',
+				weak: !binary.canary,
+				unknown: false
+			},
+			binary.fortify !== null && {
+				label: 'Fortify',
+				value: binary.fortify ? 'on' : 'none found',
+				weak: !binary.fortify,
+				unknown: false
+			},
+			binary.cfg !== null && {
+				label: 'CFG',
+				value: binary.cfg ? 'on' : 'off',
+				weak: false,
+				unknown: !binary.cfg
+			}
+		].filter((guard): guard is Guard => typeof guard === 'object')
+	);
 
 	const notes = $derived(
 		[
@@ -52,9 +64,15 @@
 				'a fixed load address, so every address in this binary is the same on every run',
 			binary.relro === 'none' && 'the relocation table stays writable for the life of the process',
 			!binary.canary &&
-				'no __stack_chk_fail is linked, so nothing here was compiled with a stack guard',
-			binary.stripped && 'stripped: only the dynamic symbols a linker needs are left',
-			binary.runpath !== null && `a library search path is baked in: ${binary.runpath}`
+				(binary.format === 'PE'
+					? 'the load configuration names no stack cookie, so nothing here was built with a stack guard'
+					: 'no __stack_chk_fail is linked, so nothing here was compiled with a stack guard'),
+			binary.stripped &&
+				binary.format === 'ELF' &&
+				'stripped: only the dynamic symbols a linker needs are left',
+			binary.runpath !== null && `a library search path is baked in: ${binary.runpath}`,
+			binary.pdbPath !== null &&
+				`the linker left the path to its debug database in the file: ${binary.pdbPath}`
 		].filter((note): note is string => typeof note === 'string')
 	);
 
@@ -69,10 +87,12 @@
 	);
 
 	const summary = $derived([
+		{ key: 'Format', value: binary.format },
 		{ key: 'Class', value: `${binary.class} ${binary.endianness}-endian` },
 		{ key: 'Machine', value: binary.machine },
 		{ key: 'Type', value: kind },
 		{ key: 'Entry', value: binary.entry },
+		...(binary.subsystem ? [{ key: 'Subsystem', value: binary.subsystem }] : []),
 		...(binary.interpreter ? [{ key: 'Interpreter', value: binary.interpreter }] : [])
 	]);
 
@@ -140,8 +160,13 @@
 				>
 			</h3>
 			<ul class="chips">
-				{#each binary.imports as symbol (symbol.name)}
-					<li class="mono chip" title={symbol.name}>{symbol.name}</li>
+				{#each binary.imports as symbol (symbol.from ? `${symbol.from}/${symbol.name}` : symbol.name)}
+					<li
+						class="mono chip"
+						title={symbol.from ? `${symbol.name} from ${symbol.from}` : symbol.name}
+					>
+						{symbol.name}
+					</li>
 				{/each}
 			</ul>
 		</div>
@@ -225,6 +250,10 @@
 		Every line here is a field in one of the file's own tables. Nothing is disassembled: what the
 		code does is a different question, and answering it needs a tool built around a session that
 		lasts longer than one file.
+		{#if binary.format === 'PE' && binary.stripped}
+			A PE keeps its symbol names in a separate database rather than in the image, so the names here
+			are the imports and exports rather than anything local.
+		{/if}
 	</p>
 </div>
 

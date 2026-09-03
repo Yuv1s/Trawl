@@ -48,6 +48,14 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
       decision to make and not a claim the binary made. Nothing is
       disassembled: what the code does is a different question, and answering
       it wants a tool built around a session that outlasts one file
+- [x] PE binaries, the Windows half of the same reading, converging on the
+      same shape so one panel reads both. Where ELF names a table by where it
+      sits in the file, PE names almost everything by where it lands in
+      memory, so every read goes through the section table to translate
+      between the two. What one format carries and the other has no
+      counterpart for is reported as absent rather than filled in: a PE has
+      nothing RELRO would describe, and saying "none" there would report a
+      defence as missing that was never available to it
 
 ### Cuttlefish, the steganography half
 
@@ -226,10 +234,6 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 ### Forensics
 
 - [ ] Windows registry, for tracing which USB stick was plugged in when
-- [ ] PE binaries, the Windows half of what ELF already reads. Its import and
-      export tables are addressed by where they land in memory rather than by
-      where they sit in the file, so reaching them means walking the section
-      table to translate between the two, which ELF never asks for
 
 ### Steganography still open
 

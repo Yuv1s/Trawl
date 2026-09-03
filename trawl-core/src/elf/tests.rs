@@ -452,12 +452,12 @@ fn tells_a_position_independent_executable_from_a_shared_library() {
 #[test]
 fn reads_partial_and_full_relro_apart() {
     let none = Builder::new().build();
-    assert_eq!(read(&none).unwrap().relro, "none");
+    assert_eq!(read(&none).unwrap().relro, Some("none"));
 
     let partial = Builder::new()
         .segment(BuildSegment::new(PT_GNU_RELRO, 4))
         .build();
-    assert_eq!(read(&partial).unwrap().relro, "partial");
+    assert_eq!(read(&partial).unwrap().relro, Some("partial"));
 
     // The same header plus DT_BIND_NOW, which is what makes it full: the
     // relocations are resolved before main runs, so the table can be sealed.
@@ -468,7 +468,7 @@ fn reads_partial_and_full_relro_apart() {
         .section(BuildSection::new(".dynamic", SHT_DYNAMIC, dynamic).linked(2))
         .section(BuildSection::new(".dynstr", SHT_STRTAB, Strings::new().data))
         .build();
-    assert_eq!(read(&full).unwrap().relro, "full");
+    assert_eq!(read(&full).unwrap().relro, Some("full"));
 }
 
 #[test]
@@ -535,7 +535,7 @@ fn finds_the_stack_guard_and_fortified_calls_among_the_symbols() {
     let elf = read(&file).unwrap();
 
     assert!(elf.canary);
-    assert!(elf.fortify);
+    assert_eq!(elf.fortify, Some(true));
 }
 
 #[test]
@@ -642,7 +642,7 @@ fn json_output_is_well_formed_with_every_field_populated() {
         .segment(BuildSegment::new(PT_GNU_STACK, 4 | 2))
         .build();
 
-    let out = json(&file);
+    let out = crate::binary::json(&file);
     assert!(crate::json::is_well_formed(&out), "malformed JSON: {out}");
     assert!(out.contains("\"puts\""), "{out}");
     assert!(out.contains("\"libc.so.6\""), "{out}");
@@ -650,8 +650,8 @@ fn json_output_is_well_formed_with_every_field_populated() {
 
 #[test]
 fn json_output_is_well_formed_for_a_file_that_is_not_an_elf() {
-    assert_eq!(json(b"not an elf"), "null");
-    assert!(crate::json::is_well_formed(&json(b"not an elf")));
+    assert_eq!(crate::binary::json(b"not an elf"), "null");
+    assert!(crate::json::is_well_formed(&crate::binary::json(b"not an elf")));
 }
 
 #[test]
@@ -666,4 +666,11 @@ fn survives_a_header_that_points_its_tables_past_the_end_of_the_file() {
     let elf = read(&file).expect("still reads the header it has");
     assert_eq!(elf.machine, "x86-64");
     assert!(elf.sections.is_empty() || elf.sections.iter().all(|s| s.name.is_empty()));
+}
+
+/// The smallest thing this reads as an ELF, for the tests elsewhere that only
+/// need one to exist. Shared with [`crate::binary::tests`], which checks that
+/// the two formats come out the same shape.
+pub(crate) fn minimal() -> Vec<u8> {
+    Builder::new().build()
 }

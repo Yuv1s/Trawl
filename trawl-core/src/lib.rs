@@ -6,6 +6,7 @@
 use wasm_bindgen::prelude::*;
 
 pub mod aes;
+pub mod binary;
 pub mod bmp;
 pub mod bytes;
 pub mod cuttlefish;
@@ -16,6 +17,7 @@ pub mod jpeg;
 pub mod json;
 pub mod mantis;
 pub mod pdf;
+pub mod pe;
 pub mod pixels;
 pub mod png;
 pub mod spectrogram;
@@ -304,16 +306,17 @@ pub fn pdf_structure(file: &[u8]) -> String {
     pdf::json(file)
 }
 
-/// What an ELF binary declares about itself, as JSON, or null when the file
-/// is not one.
+/// What an executable declares about itself, as JSON, or null when the file
+/// is neither an ELF nor a PE.
 ///
-/// The header, the section table, the program headers and the dynamic
-/// symbols, each read and reported. Nothing here decodes an instruction: the
-/// question this answers is what the file says it is, which the format
-/// states outright, rather than what its code does, which it does not.
+/// The header, the section table, the libraries needed, the symbols passing
+/// in and out, and the protections the file says it was built with, each
+/// read and reported. Nothing here decodes an instruction: the question this
+/// answers is what the file says it is, which the format states outright,
+/// rather than what its code does, which it does not.
 #[wasm_bindgen]
-pub fn elf_structure(file: &[u8]) -> String {
-    elf::json(file)
+pub fn binary_structure(file: &[u8]) -> String {
+    binary::json(file)
 }
 
 /// Applies a key somebody already has, across every cipher that takes one.

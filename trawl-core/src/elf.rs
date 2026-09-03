@@ -18,6 +18,8 @@
 //! actually supports: a header that is absent is reported as absent, not as
 //! a protection that is off, because those are different facts.
 
+use crate::binary::{Binary, Guard, Section, Segment, Symbol, MAX_SYMBOLS};
+
 /// Reads numbers out of an ELF the way its own header says to: in the
 /// endianness it declares, and four or eight bytes wide depending on its
 /// class. Every table in the format changes shape on those two bits, so
@@ -179,109 +181,10 @@ fn section_flags(flags: u64) -> String {
     out.join(", ")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Section {
-    pub name: String,
-    pub kind: &'static str,
-    pub address: u64,
-    pub offset: u64,
-    pub size: u64,
-    pub flags: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Segment {
-    pub kind: &'static str,
-    pub permissions: String,
-    pub offset: u64,
-    pub address: u64,
-    pub file_size: u64,
-    pub memory_size: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Symbol {
-    pub name: String,
-    pub kind: &'static str,
-    pub address: u64,
-}
-
-/// What the file says about a protection, kept to three states because the
-/// format supports three: declared on, declared off, and never declared at
-/// all. Collapsing the third into the second would report a fact the binary
-/// does not carry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Guard {
-    On,
-    Off,
-    Undeclared,
-}
-
-impl Guard {
-    fn label(self) -> &'static str {
-        match self {
-            Guard::On => "on",
-            Guard::Off => "off",
-            Guard::Undeclared => "not declared",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Elf {
-    /// "64-bit" or "32-bit", from the header's own class byte.
-    pub class: &'static str,
-    pub endianness: &'static str,
-    pub machine: &'static str,
-    /// What the file is for: an executable, a shared object, a relocatable
-    /// object file, or a core dump.
-    pub kind: &'static str,
-    pub entry: u64,
-    /// The dynamic loader named in `PT_INTERP`, present only on a file meant
-    /// to be run rather than linked against.
-    pub interpreter: Option<String>,
-    pub sections: Vec<Section>,
-    pub segments: Vec<Segment>,
-    /// Libraries named by `DT_NEEDED`, in the order the dynamic table lists
-    /// them.
-    pub needed: Vec<String>,
-    /// Undefined dynamic symbols: what this binary calls and something else
-    /// has to provide.
-    pub imports: Vec<Symbol>,
-    /// Defined, globally bound dynamic symbols: what this binary offers.
-    pub exports: Vec<Symbol>,
-    /// True counts, which the two lists above are capped copies of.
-    pub import_count: usize,
-    pub export_count: usize,
-    /// True when no `.symtab` survives, so only the dynamic symbols a linker
-    /// needs are left and every local name the author wrote is gone.
-    pub stripped: bool,
-    pub nx: Guard,
-    /// "yes", "no", or "shared object", since a position-independent
-    /// executable and a library share a type and are told apart by whether
-    /// the file names an interpreter.
-    pub pie: &'static str,
-    /// "none", "partial", or "full".
-    pub relro: &'static str,
-    /// True when `__stack_chk_fail` is linked, which a compiler emits only
-    /// for functions it guarded.
-    pub canary: bool,
-    /// True when a `__*_chk` fortified libc call is linked.
-    pub fortify: bool,
-    /// A library search path baked into the binary, which is worth seeing
-    /// because it decides where its libraries come from.
-    pub runpath: Option<String>,
-}
-
-/// How many symbols of each kind reach the caller. A stripped challenge
-/// binary has a handful; a large one can have thousands, and the count is
-/// reported separately so a capped list never reads as the whole truth.
-const MAX_SYMBOLS: usize = 512;
-
 const SHN_UNDEF: u16 = 0;
 const STB_LOCAL: u8 = 0;
 
-pub fn read(data: &[u8]) -> Option<Elf> {
+pub fn read(data: &[u8]) -> Option<Binary> {
     if !data.starts_with(b"\x7fELF") {
         return None;
     }
@@ -333,7 +236,7 @@ pub fn read(data: &[u8]) -> Option<Elf> {
             name: shstrtab
                 .and_then(|table| string_at(data, table, s.name_offset))
                 .unwrap_or_default(),
-            kind: section_kind(s.kind),
+            kind: section_kind(s.kind).to_string(),
             address: s.address,
             offset: s.offset,
             size: s.size,
@@ -415,6 +318,7 @@ pub fn read(data: &[u8]) -> Option<Elf> {
                 name,
                 kind: symbol_kind(info),
                 address: value,
+                from: None,
             };
 
             if shndx == SHN_UNDEF {
@@ -453,27 +357,31 @@ pub fn read(data: &[u8]) -> Option<Elf> {
 
     let stripped = !raw_sections.iter().any(|s| s.kind == 2);
 
-    Some(Elf {
+    Some(Binary {
+        format: "ELF",
         class: if wide { "64-bit" } else { "32-bit" },
         endianness: if little { "little" } else { "big" },
         machine,
         kind,
         entry,
         interpreter,
+        runpath,
+        subsystem: None,
+        pdb_path: None,
+        stripped,
+        nx,
+        pie,
+        relro: Some(relro),
+        canary,
+        fortify: Some(fortify),
+        cfg: None,
+        needed,
         sections,
         segments,
-        needed,
         imports,
         exports,
         import_count,
         export_count,
-        stripped,
-        nx,
-        pie,
-        relro,
-        canary,
-        fortify,
-        runpath,
     })
 }
 
@@ -543,7 +451,7 @@ fn read_program_headers(
             };
 
             Some(Segment {
-                kind: segment_kind(r.u32(at)?),
+                kind: segment_kind(r.u32(at)?).to_string(),
                 permissions: permissions(flags),
                 offset,
                 address,
@@ -611,131 +519,5 @@ fn read_dynamic(r: &Reader, sections: &[RawSection]) -> (Vec<String>, Option<Str
     (needed, runpath, bind_now)
 }
 
-pub fn json(data: &[u8]) -> String {
-    use crate::json::{push_bool, push_field, push_number, push_string};
-
-    let Some(elf) = read(data) else {
-        return "null".to_string();
-    };
-
-    let mut out = String::from("{");
-    push_field(&mut out, "class", elf.class);
-    out.push(',');
-    push_field(&mut out, "endianness", elf.endianness);
-    out.push(',');
-    push_field(&mut out, "machine", elf.machine);
-    out.push(',');
-    push_field(&mut out, "kind", elf.kind);
-    out.push(',');
-    push_field(&mut out, "entry", &format!("0x{:x}", elf.entry));
-    out.push(',');
-    push_string(&mut out, "interpreter");
-    out.push(':');
-    match &elf.interpreter {
-        Some(name) => push_string(&mut out, name),
-        None => out.push_str("null"),
-    }
-    out.push(',');
-    push_string(&mut out, "runpath");
-    out.push(':');
-    match &elf.runpath {
-        Some(path) => push_string(&mut out, path),
-        None => out.push_str("null"),
-    }
-    out.push(',');
-    push_bool(&mut out, "stripped", elf.stripped);
-    out.push(',');
-    push_field(&mut out, "nx", elf.nx.label());
-    out.push(',');
-    push_field(&mut out, "pie", elf.pie);
-    out.push(',');
-    push_field(&mut out, "relro", elf.relro);
-    out.push(',');
-    push_bool(&mut out, "canary", elf.canary);
-    out.push(',');
-    push_bool(&mut out, "fortify", elf.fortify);
-    out.push(',');
-    push_number(&mut out, "importCount", elf.import_count);
-    out.push(',');
-    push_number(&mut out, "exportCount", elf.export_count);
-    out.push(',');
-
-    push_string(&mut out, "needed");
-    out.push_str(":[");
-    for (i, name) in elf.needed.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        push_string(&mut out, name);
-    }
-    out.push_str("],");
-
-    push_string(&mut out, "sections");
-    out.push_str(":[");
-    for (i, section) in elf.sections.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push('{');
-        push_field(&mut out, "name", &section.name);
-        out.push(',');
-        push_field(&mut out, "kind", section.kind);
-        out.push(',');
-        push_field(&mut out, "address", &format!("0x{:x}", section.address));
-        out.push(',');
-        push_number(&mut out, "offset", section.offset as usize);
-        out.push(',');
-        push_number(&mut out, "size", section.size as usize);
-        out.push(',');
-        push_field(&mut out, "flags", &section.flags);
-        out.push('}');
-    }
-    out.push_str("],");
-
-    push_string(&mut out, "segments");
-    out.push_str(":[");
-    for (i, segment) in elf.segments.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push('{');
-        push_field(&mut out, "kind", segment.kind);
-        out.push(',');
-        push_field(&mut out, "permissions", &segment.permissions);
-        out.push(',');
-        push_field(&mut out, "address", &format!("0x{:x}", segment.address));
-        out.push(',');
-        push_number(&mut out, "offset", segment.offset as usize);
-        out.push(',');
-        push_number(&mut out, "fileSize", segment.file_size as usize);
-        out.push(',');
-        push_number(&mut out, "memorySize", segment.memory_size as usize);
-        out.push('}');
-    }
-    out.push_str("],");
-
-    for (key, symbols) in [("imports", &elf.imports), ("exports", &elf.exports)] {
-        push_string(&mut out, key);
-        out.push_str(":[");
-        for (i, symbol) in symbols.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            out.push('{');
-            push_field(&mut out, "name", &symbol.name);
-            out.push(',');
-            push_field(&mut out, "kind", symbol.kind);
-            out.push(',');
-            push_field(&mut out, "address", &format!("0x{:x}", symbol.address));
-            out.push('}');
-        }
-        out.push_str("],");
-    }
-
-    out.pop();
-    out.push('}');
-    out
-}
-
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

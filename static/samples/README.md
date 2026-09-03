@@ -55,12 +55,16 @@ The four files at the top of this directory stay at fixed paths because the in-a
 
 ## Binaries
 
-Both are ELF executables compiled from one source file on Debian, differing only in their compiler flags, so the defence rack is the only thing that changes between them.
+Two pairs, one per format. Each pair differs only in what it was built with, so the defence rack is the only thing that changes between them.
+
+The ELF pair is compiled from one source file on Debian. The PE pair is hand-built rather than compiled: there is no Windows cross-compiler in this corpus's toolchain, and a real `.exe` is a file people would be right to be wary of downloading. They carry no code at all, only headers, a `.text` of `int3` padding, and a flag string. Every header, table and directory in them is real, so the reader walks them exactly as it walks a compiled image. They are named `.bin` because Trawl identifies a format by its magic bytes rather than its extension.
 
 | File | Main tools | Expected result |
 | --- | --- | --- |
 | [`binaries/vulnerable-elf`](binaries/vulnerable-elf) | Binary structure, flag scan | Reports an executable stack, a fixed load address, no RELRO and no stack guard, and reads `flag{the_symbols_gave_it_away}` out of the binary. |
 | [`binaries/hardened-elf`](binaries/hardened-elf) | Binary structure | The same program built with `-pie -fstack-protector-all -D_FORTIFY_SOURCE=2 -z relro -z now`. Every protection reads on, so the tool stays quiet. |
+| [`binaries/vulnerable-pe.bin`](binaries/vulnerable-pe.bin) | Binary structure, flag scan | A PE32+ image declaring no NX, no ASLR and no Control Flow Guard, with no stack cookie in its load configuration. Imports four functions from `KERNEL32.dll` and carries `flag{the_headers_told_on_it}`. |
+| [`binaries/hardened-pe.bin`](binaries/hardened-pe.bin) | Binary structure | The same image with NX, ASLR and Control Flow Guard set and a cookie in its load configuration, so every protection reads on. |
 
 ## Cuttlefish image tools
 
@@ -108,4 +112,4 @@ Mantis accepts pasted text. Open a `.txt` file below, copy its single encoded li
 
 ## Regeneration
 
-Most files in this public corpus are copies of deterministic fixtures produced by [`fixtures/generate.mjs`](../../fixtures/generate.mjs). The focused archive, PDF, GIF, tone, AES, compression, carving, and entropy samples were generated with Node built-ins for this corpus. The two binaries were compiled with `gcc` from a single source file, once with every protection disabled and once with them on; the flags for each are in the table above. No application source or runtime dependency is required to use them.
+Most files in this public corpus are copies of deterministic fixtures produced by [`fixtures/generate.mjs`](../../fixtures/generate.mjs). The focused archive, PDF, GIF, tone, AES, compression, carving, and entropy samples were generated with Node built-ins for this corpus. The two ELF binaries were compiled with `gcc` from a single source file, once with every protection disabled and once with them on; the flags for each are in the table above. The two PE images were written byte by byte with Node built-ins rather than compiled, for the reasons given in that section. No application source or runtime dependency is required to use them.

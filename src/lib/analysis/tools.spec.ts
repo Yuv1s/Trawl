@@ -2,7 +2,7 @@
 import { flagsOf, PLANNED, tools } from './tools';
 import type {
 	Chunk,
-	ElfStructure,
+	BinaryStructure,
 	GifAnalysis,
 	NestedAnalysis,
 	Structure,
@@ -547,7 +547,8 @@ describe('nested analysis', () => {
 });
 
 describe('binary structure', () => {
-	const elf = (over: Partial<ElfStructure> = {}): ElfStructure => ({
+	const elf = (over: Partial<BinaryStructure> = {}): BinaryStructure => ({
+		format: 'ELF',
 		class: '64-bit',
 		endianness: 'little',
 		machine: 'x86-64',
@@ -555,12 +556,15 @@ describe('binary structure', () => {
 		entry: '0x401060',
 		interpreter: '/lib64/ld-linux-x86-64.so.2',
 		runpath: null,
+		subsystem: null,
+		pdbPath: null,
 		stripped: false,
 		nx: 'on',
 		pie: 'yes',
 		relro: 'full',
 		canary: true,
 		fortify: true,
+		cfg: null,
 		importCount: 0,
 		exportCount: 0,
 		needed: [],
@@ -574,11 +578,11 @@ describe('binary structure', () => {
 	it('stands down on a file that is not an ELF', () => {
 		const tool = tools({ survey, structure }).find((t) => t.id === 'binary')!;
 		expect(tool.status).toBe('pending');
-		expect(tool.value).toBe('not an ELF binary');
+		expect(tool.value).toBe('not an executable this reads');
 	});
 
 	it('stays clear on a binary built with every protection on', () => {
-		const tool = tools({ survey, elf: elf() }).find((t) => t.id === 'binary')!;
+		const tool = tools({ survey, binary: elf() }).find((t) => t.id === 'binary')!;
 		expect(tool.status).toBe('clear');
 		expect(tool.value).toContain('hardened');
 	});
@@ -586,17 +590,17 @@ describe('binary structure', () => {
 	it('reports each protection the file leaves open', () => {
 		const tool = tools({
 			survey,
-			elf: elf({ nx: 'off', pie: 'no', relro: 'none', canary: false })
+			binary: elf({ nx: 'off', pie: 'no', relro: 'none', canary: false })
 		}).find((t) => t.id === 'binary')!;
 
 		expect(tool.status).toBe('hit');
-		expect(tool.value).toBe('executable stack, no PIE, no RELRO, no canary');
+		expect(tool.value).toBe('executable stack, no ASLR, no RELRO, no canary');
 	});
 
 	it('treats a stack header that is missing as unresolved rather than off', () => {
 		// The file makes no claim, so the note says so instead of reporting a
 		// protection as disabled that the binary never mentions.
-		const tool = tools({ survey, elf: elf({ nx: 'not declared' }) }).find(
+		const tool = tools({ survey, binary: elf({ nx: 'not declared' }) }).find(
 			(t) => t.id === 'binary'
 		)!;
 		expect(tool.status).toBe('hit');
@@ -605,13 +609,51 @@ describe('binary structure', () => {
 
 	it('does not hold a shared library to PIE, which does not apply to it', () => {
 		const library = elf({ kind: 'shared object', pie: 'shared object', interpreter: null });
-		const tool = tools({ survey, elf: library }).find((t) => t.id === 'binary')!;
+		const tool = tools({ survey, binary: library }).find((t) => t.id === 'binary')!;
 		expect(tool.status).toBe('clear');
 	});
 
 	it('says a hardened binary was stripped when it was', () => {
-		const tool = tools({ survey, elf: elf({ stripped: true }) }).find((t) => t.id === 'binary')!;
+		const tool = tools({ survey, binary: elf({ stripped: true }) }).find((t) => t.id === 'binary')!;
 		expect(tool.value).toContain('stripped');
+	});
+
+	const pe = (over: Partial<BinaryStructure> = {}): BinaryStructure =>
+		elf({
+			format: 'PE',
+			kind: 'executable',
+			interpreter: null,
+			subsystem: 'Windows console',
+			// The fields ELF alone carries are absent rather than nil-valued,
+			// which is what the rack has to cope with.
+			relro: null,
+			fortify: null,
+			cfg: true,
+			...over
+		});
+
+	it('judges a PE by the protections it does carry', () => {
+		const tool = tools({ survey, binary: pe() }).find((t) => t.id === 'binary')!;
+		expect(tool.status).toBe('clear');
+		expect(tool.value).toContain('hardened');
+	});
+
+	it('does not hold a PE to RELRO, which its format has no counterpart for', () => {
+		// A null RELRO is "this format does not have one", and counting it as
+		// a missing defence would mark every PE ever built as weak.
+		const tool = tools({ survey, binary: pe({ relro: null }) }).find((t) => t.id === 'binary')!;
+		expect(tool.status).toBe('clear');
+		expect(tool.value).not.toContain('RELRO');
+	});
+
+	it('reports an unprotected PE the same way it reports an unprotected ELF', () => {
+		const tool = tools({
+			survey,
+			binary: pe({ nx: 'off', pie: 'no', canary: false })
+		}).find((t) => t.id === 'binary')!;
+
+		expect(tool.status).toBe('hit');
+		expect(tool.value).toBe('executable stack, no ASLR, no canary');
 	});
 });
 

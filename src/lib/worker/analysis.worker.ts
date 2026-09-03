@@ -24,7 +24,7 @@ import init, {
 	wav_structure,
 	zip_structure,
 	pdf_structure,
-	elf_structure,
+	binary_structure,
 	gif_frame_analysis
 } from '$lib/wasm/trawl_core';
 import type {
@@ -42,7 +42,7 @@ import type {
 	NestedArtifact,
 	PaletteStego,
 	PdfStructure,
-	ElfStructure,
+	BinaryStructure,
 	PeelResult,
 	PeelStep,
 	PlaneWall,
@@ -784,7 +784,7 @@ async function analyseRoot(
 	const pdf = JSON.parse(pdf_structure(bytes)) as PdfStructure | null;
 	if (pdf) await inflatePdfStreams(bytes, pdf, flagTags);
 
-	const elf = JSON.parse(elf_structure(bytes)) as ElfStructure | null;
+	const binary = JSON.parse(binary_structure(bytes)) as BinaryStructure | null;
 
 	const aes = JSON.parse(aes_probe(withInflatedText(bytes, structure))) as AesSolved[];
 	const jpeg = JSON.parse(jpeg_stego(bytes, SWEEP_BYTES, CHI_STEPS_JPEG)) as
@@ -873,7 +873,7 @@ async function analyseRoot(
 		paletteStego,
 		zip,
 		pdf,
-		elf,
+		binary,
 		aes,
 		sweep,
 		wall,
