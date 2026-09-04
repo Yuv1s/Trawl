@@ -14,6 +14,7 @@ import {
 	type PaletteStego,
 	type PdfStructure,
 	type BinaryStructure,
+	type RegistryHive,
 	type PlaneWall,
 	type RsAnalysis,
 	type Spectrogram,
@@ -33,7 +34,7 @@ export type ToolStatus = 'hit' | 'clear' | 'ready' | 'pending';
  * `jpeg` needs the coefficient decoder.
  */
 export type ToolScope =
-	'bytes' | 'pixels' | 'png' | 'audio' | 'jpeg' | 'zip' | 'pdf' | 'binary' | 'gif';
+	'bytes' | 'pixels' | 'png' | 'audio' | 'jpeg' | 'zip' | 'pdf' | 'binary' | 'hive' | 'gif';
 
 /**
  * The two halves of the rack. Survey reads the file as it sits on disk;
@@ -90,6 +91,7 @@ const NO_AUDIO = 'not an audio file';
 const NO_ARCHIVE = 'not a ZIP archive';
 const NO_PDF = 'not a PDF document';
 const NO_BINARY = 'not an executable this reads';
+const NO_HIVE = 'not a registry hive';
 const NO_COEFFICIENTS = 'no readable JPEG coefficients';
 
 /** Metadata fields a person types into, as opposed to ones a camera fills in. */
@@ -122,6 +124,7 @@ export type Findings = {
 	zip?: ZipArchive | null;
 	pdf?: PdfStructure | null;
 	binary?: BinaryStructure | null;
+	hive?: RegistryHive | null;
 	nested?: NestedAnalysis | null;
 	gif?: GifAnalysis | null;
 };
@@ -232,6 +235,25 @@ function pdfNote(pdf: PdfStructure): string {
 }
 
 /**
+ * What to say about a hive in one line of a tool rack.
+ *
+ * A device count is the finding when there is one. When there is not, which
+ * of the two reasons applies matters more than the zero does: a hive that
+ * was searched and held nothing is a different fact from a hive that carries
+ * no device history in the first place.
+ */
+function hiveNote(hive: RegistryHive): string {
+	const count = hive.devices.length;
+	if (count > 0) {
+		return `${count} USB device${count === 1 ? '' : 's'} remembered`;
+	}
+	if (hive.searched.length > 0) {
+		return `${hive.kind}, no device history`;
+	}
+	return `${hive.kind}, nowhere here keeps device history`;
+}
+
+/**
  * Whether a binary leaves open any of the protections its own format can
  * declare.
  *
@@ -263,7 +285,7 @@ function binaryNote(binary: BinaryStructure): string {
 export function tools(found: Findings): Tool[] {
 	const { survey, structure = null, sweep = null, wall = null, chi = null, rs = null } = found;
 	const { audio = null, spectrogram = null, paletteStego = null, zip = null } = found;
-	const { pdf = null, binary = null } = found;
+	const { pdf = null, binary = null, hive = null } = found;
 	const { nested = null, gif = null } = found;
 	const aes = found.aes ?? [];
 	const wav = found.wav && !isWavError(found.wav) ? found.wav : null;
@@ -322,6 +344,11 @@ export function tools(found: Findings): Tool[] {
 			? { ...tool, scope: 'binary', group: 'survey' }
 			: { ...tool, scope: 'binary', group: 'survey', status: 'pending', value: NO_BINARY };
 
+	const registry = (tool: Partial): Tool =>
+		hive
+			? { ...tool, scope: 'hive', group: 'survey' }
+			: { ...tool, scope: 'hive', group: 'survey', status: 'pending', value: NO_HIVE };
+
 	const sound = (tool: Partial, group: ToolGroup = 'cuttlefish'): Tool =>
 		wav
 			? { ...tool, scope: 'audio', group }
@@ -353,6 +380,13 @@ export function tools(found: Findings): Tool[] {
 				'Walks a PDF for every object, and reports what the cross-reference table leaves out',
 			status: pdf && pdfOdd(pdf) ? 'hit' : 'clear',
 			value: pdf ? pdfNote(pdf) : ''
+		}),
+		registry({
+			id: 'hive',
+			name: 'Registry hive',
+			measures: 'Walks a Windows hive for what it remembers about the USB devices plugged in',
+			status: hive && hive.devices.length > 0 ? 'hit' : 'clear',
+			value: hive ? hiveNote(hive) : ''
 		}),
 		executable({
 			id: 'binary',

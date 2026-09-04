@@ -22,6 +22,7 @@
 	import ZipView from '$lib/components/ZipView.svelte';
 	import PdfView from '$lib/components/PdfView.svelte';
 	import BinaryView from '$lib/components/BinaryView.svelte';
+	import HiveView from '$lib/components/HiveView.svelte';
 	import GifFramesView from '$lib/components/GifFramesView.svelte';
 	import HexView from '$lib/components/HexView.svelte';
 	import StringsView from '$lib/components/StringsView.svelte';
@@ -150,37 +151,44 @@
 					// since that is the one panel a person has to read themselves.
 					const zipFlagged = analysis.zip?.entries.some((e) => (e.flags?.length ?? 0) > 0);
 
+					// A hive that remembers a device is as specific a finding as a
+					// flag inside an archive, and the panel that shows it is the
+					// only reason to open a hive at all.
+					const hiveDevices = (analysis.hive?.devices.length ?? 0) > 0;
+
 					activeTool = flags.some((f) => f.credible)
 						? 'flags'
 						: analysis.aes.length
 							? 'aes'
 							: zipFlagged
 								? 'archive'
-								: analysis.sweep?.candidates.length
-									? 'lsb'
-									: analysis.audio?.candidates.length
-										? 'audio-lsb'
-										: analysis.jpeg &&
-											  !isJpegError(analysis.jpeg) &&
-											  analysis.jpeg.candidates.length
-											? 'jsteg'
-											: analysis.paletteStego?.candidates.length
-												? 'palette'
-												: written
-													? 'exif'
-													: analysis.survey.jpegComments.length
-														? 'jpeg'
-														: analysis.chi?.detected
-															? 'chi'
-															: analysis.rs?.detected
-																? 'rs'
-																: analysis.survey.magic.some((m) => m.embedded)
-																	? 'magic'
-																	: isWav
-																		? 'spectrogram'
-																		: analysis.structure
-																			? 'chunks'
-																			: 'strings';
+								: hiveDevices
+									? 'hive'
+									: analysis.sweep?.candidates.length
+										? 'lsb'
+										: analysis.audio?.candidates.length
+											? 'audio-lsb'
+											: analysis.jpeg &&
+												  !isJpegError(analysis.jpeg) &&
+												  analysis.jpeg.candidates.length
+												? 'jsteg'
+												: analysis.paletteStego?.candidates.length
+													? 'palette'
+													: written
+														? 'exif'
+														: analysis.survey.jpegComments.length
+															? 'jpeg'
+															: analysis.chi?.detected
+																? 'chi'
+																: analysis.rs?.detected
+																	? 'rs'
+																	: analysis.survey.magic.some((m) => m.embedded)
+																		? 'magic'
+																		: isWav
+																			? 'spectrogram'
+																			: analysis.structure
+																				? 'chunks'
+																				: 'strings';
 				});
 			});
 		}
@@ -513,6 +521,10 @@
 		view.phase === 'done' && view.result.status === 'ok' ? view.result.binary : null
 	);
 
+	const hive = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.hive : null
+	);
+
 	const nested = $derived(
 		view.phase === 'done' && view.result.status === 'ok' ? view.result.nested : null
 	);
@@ -551,6 +563,7 @@
 					zip,
 					pdf,
 					binary,
+					hive,
 					aes,
 					nested,
 					gif
@@ -924,6 +937,12 @@
 							<PdfView doc={pdf} onpeel={acceptText} />
 						{:else}
 							<p class="clear">This file is not a PDF document, so there is nothing to read.</p>
+						{/if}
+					{:else if activeTool === 'hive'}
+						{#if hive}
+							<HiveView {hive} />
+						{:else}
+							<p class="clear">This file is not a registry hive, so there is nothing to read.</p>
 						{/if}
 					{:else if activeTool === 'binary'}
 						{#if binary}

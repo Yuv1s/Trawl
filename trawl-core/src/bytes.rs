@@ -250,7 +250,7 @@ pub fn flag_candidates(data: &[u8]) -> Vec<Found> {
     out
 }
 
-const SIGNATURES: [(&[u8], &str); 12] = [
+const SIGNATURES: [(&[u8], &str); 13] = [
     (b"\x89PNG\r\n\x1a\n", "PNG image"),
     (b"\xff\xd8\xff", "JPEG image"),
     (b"GIF8", "GIF image"),
@@ -261,6 +261,7 @@ const SIGNATURES: [(&[u8], &str); 12] = [
     (b"7z\xbc\xaf\x27\x1c", "7-Zip archive"),
     (b"Rar!\x1a\x07", "RAR archive"),
     (b"%PDF", "PDF document"),
+    (b"regf", "Windows registry hive"),
     (b"\x7fELF", "ELF binary"),
     (b"RIFF", "RIFF container"),
 ];

@@ -357,6 +357,18 @@ export const SAMPLE_GROUPS: SampleGroup[] = [
 		]
 	},
 	{
+		title: 'Forensics',
+		entries: [
+			{
+				name: 'usb-history.hiv',
+				mime: 'application/octet-stream',
+				url: '/samples/forensics/usb-history.hiv',
+				blurb:
+					'A Windows SYSTEM hive remembering three USB sticks, with the date each was last plugged in. One of the three reported no serial number, so Windows invented one and it names the port rather than the stick.'
+			}
+		]
+	},
+	{
 		title: 'Cuttlefish: images',
 		entries: [
 			{

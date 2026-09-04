@@ -265,6 +265,52 @@ export type PdfStructure = {
 	objects: PdfObject[];
 };
 
+/** One USB device a hive remembers. */
+export type RegistryDevice = {
+	/** Which key this came out of: USBSTOR, USB, or MountPoints2. The three
+	 *  carry different evidence. */
+	source: string;
+	vendor: string;
+	product: string;
+	revision: string;
+	/** The instance identifier, which is the device's own serial when it had
+	 *  one to give. */
+	serial: string;
+	friendlyName: string;
+	/** When the device's own key was last written. Not a connection log: it
+	 *  is when Windows last touched this key, which for a USBSTOR key is
+	 *  normally a connection and occasionally something else. */
+	lastWritten: string;
+	/** True when Windows generated the identifier because the device reported
+	 *  no serial of its own, which means it belongs to the port rather than
+	 *  to the stick and does not follow it between machines. */
+	generatedSerial: boolean;
+};
+
+export type RegistryKeyLine = {
+	name: string;
+	subkeys: number;
+	values: number;
+	written: string;
+};
+
+/** What a Windows registry hive declares, and what it remembers about the
+ *  devices plugged into the machine it came from. */
+export type RegistryHive = {
+	version: string;
+	/** Which hive this is, from the path it names for itself and the keys at
+	 *  its root. */
+	kind: string;
+	fileName: string;
+	written: string;
+	root: string;
+	top: RegistryKeyLine[];
+	devices: RegistryDevice[];
+	/** The paths that were looked at, so an empty result says which it is: a
+	 *  hive with no device history, or a hive that would never have held any. */
+	searched: string[];
+};
+
 export type BinarySection = {
 	name: string;
 	kind: string;
@@ -803,6 +849,8 @@ export type AnalysisResponse =
 			pdf: PdfStructure | null;
 			/** Null when the file is neither an ELF nor a PE. */
 			binary: BinaryStructure | null;
+			/** Null when the file is not a Windows registry hive. */
+			hive: RegistryHive | null;
 			/** AES-CBC decryptions the file's own key and payload produced. Empty for most files. */
 			aes: AesSolved[];
 			sweep: Sweep | null;

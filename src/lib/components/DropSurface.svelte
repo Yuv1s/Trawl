@@ -65,7 +65,8 @@
 				['Readable text', 'Text anywhere in the file, plain or wide'],
 				['Archive entries', 'Reads a ZIP twice and reports where the two copies disagree'],
 				['PDF structure', 'Walks a PDF for every object, and what the index leaves out'],
-				['Binary structure', 'Reads what an ELF or PE declares, down to its own defences']
+				['Binary structure', 'Reads what an ELF or PE declares, down to its own defences'],
+				['Registry hive', 'Reads which USB stick a Windows hive remembers, and when']
 			]
 		},
 		{

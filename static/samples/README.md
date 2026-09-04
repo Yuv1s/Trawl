@@ -66,6 +66,14 @@ The ELF pair is compiled from one source file on Debian. The PE pair is hand-bui
 | [`binaries/vulnerable-pe.bin`](binaries/vulnerable-pe.bin) | Binary structure, flag scan | A PE32+ image declaring no NX, no ASLR and no Control Flow Guard, with no stack cookie in its load configuration. Imports four functions from `KERNEL32.dll` and carries `flag{the_headers_told_on_it}`. |
 | [`binaries/hardened-pe.bin`](binaries/hardened-pe.bin) | Binary structure | The same image with NX, ASLR and Control Flow Guard set and a cookie in its load configuration, so every protection reads on. |
 
+## Forensics
+
+Hand-built rather than copied off a machine. A real SYSTEM hive is tens of megabytes and carries the serial numbers, machine name and account details of whoever it came from; this one holds three invented devices and nothing else. The device key naming, the instance identifier shapes and the value names are the ones Windows actually writes, so the reader walks it exactly as it walks a hive pulled off a real machine.
+
+| File | Main tools | Expected result |
+| --- | --- | --- |
+| [`forensics/usb-history.hiv`](forensics/usb-history.hiv) | Registry hive | A SYSTEM hive remembering three USB sticks under `ControlSet001\Enum\USBSTOR`, each with the date it was last plugged in. Two reported their own serial numbers; the third did not, so Windows generated `7&1ec5b3e5&0` and the reader marks it as naming the port rather than the device. |
+
 ## Cuttlefish image tools
 
 | File | Main tools | Expected result |

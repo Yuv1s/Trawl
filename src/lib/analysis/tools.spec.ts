@@ -3,6 +3,7 @@ import { flagsOf, PLANNED, tools } from './tools';
 import type {
 	Chunk,
 	BinaryStructure,
+	RegistryHive,
 	GifAnalysis,
 	NestedAnalysis,
 	Structure,
@@ -654,6 +655,62 @@ describe('binary structure', () => {
 
 		expect(tool.status).toBe('hit');
 		expect(tool.value).toBe('executable stack, no ASLR, no canary');
+	});
+});
+
+describe('registry hive', () => {
+	const hive = (over: Partial<RegistryHive> = {}): RegistryHive => ({
+		version: '1.5',
+		kind: 'SYSTEM',
+		fileName: '\\??\\C:\\Windows\\System32\\SYSTEM',
+		written: '2025-06-19 17:03:28',
+		root: 'ROOT',
+		top: [],
+		devices: [],
+		searched: ['ControlSet001\\Enum\\USBSTOR'],
+		...over
+	});
+
+	const device = (over = {}) => ({
+		source: 'USBSTOR',
+		vendor: 'SanDisk',
+		product: 'Cruzer Blade',
+		revision: '1.26',
+		serial: '4C530001120606117025&0',
+		friendlyName: 'SanDisk Cruzer Blade USB Device',
+		lastWritten: '2025-03-14 22:41:07',
+		generatedSerial: false,
+		...over
+	});
+
+	it('stands down on a file that is not a hive', () => {
+		const tool = tools({ survey, structure }).find((t) => t.id === 'hive')!;
+		expect(tool.status).toBe('pending');
+		expect(tool.value).toBe('not a registry hive');
+	});
+
+	it('reports the devices a hive remembers', () => {
+		const tool = tools({ survey, hive: hive({ devices: [device(), device()] }) }).find(
+			(t) => t.id === 'hive'
+		)!;
+		expect(tool.status).toBe('hit');
+		expect(tool.value).toBe('2 USB devices remembered');
+	});
+
+	it('separates a hive with no history from one that never keeps any', () => {
+		// The zero is the same either way, and the difference is the whole
+		// point: one hive was searched and held nothing, the other was never
+		// going to hold anything.
+		const searched = tools({ survey, hive: hive() }).find((t) => t.id === 'hive')!;
+		expect(searched.status).toBe('clear');
+		expect(searched.value).toBe('SYSTEM, no device history');
+
+		const wrongKind = tools({
+			survey,
+			hive: hive({ kind: 'SOFTWARE', searched: [] })
+		}).find((t) => t.id === 'hive')!;
+		expect(wrongKind.status).toBe('clear');
+		expect(wrongKind.value).toBe('SOFTWARE, nowhere here keeps device history');
 	});
 });
 

@@ -20,6 +20,8 @@ pub mod pdf;
 pub mod pe;
 pub mod pixels;
 pub mod png;
+pub mod regf;
+pub mod registry;
 pub mod spectrogram;
 pub mod survey;
 pub mod wav;
@@ -317,6 +319,18 @@ pub fn pdf_structure(file: &[u8]) -> String {
 #[wasm_bindgen]
 pub fn binary_structure(file: &[u8]) -> String {
     binary::json(file)
+}
+
+/// What a Windows registry hive remembers about the USB devices plugged
+/// into the machine it came from, as JSON, or null when the file is not one.
+///
+/// A hive is a tree of cells pointing at each other by offset rather than a
+/// table, so this walks it from the root. Every key carries the time it was
+/// last written, and for the keys Windows only touches when a device is
+/// connected, that timestamp is the evidence.
+#[wasm_bindgen]
+pub fn registry_hive(file: &[u8]) -> String {
+    registry::json(file)
 }
 
 /// Applies a key somebody already has, across every cipher that takes one.

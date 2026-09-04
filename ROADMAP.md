@@ -57,6 +57,21 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
       nothing RELRO would describe, and saying "none" there would report a
       defence as missing that was never available to it
 
+- [x] Windows registry hives, for tracing which USB stick was plugged in
+      when. Every other format here describes itself in a table; a hive is a
+      tree of cells pointing at each other by byte offset, so it is walked
+      from the root rather than listed. What makes one worth reading is that
+      every key carries the time it was last written, and the keys Windows
+      touches when a device is connected are therefore the best evidence in
+      the file for when a stick was last plugged in. Reported as that and no
+      more: it is not a connection log, nothing says a device was ever
+      removed, and a driver can rewrite a key without anyone touching a port.
+      The one thing inferred outright is the serial, because the rule is
+      exact rather than probabilistic: an ampersand in the second position of
+      an instance identifier means the device reported no serial and Windows
+      generated one, so it names the port rather than the stick and does not
+      follow it between machines
+
 ### Cuttlefish, the steganography half
 
 - [x] Bit-plane wall: every layer of an image shown at once
@@ -233,7 +248,7 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 
 ### Forensics
 
-- [ ] Windows registry, for tracing which USB stick was plugged in when
+Nothing open here.
 
 ### Steganography still open
 
