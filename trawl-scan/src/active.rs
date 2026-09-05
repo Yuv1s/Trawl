@@ -176,6 +176,166 @@ fn clean_hints(hints: &[String]) -> Vec<String> {
     out
 }
 
+/// A value one response issued that a later request can carry, and the header
+/// it belongs in.
+///
+/// The stateless probes each send one request and read one response. A flow
+/// is what they cannot be: a first request draws out a value the site handed
+/// over, a session cookie or a token it minted, and a second request carries
+/// it to an endpoint that answers only to something it issued a moment ago.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Carriable {
+    /// The header this goes back in, `Cookie` or `Authorization`.
+    pub header: String,
+    /// The full header value to send, `session=abc123` or `Bearer abc123`.
+    pub value: String,
+    /// What it was, for the note on anything it draws out.
+    pub label: &'static str,
+}
+
+/// The JSON keys a site issues a session or a token under. A value found under
+/// one of these is worth carrying; a value under `id` or `name` is not, and
+/// carrying everything would be a second wordlist's worth of noise.
+const TOKEN_KEYS: &[&str] = &[
+    "token",
+    "session",
+    "sessionid",
+    "session_id",
+    "access_token",
+    "accesstoken",
+    "auth",
+    "authorization",
+    "apikey",
+    "api_key",
+    "jwt",
+    "secret",
+    "csrf",
+    "xsrf",
+    "csrf_token",
+];
+
+const MIN_TOKEN_LEN: usize = 8;
+const MAX_TOKEN_LEN: usize = 512;
+
+/// How many carriables one pass will replay, across every kind. A page can
+/// set a dozen cookies, and replaying each against every endpoint is a
+/// multiplying cost the budget already caps, but capping the list keeps the
+/// pass from spending its whole budget before it reaches anything else.
+const MAX_CARRIABLES: usize = 12;
+
+/// Whether a token value is one the site could have minted rather than a
+/// placeholder or a stray word. A JWT is deliberately left out: it has its own
+/// pass that recovers the key and forges a fresh token, which reaches further
+/// than replaying the one the site sent.
+fn is_carriable_token(value: &str) -> bool {
+    let length = value.len();
+    if !(MIN_TOKEN_LEN..=MAX_TOKEN_LEN).contains(&length) {
+        return false;
+    }
+    // A JWT is three base64url runs joined by dots; the forging pass owns those.
+    if value.split('.').count() == 3 && value.contains('.') {
+        return false;
+    }
+    // Placeholders read as words; a real token carries digits or the symbols
+    // base64 and hex use, and rarely spells anything.
+    let structured = value
+        .bytes()
+        .any(|b| b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'+' | b'/' | b'='));
+    value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+' | b'/' | b'='))
+        && structured
+}
+
+/// The quoted string that follows `"key"` in a JSON-ish body, if there is one.
+/// A byte scan rather than a parse, the same way the rest of this module reads
+/// bodies, so a malformed or truncated response still gives up what it holds.
+fn json_string_after(body: &[u8], key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let mut from = 0;
+    while let Some(found) = window_find(body, from, needle.as_bytes()) {
+        let mut at = found + needle.len();
+        while at < body.len() && matches!(body[at], b' ' | b'\t' | b':') {
+            at += 1;
+        }
+        if body.get(at) == Some(&b'"') {
+            let start = at + 1;
+            if let Some(end) = window_find(body, start, b"\"")
+                && let Ok(text) = std::str::from_utf8(&body[start..end])
+            {
+                return Some(text.to_string());
+            }
+        }
+        from = found + needle.len();
+    }
+    None
+}
+
+fn window_find(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    haystack
+        .get(from..)?
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| from + p)
+}
+
+/// The name=value a `Set-Cookie` header sets, before the attributes that follow.
+fn cookie_pair(set_cookie: &str) -> Option<String> {
+    let pair = set_cookie.split(';').next()?.trim();
+    let (name, _) = pair.split_once('=')?;
+    if name.is_empty() || pair.len() <= name.len() + 1 {
+        return None;
+    }
+    Some(pair.to_string())
+}
+
+/// Every value a response issued that is worth carrying into a later request.
+///
+/// A cookie the response set goes back as a `Cookie`. A token in the body goes
+/// back two ways, since a site accepts one where another expects the other: as
+/// a bearer credential, and as a session cookie. Deduplicated, because a page
+/// that sets one cookie and names the same token in its body should not spend
+/// the budget three times on the same string.
+pub fn carriables(headers: &[(String, String)], body: &[u8]) -> Vec<Carriable> {
+    let mut out: Vec<Carriable> = Vec::new();
+    let mut push = |carriable: Carriable| {
+        if out.len() < MAX_CARRIABLES && !out.contains(&carriable) {
+            out.push(carriable);
+        }
+    };
+
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("set-cookie")
+            && let Some(pair) = cookie_pair(value)
+        {
+            push(Carriable {
+                header: "Cookie".to_string(),
+                value: pair,
+                label: "a cookie the site set",
+            });
+        }
+    }
+
+    for key in TOKEN_KEYS {
+        if let Some(token) = json_string_after(body, key)
+            && is_carriable_token(&token)
+        {
+            push(Carriable {
+                header: "Authorization".to_string(),
+                value: format!("Bearer {token}"),
+                label: "a token the site issued",
+            });
+            push(Carriable {
+                header: "Cookie".to_string(),
+                value: format!("session={token}"),
+                label: "a token the site issued",
+            });
+        }
+    }
+
+    out
+}
+
 struct Probe<'a> {
     allow_local: bool,
     budget: &'a mut usize,
@@ -192,6 +352,9 @@ struct Probe<'a> {
     /// be forged and replayed once the crawl has turned both up.
     tokens: Vec<String>,
     existing: Vec<String>,
+    /// Values a response issued that a later request can carry, gathered as the
+    /// endpoints are met so the flow pass has them once the answering set is known.
+    carries: Vec<Carriable>,
     /// The page source, for a signing key a site leaks outside its own token.
     source: Vec<u8>,
 }
@@ -259,18 +422,61 @@ impl Probe<'_> {
         *self.budget -= 1;
         let mut request = request.clone();
         request.timeout.get_or_insert(PROBE_TIMEOUT);
-        fetch::fetch_with(url, self.allow_local, &request).await.ok()
+        fetch::fetch_with(url, self.allow_local, &request)
+            .await
+            .ok()
     }
 
     /// Whether an endpoint answers to a name, so techniques are not spent on one
     /// the site does not have. A 404 is a no; anything else is worth pressing.
+    ///
+    /// The response is also read for anything worth carrying: a cookie it set,
+    /// a token it named. The flow pass replays those once every endpoint has
+    /// been met, so they are gathered here rather than fetched again.
     async fn exists(&mut self, url: &str) -> bool {
         match self.send(url, &Request::default()).await {
             Some(response) => {
                 self.scan(url, "at an endpoint probed by name", &response.body);
+                for carriable in carriables(&response.headers, &response.body) {
+                    if !self.carries.contains(&carriable) && self.carries.len() < MAX_CARRIABLES {
+                        self.carries.push(carriable);
+                    }
+                }
                 response.status != 404
             }
             None => false,
+        }
+    }
+
+    /// Replays each value a response issued against every endpoint that
+    /// answered, so a flag behind a session reached only by carrying that
+    /// session forward is drawn out.
+    ///
+    /// Last, with the forging pass, because it needs the full set of answering
+    /// endpoints, which only the sweep above turns up. Every request is a GET
+    /// with one header added, no more invasive than the forged-token replay it
+    /// sits beside, and held to the target's own host because every URL in
+    /// `existing` was.
+    async fn flows(&mut self) {
+        for carriable in self.carries.clone() {
+            for url in self.existing.clone() {
+                if *self.budget == 0 || Instant::now() >= self.deadline {
+                    return;
+                }
+                let request = Request {
+                    method: Method::GET,
+                    body: None,
+                    headers: vec![(carriable.header.clone(), carriable.value.clone())],
+                    timeout: None,
+                };
+                if let Some(response) = self.send(&url, &request).await {
+                    self.scan(
+                        &url,
+                        &format!("{} was carried here from another response", carriable.label),
+                        &response.body,
+                    );
+                }
+            }
         }
     }
 
@@ -414,6 +620,7 @@ pub async fn run(
         accept_markers,
         tokens: Vec::new(),
         existing: Vec::new(),
+        carries: Vec::new(),
         source: source_bodies.concat(),
     };
 
@@ -451,8 +658,10 @@ pub async fn run(
         probe.header_variants(&url).await;
     }
 
-    // Last, because it needs both a token and the endpoints that answered, which
-    // only the pass above turns up.
+    // Last, because both need the endpoints that answered, which only the sweep
+    // above turns up: one carries values the site issued, the other a token
+    // forged from a key it leaked.
+    probe.flows().await;
     probe.forge_and_replay().await;
 
     probe.hits

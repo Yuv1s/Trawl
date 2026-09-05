@@ -221,6 +221,16 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
       fresh token that names an administrator is signed and replayed against the
       endpoints that answered. SHA-256 and HMAC are written out here too, nothing
       borrowed
+- [x] Flows that take more than one request. Every other active check is one
+      request in and one response out, so a flag behind a session stays out of
+      reach: the endpoint that holds it answers only to something another
+      endpoint handed over first. This reads each response for a value the site
+      issued, a cookie it set or a token it named, and carries it to every
+      endpoint that answered, as a cookie and as a bearer credential both, since
+      a site takes one where another expects the other. The same shape as the
+      forging pass and run beside it, except the value is one the site gave out
+      rather than one forged from a key it leaked. A JWT is left to the forging
+      pass, which reaches further than replaying the token as sent
 
 ### Onboarding and reporting
 
@@ -240,9 +250,6 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 
 ### Remora
 
-- [ ] Flows that take more than one request: a value decoded out of one response
-      and carried into the next as a header or a host, the multi-step a single
-      probe cannot reach on its own
 - [ ] A wider wordlist and a deeper crawl, so more of a site's routes and
       parameters are found without a hint to point at them
 
