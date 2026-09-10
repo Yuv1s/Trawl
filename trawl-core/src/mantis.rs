@@ -225,7 +225,17 @@ type Codec = (&'static str, fn(&[u8]) -> Option<Vec<u8>>, bool);
 /// alphabet is 58 of the 62 alphanumerics, so very nearly every alphanumeric
 /// string is valid base58 and decodes to something. Treating that as evidence
 /// lets it fire on an answer that was already correct and hand back noise.
-pub const CODECS: [Codec; 14] = [
+pub const CODECS: [Codec; 17] = [
+    // Bacon and Polybius come first so the greedy unwrap tries them before hex
+    // and decimal, which also accept their alphabets. Each one decodes only its
+    // own shape, groups of two symbols or pairs of 1-to-5 digits, and declines
+    // everything else, so leading with them costs the other codecs nothing.
+    // They belong in the greedy pass rather than the readability search because
+    // their ciphertext, a wall of A's and B's or of digits, scores as plainly
+    // as their plaintext, so a search that demands the decode read better never
+    // takes the step.
+    ("Bacon cipher", encodings::bacon, true),
+    ("Polybius square", encodings::polybius, true),
     ("morse", encodings::morse, true),
     ("binary", encodings::binary, true),
     ("decimal bytes", encodings::decimal, true),
@@ -240,6 +250,9 @@ pub const CODECS: [Codec; 14] = [
     ("quoted-printable", encodings::quoted_printable, true),
     ("HTML entities", encodings::html_entities, true),
     ("ROT13", encodings::rot13, false),
+    // Brainfuck is structural too: nothing but a program passes its density and
+    // bracket checks, so a match is unambiguous.
+    ("Brainfuck", encodings::brainfuck, true),
 ];
 
 /// A chain has to end up this much more readable than it started.
@@ -360,7 +373,9 @@ fn candidates(data: &[u8], tags: &[String]) -> Vec<(&'static str, Vec<u8>, bool)
             return;
         }
         let score = plainness(&rotated);
-        if (score >= ROTATION_BAR && score >= here + MIN_GAIN) || conclusive(&rotated, tags).is_some() {
+        if (score >= ROTATION_BAR && score >= here + MIN_GAIN)
+            || conclusive(&rotated, tags).is_some()
+        {
             out.push((name, rotated, false));
         }
     };
@@ -404,7 +419,13 @@ fn candidates(data: &[u8], tags: &[String]) -> Vec<(&'static str, Vec<u8>, bool)
 /// wall of hex digits, which reads no more like English than the base64 did. A
 /// peeler that demands an improvement at every step stops there and never
 /// reaches the sentence underneath.
-fn explore(data: &[u8], seen: &mut Vec<Vec<u8>>, tags: &[String], depth: usize, depth_budget: usize) -> (f32, Vec<Step>) {
+fn explore(
+    data: &[u8],
+    seen: &mut Vec<Vec<u8>>,
+    tags: &[String],
+    depth: usize,
+    depth_budget: usize,
+) -> (f32, Vec<Step>) {
     let here = rate(data, tags);
     if depth >= depth_budget || here == CONCLUSIVE || data.len() > MAX_INPUT {
         return (here, Vec::new());
@@ -447,6 +468,22 @@ fn explore(data: &[u8], seen: &mut Vec<Vec<u8>>, tags: &[String], depth: usize, 
     best
 }
 
+/// Whether a run of bytes is a decoded word rather than another layer: almost
+/// all letters, and enough of them to mean something. A cipher plaintext, which
+/// is letters with no spaces, is exactly this, and it is where the greedy
+/// unwrap has to stop before a later codec eats it.
+fn is_plaintext_word(data: &[u8]) -> bool {
+    let lower = data.iter().filter(|b| b.is_ascii_lowercase()).count();
+    let others = data
+        .iter()
+        .filter(|b| !b.is_ascii_lowercase() && !b.is_ascii_whitespace())
+        .count();
+    // Lowercase rather than any letter, so an uppercase intermediate a real
+    // chain passes through, a base32 blob feeding a base64 one, is not mistaken
+    // for a finished word. The ciphers here write their plaintext in lower case.
+    lower >= 4 && others == 0
+}
+
 /// Unwraps layers that only one codec will accept at all.
 ///
 /// A separate pass, because it answers a different question. The search asks
@@ -461,6 +498,15 @@ pub fn unwrap_structural(data: &[u8], tags: &[String], depth_budget: usize) -> V
 
     while steps.len() < depth_budget {
         if plainness(&current) >= ROTATION_BAR {
+            break;
+        }
+
+        // Once a step lands on a run of letters, it is a decoded word, and
+        // decoding a word again is how a clean answer gets eaten: a short
+        // lowercase word is valid base64 and a run of 1-to-5 digits is valid
+        // hex. A classical cipher's plaintext scores below the readability bar
+        // because it has no spaces, so this is the stop that bar cannot be.
+        if !steps.is_empty() && is_plaintext_word(&current) {
             break;
         }
 

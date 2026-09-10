@@ -13,6 +13,7 @@
 pub mod active;
 pub mod crawl;
 pub mod decode;
+pub mod discovery;
 pub mod fetch;
 pub mod guard;
 pub mod jwt;

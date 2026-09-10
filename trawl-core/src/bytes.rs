@@ -250,7 +250,7 @@ pub fn flag_candidates(data: &[u8]) -> Vec<Found> {
     out
 }
 
-const SIGNATURES: [(&[u8], &str); 13] = [
+const SIGNATURES: [(&[u8], &str); 19] = [
     (b"\x89PNG\r\n\x1a\n", "PNG image"),
     (b"\xff\xd8\xff", "JPEG image"),
     (b"GIF8", "GIF image"),
@@ -264,6 +264,15 @@ const SIGNATURES: [(&[u8], &str); 13] = [
     (b"regf", "Windows registry hive"),
     (b"\x7fELF", "ELF binary"),
     (b"RIFF", "RIFF container"),
+    // Classic libpcap, all four byte orders and both timestamp resolutions.
+    (b"\xd4\xc3\xb2\xa1", "packet capture"),
+    (b"\xa1\xb2\xc3\xd4", "packet capture"),
+    (b"\x4d\x3c\xb2\xa1", "packet capture"),
+    (b"\xa1\xb2\x3c\x4d", "packet capture"),
+    // pcapng, whose first block is always a Section Header Block.
+    (b"\x0a\x0d\x0d\x0a", "packet capture"),
+    // SQLite, so the header line names one before the database reader runs.
+    (b"SQLite format 3\x00", "SQLite database"),
 ];
 
 /// Names the format a byte run starts with, if any.

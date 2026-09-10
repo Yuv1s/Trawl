@@ -21,6 +21,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tower_http::cors::CorsLayer;
 
 /// What the scanner was started with. Carried into every handler so a request
@@ -214,6 +215,21 @@ struct PageResult {
     status: u16,
 }
 
+/// A file that answered to its name, that no page linked to and no sitemap
+/// listed. The most interesting kind of find on a scan: someone left it there
+/// and meant for nobody to see it.
+#[derive(Serialize)]
+struct Found {
+    url: String,
+    status: u16,
+    /// How many bytes came back, so an empty stub reads differently from a real
+    /// file at a glance.
+    size: usize,
+    /// True for the source-control, dotfile and backup paths, which are a
+    /// heavier finding than a guessable loot file.
+    sensitive: bool,
+}
+
 /// What a crawl turned up, grouped the way a person looks for it.
 #[derive(Serialize, Default)]
 struct ScanResult {
@@ -229,6 +245,8 @@ struct ScanResult {
     assets: Vec<String>,
     /// Links that leave the target. Reported, never followed.
     external: Vec<String>,
+    /// Files that answered to their name without a link pointing at them.
+    found: Vec<Found>,
     /// Flag shapes found anywhere, each with the page it sat on.
     flags: Vec<Located>,
     /// HTML comments found anywhere, each with the page it sat on.
@@ -458,8 +476,20 @@ async fn harvest_resources(
     }
 }
 
+/// Most files one sweep will report. A soft-404 server that slips calibration
+/// could otherwise answer every name; this stops the list from filling with its
+/// catch-all.
+const MAX_FOUND: usize = 40;
+
+/// Learns the server's not-found answer, then sweeps for files by name.
+///
+/// The sensitive paths and the loot list are one pass: both are names a file
+/// gets when it should not be reachable, and both are judged against the same
+/// baseline so a soft-404 server does not turn every guess into a find. A hit
+/// is recorded as a found file, its body read for flags, and anything it in
+/// turn references bucketed like any other page's.
 #[allow(clippy::too_many_arguments)]
-async fn probe_sensitive_paths(
+async fn probe_by_name(
     config: &Config,
     entry_url: &str,
     entry_host: &Option<String>,
@@ -474,8 +504,27 @@ async fn probe_sensitive_paths(
         return;
     };
 
-    for path in SENSITIVE_PATHS {
-        if result.pages.len() >= MAX_PAGES {
+    // Ask for two paths that cannot be there and remember the answer, so a
+    // server that says 200 to everything does not make every name look found.
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut samples = Vec::new();
+    for path in crate::discovery::calibration_paths(seed) {
+        if let Ok(url) = base.join(&path)
+            && let Ok(res) = crate::fetch::fetch(url.as_str(), config.allow_local).await
+        {
+            samples.push((res.status, res.body.len()));
+        }
+    }
+    let baseline = crate::discovery::Baseline::from_samples(&samples);
+
+    let sensitive = SENSITIVE_PATHS.iter().map(|p| (*p, true));
+    let loot = crate::discovery::DISCOVERY_PATHS.iter().map(|p| (*p, false));
+
+    for (path, sensitive) in sensitive.chain(loot) {
+        if result.found.len() >= MAX_FOUND {
             break;
         }
         let Ok(url) = base.join(path) else {
@@ -486,15 +535,22 @@ async fn probe_sensitive_paths(
             continue;
         }
 
-        if let Ok(page) = crate::fetch::fetch(&probe, config.allow_local).await
-            && page.status == 200
-            && !page.body.is_empty()
-        {
+        let Ok(page) = crate::fetch::fetch(&probe, config.allow_local).await else {
+            continue;
+        };
+        if !baseline.is_hit(page.status, page.body.len()) {
+            continue;
+        }
+
+        result.found.push(Found {
+            url: probe.clone(),
+            status: page.status,
+            size: page.body.len(),
+            sensitive,
+        });
+
+        if !page.body.is_empty() {
             let (flags, comments, references) = glean(&probe, &page.body, &page.headers);
-            result.pages.push(PageResult {
-                url: probe.clone(),
-                status: page.status,
-            });
             result.flags.extend(flags);
             result.comments.extend(comments);
 
@@ -608,10 +664,11 @@ async fn scan(
         }
     }
 
-    // Sensitive files a crawl never links to, tried by name. Standard recon: a
-    // source backup left in place, a dotfile served by mistake. Only ones that
-    // answer with something are kept, and each still runs the guard.
-    probe_sensitive_paths(
+    // Files a crawl never links to, tried by name: a source backup left in
+    // place, a dotfile served by mistake, a flag dropped at the root. The
+    // server's own not-found answer is learned first so a soft-404 site does
+    // not turn every guess into a find. Each hit still runs the guard.
+    probe_by_name(
         &config,
         &entry_url,
         &entry_host,

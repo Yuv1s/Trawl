@@ -71,6 +71,25 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
       an instance identifier means the device reported no serial and Windows
       generated one, so it names the port rather than the stick and does not
       follow it between machines
+- [x] SQLite databases, read for their tables and rows, and for the rows that
+      were deleted but never left. A raw scan already finds a flag sitting in
+      a database; this says which table a row was in, and whether it is one a
+      query would still return. Each table's pages are walked twice, the way a
+      ZIP is: once down the live cell list, and once through the free space,
+      where a deleted row's bytes sit until something reuses them. Deleting a
+      row overwrites its first four bytes with the freeblock's own header, so
+      the leading column is usually gone, but the surviving column types and
+      values exactly fill the freed space, and that is the handle used to carve
+      the record back out
+- [x] Packet captures, classic pcap and pcapng, read for the protocol mix, the
+      conversations, the DNS questions asked, and the reassembled TCP streams. A
+      raw scan already finds a flag that sits whole inside one packet; this finds
+      the one that does not. TCP breaks a stream into segments, and in the file
+      one segment's payload is followed by the next packet's headers, so a flag
+      crossing that boundary is interrupted by bytes that are not part of it.
+      Following the sequence numbers and laying the payloads back in order is the
+      only way it reads again, and the same reassembly surfaces a whole file
+      carried over a connection, its signature sitting mid-packet
 
 ### Cuttlefish, the steganography half
 
@@ -97,6 +116,15 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
       same layer budget, until plain text falls out
 - [x] Sixteen encodings: base64, base58, base32, ascii85, hex, morse, binary,
       uuencode, quoted-printable and the rest
+- [x] Bacon and Polybius, the classical ciphers that need no key: five A/B
+      symbols to a letter, or pairs of one-to-five digits through the 5x5
+      square. Their ciphertext reads as plainly as the plaintext to a letter
+      scorer, so they are taken by the same greedy unwrap the structural
+      encodings use rather than the readability search, and the unwrap stops
+      once it lands on a word so a short decode is not eaten again as base64
+- [x] Brainfuck, run rather than decoded: the program is the ciphertext and
+      what it prints is the answer, on a bounded tape with a cap on steps and
+      output
 - [x] Caesar, solved rather than applied: every shift tried, the readable one
       kept
 - [x] XOR key recovery, single byte and repeating key, with the key length

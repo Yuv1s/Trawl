@@ -4,6 +4,9 @@ import type {
 	Chunk,
 	BinaryStructure,
 	RegistryHive,
+	SqliteDatabase,
+	PcapCapture,
+	PcapStream,
 	GifAnalysis,
 	NestedAnalysis,
 	Structure,
@@ -711,6 +714,105 @@ describe('registry hive', () => {
 		}).find((t) => t.id === 'hive')!;
 		expect(wrongKind.status).toBe('clear');
 		expect(wrongKind.value).toBe('SOFTWARE, nowhere here keeps device history');
+	});
+});
+
+describe('sqlite database', () => {
+	const db = (over: Partial<SqliteDatabase> = {}): SqliteDatabase => ({
+		pageSize: 4096,
+		pageCount: 3,
+		encoding: 'UTF-8',
+		freelistPages: 0,
+		tableCount: 1,
+		tables: [
+			{ name: 'users', columns: ['id', 'name'], sql: '', rows: [], rowCount: 5, deleted: [] }
+		],
+		...over
+	});
+
+	it('stands down on a file that is not a database', () => {
+		const tool = tools({ survey, structure }).find((t) => t.id === 'sqlite')!;
+		expect(tool.status).toBe('pending');
+		expect(tool.value).toBe('not a SQLite database');
+	});
+
+	it('stays clear on a database with nothing deleted', () => {
+		const tool = tools({ survey, sqlite: db() }).find((t) => t.id === 'sqlite')!;
+		expect(tool.status).toBe('clear');
+		expect(tool.value).toBe('1 table, 5 rows');
+	});
+
+	it('flags a database with a recovered deleted row', () => {
+		const withDeleted = db({
+			tables: [
+				{
+					name: 'users',
+					columns: ['id', 'name'],
+					sql: '',
+					rows: [],
+					rowCount: 4,
+					deleted: [[{ kind: 'text', text: 'flag{x}' }]]
+				}
+			]
+		});
+		const tool = tools({ survey, sqlite: withDeleted }).find((t) => t.id === 'sqlite')!;
+		expect(tool.status).toBe('hit');
+		expect(tool.value).toBe('1 deleted row recovered');
+	});
+});
+
+describe('network capture', () => {
+	const stream = (over: Partial<PcapStream> = {}): PcapStream => ({
+		src: '10.0.0.1:80',
+		dst: '10.0.0.9:5000',
+		bytes: 120,
+		text: 'GET / HTTP/1.1',
+		printable: 1,
+		embeddedFile: null,
+		flags: [],
+		...over
+	});
+
+	const cap = (over: Partial<PcapCapture> = {}): PcapCapture => ({
+		format: 'pcap',
+		linkType: 'Ethernet',
+		packetCount: 12,
+		captureBytes: 4096,
+		truncated: false,
+		duration: '3.20 s',
+		protocols: [{ name: 'HTTP', packets: 8, bytes: 3000 }],
+		conversations: [],
+		conversationCount: 1,
+		streams: [stream()],
+		streamCount: 1,
+		dns: [],
+		...over
+	});
+
+	it('stands down on a file that is not a capture', () => {
+		const tool = tools({ survey, structure }).find((t) => t.id === 'pcap')!;
+		expect(tool.status).toBe('pending');
+		expect(tool.value).toBe('not a packet capture');
+	});
+
+	it('stays clear on a capture with nothing a raw scan would miss', () => {
+		const tool = tools({ survey, pcap: cap() }).find((t) => t.id === 'pcap')!;
+		expect(tool.status).toBe('clear');
+		expect(tool.value).toBe('12 packets, 1 stream');
+	});
+
+	it('flags a capture with a flag reassembled from a stream', () => {
+		const withFlag = cap({ streams: [stream({ flags: ['flag{split}'] })] });
+		const tool = tools({ survey, pcap: withFlag }).find((t) => t.id === 'pcap')!;
+		expect(tool.status).toBe('hit');
+		expect(tool.value).toBe('flag in a reassembled stream');
+	});
+
+	it('flags a capture that carried a whole file over a stream', () => {
+		const withFile = cap({ streams: [stream({ embeddedFile: 'PNG image' })] });
+		const tool = tools({ survey, pcap: withFile }).find((t) => t.id === 'pcap')!;
+		expect(tool.status).toBe('hit');
+		expect(tool.value).toBe('1 file carried over a stream');
 	});
 });
 

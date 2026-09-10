@@ -26,6 +26,8 @@ import init, {
 	pdf_structure,
 	binary_structure,
 	registry_hive,
+	sqlite_database,
+	pcap_capture,
 	gif_frame_analysis
 } from '$lib/wasm/trawl_core';
 import type {
@@ -45,6 +47,8 @@ import type {
 	PdfStructure,
 	BinaryStructure,
 	RegistryHive,
+	SqliteDatabase,
+	PcapCapture,
 	PeelResult,
 	PeelStep,
 	PlaneWall,
@@ -788,6 +792,8 @@ async function analyseRoot(
 
 	const binary = JSON.parse(binary_structure(bytes)) as BinaryStructure | null;
 	const hive = JSON.parse(registry_hive(bytes)) as RegistryHive | null;
+	const sqlite = JSON.parse(sqlite_database(bytes)) as SqliteDatabase | null;
+	const pcap = JSON.parse(pcap_capture(bytes, flagTags)) as PcapCapture | null;
 
 	const aes = JSON.parse(aes_probe(withInflatedText(bytes, structure))) as AesSolved[];
 	const jpeg = JSON.parse(jpeg_stego(bytes, SWEEP_BYTES, CHI_STEPS_JPEG)) as
@@ -878,6 +884,8 @@ async function analyseRoot(
 		pdf,
 		binary,
 		hive,
+		sqlite,
+		pcap,
 		aes,
 		sweep,
 		wall,

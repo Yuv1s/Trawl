@@ -16,6 +16,7 @@ pub mod gif;
 pub mod jpeg;
 pub mod json;
 pub mod mantis;
+pub mod pcap;
 pub mod pdf;
 pub mod pe;
 pub mod pixels;
@@ -23,6 +24,7 @@ pub mod png;
 pub mod regf;
 pub mod registry;
 pub mod spectrogram;
+pub mod sqlite;
 pub mod survey;
 pub mod wav;
 pub mod zip;
@@ -331,6 +333,37 @@ pub fn binary_structure(file: &[u8]) -> String {
 #[wasm_bindgen]
 pub fn registry_hive(file: &[u8]) -> String {
     registry::json(file)
+}
+
+/// What a SQLite database holds, as JSON, or null when the file is not one.
+///
+/// The tables and their rows, and the rows recovered from each page's free
+/// space: deleted, and still in the file. A raw scan already finds a flag
+/// sitting in a database; this says which table a row was in and whether it
+/// was one a query would still return.
+#[wasm_bindgen]
+pub fn sqlite_database(file: &[u8]) -> String {
+    sqlite::json(file)
+}
+
+/// What a packet capture carried, as JSON, or null when the file is neither a
+/// classic pcap nor a pcapng.
+///
+/// The header, the protocol breakdown, the conversations, the DNS questions
+/// asked, and the reassembled TCP streams. The streams are the point: a raw
+/// scan already finds a flag that sits whole inside one packet, but a flag
+/// broken across two TCP segments is interrupted in the file by the headers of
+/// the packet that carried the second half, so only putting the connection
+/// back together reveals it. The caller's flag tags steer that scan.
+#[wasm_bindgen]
+pub fn pcap_capture(file: &[u8], tags: &str) -> String {
+    let tags: Vec<String> = tags
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect();
+    pcap::json(file, &tags)
 }
 
 /// Applies a key somebody already has, across every cipher that takes one.

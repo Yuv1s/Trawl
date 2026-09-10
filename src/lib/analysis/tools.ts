@@ -15,6 +15,8 @@ import {
 	type PdfStructure,
 	type BinaryStructure,
 	type RegistryHive,
+	type SqliteDatabase,
+	type PcapCapture,
 	type PlaneWall,
 	type RsAnalysis,
 	type Spectrogram,
@@ -34,7 +36,18 @@ export type ToolStatus = 'hit' | 'clear' | 'ready' | 'pending';
  * `jpeg` needs the coefficient decoder.
  */
 export type ToolScope =
-	'bytes' | 'pixels' | 'png' | 'audio' | 'jpeg' | 'zip' | 'pdf' | 'binary' | 'hive' | 'gif';
+	| 'bytes'
+	| 'pixels'
+	| 'png'
+	| 'audio'
+	| 'jpeg'
+	| 'zip'
+	| 'pdf'
+	| 'binary'
+	| 'hive'
+	| 'sqlite'
+	| 'pcap'
+	| 'gif';
 
 /**
  * The two halves of the rack. Survey reads the file as it sits on disk;
@@ -92,6 +105,8 @@ const NO_ARCHIVE = 'not a ZIP archive';
 const NO_PDF = 'not a PDF document';
 const NO_BINARY = 'not an executable this reads';
 const NO_HIVE = 'not a registry hive';
+const NO_SQLITE = 'not a SQLite database';
+const NO_PCAP = 'not a packet capture';
 const NO_COEFFICIENTS = 'no readable JPEG coefficients';
 
 /** Metadata fields a person types into, as opposed to ones a camera fills in. */
@@ -125,6 +140,8 @@ export type Findings = {
 	pdf?: PdfStructure | null;
 	binary?: BinaryStructure | null;
 	hive?: RegistryHive | null;
+	sqlite?: SqliteDatabase | null;
+	pcap?: PcapCapture | null;
 	nested?: NestedAnalysis | null;
 	gif?: GifAnalysis | null;
 };
@@ -253,6 +270,43 @@ function hiveNote(hive: RegistryHive): string {
 	return `${hive.kind}, nowhere here keeps device history`;
 }
 
+/** Whether a database is worth a second look: a deleted row still in the file
+ *  is the finding, since a live table is what a query would already show. */
+function sqliteOdd(db: SqliteDatabase): boolean {
+	return db.tables.some((t) => t.deleted.length > 0);
+}
+
+/** What to say about a database in one line of a tool rack. */
+function sqliteNote(db: SqliteDatabase): string {
+	const deleted = db.tables.reduce((n, t) => n + t.deleted.length, 0);
+	if (deleted > 0) {
+		return `${deleted} deleted row${deleted === 1 ? '' : 's'} recovered`;
+	}
+	const rows = db.tables.reduce((n, t) => n + t.rowCount, 0);
+	const tables = db.tableCount;
+	return `${tables} table${tables === 1 ? '' : 's'}, ${rows} row${rows === 1 ? '' : 's'}`;
+}
+
+/** Whether a capture holds something a raw scan of the file would miss: a flag
+ *  or a whole file that only appears once its TCP stream is put back together. */
+function pcapOdd(cap: PcapCapture): boolean {
+	return cap.streams.some((s) => s.flags.length > 0 || s.embeddedFile !== null);
+}
+
+/** What to say about a capture in one line of a tool rack. */
+function pcapNote(cap: PcapCapture): string {
+	const flagged = cap.streams.filter((s) => s.flags.length > 0).length;
+	if (flagged > 0) {
+		return `flag in ${flagged === 1 ? 'a reassembled stream' : `${flagged} reassembled streams`}`;
+	}
+	const files = cap.streams.filter((s) => s.embeddedFile !== null).length;
+	if (files > 0) {
+		return `${files} file${files === 1 ? '' : 's'} carried over a stream`;
+	}
+	const packets = cap.packetCount.toLocaleString();
+	return `${packets} packet${cap.packetCount === 1 ? '' : 's'}, ${cap.streamCount} stream${cap.streamCount === 1 ? '' : 's'}`;
+}
+
 /**
  * Whether a binary leaves open any of the protections its own format can
  * declare.
@@ -285,7 +339,7 @@ function binaryNote(binary: BinaryStructure): string {
 export function tools(found: Findings): Tool[] {
 	const { survey, structure = null, sweep = null, wall = null, chi = null, rs = null } = found;
 	const { audio = null, spectrogram = null, paletteStego = null, zip = null } = found;
-	const { pdf = null, binary = null, hive = null } = found;
+	const { pdf = null, binary = null, hive = null, sqlite = null, pcap = null } = found;
 	const { nested = null, gif = null } = found;
 	const aes = found.aes ?? [];
 	const wav = found.wav && !isWavError(found.wav) ? found.wav : null;
@@ -349,6 +403,16 @@ export function tools(found: Findings): Tool[] {
 			? { ...tool, scope: 'hive', group: 'survey' }
 			: { ...tool, scope: 'hive', group: 'survey', status: 'pending', value: NO_HIVE };
 
+	const database = (tool: Partial): Tool =>
+		sqlite
+			? { ...tool, scope: 'sqlite', group: 'survey' }
+			: { ...tool, scope: 'sqlite', group: 'survey', status: 'pending', value: NO_SQLITE };
+
+	const network = (tool: Partial): Tool =>
+		pcap
+			? { ...tool, scope: 'pcap', group: 'survey' }
+			: { ...tool, scope: 'pcap', group: 'survey', status: 'pending', value: NO_PCAP };
+
 	const sound = (tool: Partial, group: ToolGroup = 'cuttlefish'): Tool =>
 		wav
 			? { ...tool, scope: 'audio', group }
@@ -387,6 +451,21 @@ export function tools(found: Findings): Tool[] {
 			measures: 'Walks a Windows hive for what it remembers about the USB devices plugged in',
 			status: hive && hive.devices.length > 0 ? 'hit' : 'clear',
 			value: hive ? hiveNote(hive) : ''
+		}),
+		database({
+			id: 'sqlite',
+			name: 'SQLite database',
+			measures:
+				'Reads a database for its tables and rows, and the rows deleted but still in the file',
+			status: sqlite && sqliteOdd(sqlite) ? 'hit' : 'clear',
+			value: sqlite ? sqliteNote(sqlite) : ''
+		}),
+		network({
+			id: 'pcap',
+			name: 'Network capture',
+			measures: 'Reads a packet capture, reassembling TCP streams for a flag split across packets',
+			status: pcap && pcapOdd(pcap) ? 'hit' : 'clear',
+			value: pcap ? pcapNote(pcap) : ''
 		}),
 		executable({
 			id: 'binary',

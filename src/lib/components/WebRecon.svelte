@@ -127,6 +127,8 @@
 	// The shape the scanner returns: a crawl, grouped the way a person looks.
 	type Located = { value: string; source: string; note: string };
 	type PageResult = { url: string; status: number };
+	/** A file the scanner reached by guessing its name, that nothing linked to. */
+	type FoundFile = { url: string; status: number; size: number; sensitive: boolean };
 	type ScanResult = {
 		target: string;
 		pages: PageResult[];
@@ -134,6 +136,7 @@
 		scripts: string[];
 		assets: string[];
 		external: string[];
+		found: FoundFile[];
 		flags: Located[];
 		comments: Located[];
 	};
@@ -143,6 +146,7 @@
 		| { kind: 'flag'; id: string; label: string; source: string; note: string }
 		| { kind: 'comment'; id: string; label: string; source: string }
 		| { kind: 'page'; id: string; label: string; status: number }
+		| { kind: 'found'; id: string; label: string; status: number; size: number; sensitive: boolean }
 		| { kind: 'image'; id: string; label: string }
 		| { kind: 'script'; id: string; label: string }
 		| { kind: 'asset'; id: string; label: string }
@@ -167,6 +171,13 @@
 			!localMode &&
 			/loopback|private network|unique local address/i.test(scanError)
 	);
+
+	/** A byte count a person reads at a glance, so a stub reads apart from a file. */
+	function sizeLabel(bytes: number): string {
+		if (bytes < 1024) return `${bytes} B`;
+		if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+		return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+	}
 
 	function fileName(url: string): string {
 		try {
@@ -205,6 +216,18 @@
 					label: f.value,
 					source: f.source,
 					note: f.note
+				}))
+			},
+			{
+				key: 'found',
+				label: 'Found by name',
+				items: result.found.map((f) => ({
+					kind: 'found',
+					id: f.url,
+					label: shortPath(f.url),
+					status: f.status,
+					size: f.size,
+					sensitive: f.sensitive
 				}))
 			},
 			{
@@ -480,11 +503,19 @@
 													{#if item.kind === 'image'}
 														<img class="thumb" src={proxied(item.id)} alt="" loading="lazy" />
 													{/if}
-													<span class="item-label mono" class:flagged={item.kind === 'flag'}
-														>{item.label}</span
+													<span
+														class="item-label mono"
+														class:flagged={item.kind === 'flag' ||
+															(item.kind === 'found' && item.sensitive)}>{item.label}</span
 													>
 													{#if item.kind === 'page' && item.status !== 200}
 														<span class="chip mono">{item.status}</span>
+													{/if}
+													{#if item.kind === 'found'}
+														{#if item.sensitive}<span class="chip flagged mono">sensitive</span
+															>{/if}
+														{#if item.status !== 200}<span class="chip mono">{item.status}</span
+															>{/if}
 													{/if}
 												</button>
 											</li>
@@ -519,6 +550,27 @@
 										>{shortPath(s.source)}</a
 									>
 								</p>
+							{:else if s.kind === 'found'}
+								<div class="d-head">
+									<span class="d-kind label"
+										>{s.sensitive ? 'Sensitive file' : 'Found by name'}</span
+									>
+									<span class="chip mono" class:flagged={s.sensitive}>{s.status}</span>
+									<span class="chip mono">{sizeLabel(s.size)}</span>
+								</div>
+								<p class="d-value mono" class:flagged={s.sensitive}>{shortPath(s.id)}</p>
+								<p class="how">
+									{#if s.sensitive}
+										Source control, a backup, or a dotfile that answered to its name. Nothing on the
+										site links to it.
+									{:else}
+										A file that answered to its name. Nothing on the site links to it, so a person
+										had to know or guess it was there.
+									{/if}
+								</p>
+								<a class="open" href={s.id} target="_blank" rel="external noreferrer noopener"
+									>Open in a tab</a
+								>
 							{:else if s.kind === 'page'}
 								<div class="d-head">
 									<span class="d-kind label">Page</span>
@@ -1280,6 +1332,10 @@
 	.chip.bad {
 		color: var(--signal);
 		border-color: var(--ink);
+	}
+	.chip.flagged {
+		color: var(--signal);
+		border-color: color-mix(in srgb, var(--signal) 45%, transparent);
 	}
 	.clear {
 		margin: auto;

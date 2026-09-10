@@ -692,3 +692,170 @@ pub fn atbash(data: &[u8]) -> Vec<u8> {
         })
         .collect()
 }
+
+/// Brainfuck, run rather than decoded: the program is the ciphertext and its
+/// output is the answer. A puzzle hides a flag in a program that prints it, so
+/// this executes one and hands back what it wrote.
+///
+/// Bounded on every axis a program can run away on: a fixed tape, a cap on
+/// steps, and a cap on output. Anything the program tries to read is a zero,
+/// since a pasted string carries no input.
+pub fn brainfuck(data: &[u8]) -> Option<Vec<u8>> {
+    // Only the eight commands run; every other byte is a comment. A real
+    // program is dense with them and prints something, which is what tells it
+    // from prose that happens to hold a bracket and a full stop.
+    let program: Vec<u8> = data
+        .iter()
+        .copied()
+        .filter(|b| matches!(b, b'>' | b'<' | b'+' | b'-' | b'.' | b',' | b'[' | b']'))
+        .collect();
+    if program.len() < 8 || !program.contains(&b'.') {
+        return None;
+    }
+    if program.len() * 100 < data.len() * 40 {
+        return None;
+    }
+
+    // Match the brackets once, so a jump is a lookup and an unbalanced program
+    // is refused before it runs a step.
+    let mut jumps = vec![0usize; program.len()];
+    let mut stack = Vec::new();
+    for (i, &op) in program.iter().enumerate() {
+        match op {
+            b'[' => stack.push(i),
+            b']' => {
+                let open = stack.pop()?;
+                jumps[open] = i;
+                jumps[i] = open;
+            }
+            _ => {}
+        }
+    }
+    if !stack.is_empty() {
+        return None;
+    }
+
+    const TAPE: usize = 30_000;
+    const MAX_STEPS: usize = 5_000_000;
+    const MAX_OUTPUT: usize = 4096;
+
+    let mut tape = vec![0u8; TAPE];
+    let mut head = 0usize;
+    let mut ip = 0usize;
+    let mut out = Vec::new();
+    let mut steps = 0usize;
+
+    while ip < program.len() {
+        steps += 1;
+        if steps > MAX_STEPS || out.len() >= MAX_OUTPUT {
+            break;
+        }
+        match program[ip] {
+            b'>' => head = (head + 1) % TAPE,
+            b'<' => head = (head + TAPE - 1) % TAPE,
+            b'+' => tape[head] = tape[head].wrapping_add(1),
+            b'-' => tape[head] = tape[head].wrapping_sub(1),
+            b'.' => out.push(tape[head]),
+            b',' => tape[head] = 0,
+            b'[' if tape[head] == 0 => ip = jumps[ip],
+            b']' if tape[head] != 0 => ip = jumps[ip],
+            _ => {}
+        }
+        ip += 1;
+    }
+
+    (!out.is_empty()).then_some(out)
+}
+
+/// The 24-letter Baconian alphabet, I sharing a code with J and U with V, which
+/// is the classic table.
+const BACON: [(&[u8; 5], u8); 24] = [
+    (b"AAAAA", b'A'),
+    (b"AAAAB", b'B'),
+    (b"AAABA", b'C'),
+    (b"AAABB", b'D'),
+    (b"AABAA", b'E'),
+    (b"AABAB", b'F'),
+    (b"AABBA", b'G'),
+    (b"AABBB", b'H'),
+    (b"ABAAA", b'I'),
+    (b"ABAAB", b'K'),
+    (b"ABABA", b'L'),
+    (b"ABABB", b'M'),
+    (b"ABBAA", b'N'),
+    (b"ABBAB", b'O'),
+    (b"ABBBA", b'P'),
+    (b"ABBBB", b'Q'),
+    (b"BAAAA", b'R'),
+    (b"BAAAB", b'S'),
+    (b"BAABA", b'T'),
+    (b"BAABB", b'U'),
+    (b"BABAA", b'W'),
+    (b"BABAB", b'X'),
+    (b"BABBA", b'Y'),
+    (b"BABBB", b'Z'),
+];
+
+/// Bacon's cipher: each letter written as five of two symbols. A puzzle uses A
+/// and B, or 0 and 1, or two typefaces flattened to those. This reads the two
+/// written forms, five symbols to a letter.
+pub fn bacon(data: &[u8]) -> Option<Vec<u8>> {
+    let symbols: Vec<u8> = data
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    if symbols.is_empty() || !symbols.len().is_multiple_of(5) {
+        return None;
+    }
+
+    let mut distinct = symbols.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if distinct.len() != 2 {
+        return None;
+    }
+    // The pair has to be a Bacon pair, not any two letters that happen to
+    // alternate, or the codec fires on ordinary two-letter noise.
+    let (low, high) = (distinct[0], distinct[1]);
+    if !matches!((low, high), (b'A', b'B') | (b'a', b'b') | (b'0', b'1')) {
+        return None;
+    }
+
+    let mut out = Vec::new();
+    for group in symbols.chunks(5) {
+        let mut code = [0u8; 5];
+        for (slot, &b) in code.iter_mut().zip(group) {
+            *slot = if b == low { b'A' } else { b'B' };
+        }
+        let letter = BACON.iter().find(|(c, _)| c.as_slice() == code)?.1;
+        out.push(letter.to_ascii_lowercase());
+    }
+    Some(out)
+}
+
+/// Polybius square: the 5x5 grid with I and J sharing a cell, each letter a row
+/// then a column, both 1 to 5. A puzzle writes the pairs as digits; this reads
+/// them back.
+pub fn polybius(data: &[u8]) -> Option<Vec<u8>> {
+    let digits: Vec<u8> = data
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    if digits.is_empty() || !digits.len().is_multiple_of(2) {
+        return None;
+    }
+    if !digits.iter().all(|b| (b'1'..=b'5').contains(b)) {
+        return None;
+    }
+
+    const SQUARE: &[u8; 25] = b"abcdefghiklmnopqrstuvwxyz";
+    let mut out = Vec::new();
+    for pair in digits.chunks(2) {
+        let row = (pair[0] - b'1') as usize;
+        let col = (pair[1] - b'1') as usize;
+        out.push(SQUARE[row * 5 + col]);
+    }
+    Some(out)
+}

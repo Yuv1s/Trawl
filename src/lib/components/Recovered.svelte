@@ -1,20 +1,25 @@
 <script lang="ts">
 	import type { Found } from '$lib/worker/protocol';
+	import type { SolvePath } from '$lib/analysis/solve-path';
 
 	let {
 		candidates,
 		sources,
 		fromPixels = [],
+		paths = [],
 		onpeel
 	}: {
 		candidates: Found[];
 		sources: Record<number, string>;
 		/** Finds from a sweep, each naming which sweep turned it up. */
 		fromPixels?: { text: string; origin: string }[];
+		/** The route each flag was reached by, keyed to render under it. */
+		paths?: SolvePath[];
 		onpeel?: (text: string) => void;
 	} = $props();
 
 	const total = $derived(candidates.length + fromPixels.length);
+	const pathFor = $derived(new Map(paths.map((p) => [p.text, p.steps])));
 </script>
 
 <section class="recovered" aria-label="Cod-end, recovered candidates">
@@ -28,23 +33,35 @@
 	<ul>
 		{#each candidates as found (found.offset)}
 			<li>
-				<output class="value mono">{found.text}</output>
-				{#if onpeel}
-					<button type="button" onclick={() => onpeel?.(found.text)}>Peel</button>
+				<div class="row">
+					<output class="value mono">{found.text}</output>
+					{#if onpeel}
+						<button type="button" onclick={() => onpeel?.(found.text)}>Peel</button>
+					{/if}
+					<span class="origin mono">
+						0x{found.offset.toString(16)}
+						{#if sources[found.offset]}· {sources[found.offset]}{/if}
+					</span>
+				</div>
+				{#if pathFor.get(found.text)}
+					{@render trail(pathFor.get(found.text)!)}
 				{/if}
-				<span class="origin mono">
-					0x{found.offset.toString(16)}
-					{#if sources[found.offset]}· {sources[found.offset]}{/if}
-				</span>
 			</li>
 		{/each}
 		{#each fromPixels as found (found.origin + found.text)}
 			<li>
-				<output class="value mono">{found.text}</output>
-				{#if onpeel}
-					<button type="button" onclick={() => onpeel?.(found.text)}>Peel</button>
+				<div class="row">
+					<output class="value mono">{found.text}</output>
+					{#if onpeel}
+						<button type="button" onclick={() => onpeel?.(found.text)}>Peel</button>
+					{/if}
+					{#if !pathFor.get(found.text)}
+						<span class="origin mono">{found.origin}</span>
+					{/if}
+				</div>
+				{#if pathFor.get(found.text)}
+					{@render trail(pathFor.get(found.text)!)}
 				{/if}
-				<span class="origin mono">{found.origin}</span>
 			</li>
 		{/each}
 	</ul>
@@ -54,6 +71,14 @@
 		on shape alone, so Trawl has not verified that any of it is the answer.
 	</p>
 </section>
+
+{#snippet trail(steps: string[])}
+	<ol class="path" aria-label="How this was reached">
+		{#each steps as step, i (i)}
+			<li class="mono" class:last={i === steps.length - 1}>{step}</li>
+		{/each}
+	</ol>
+{/snippet}
 
 <style>
 	.recovered {
@@ -87,6 +112,11 @@
 	}
 
 	li {
+		display: grid;
+		gap: var(--s1);
+	}
+
+	.row {
 		display: flex;
 		flex-wrap: wrap;
 		align-items: baseline;
@@ -119,6 +149,41 @@
 	.origin {
 		font-size: var(--t-label);
 		color: var(--muted);
+	}
+
+	/* The route to the flag: file first, the tool that read it last. Each step
+	   is separated by a chevron drawn between list items, so it reads as a path
+	   rather than a list. */
+	.path {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: var(--s1) 0;
+		font-size: var(--t-label);
+	}
+
+	.path li {
+		display: inline flex;
+		align-items: baseline;
+		color: var(--muted);
+	}
+
+	.path li::after {
+		content: '›';
+		margin: 0 var(--s2);
+		color: var(--rule-bright);
+	}
+
+	.path li.last::after {
+		content: '';
+		margin: 0;
+	}
+
+	.path li.last {
+		color: var(--text);
 	}
 
 	.caveat {

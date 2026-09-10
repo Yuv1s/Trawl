@@ -382,7 +382,8 @@ fn finds_a_hill_cipher_end_to_end() {
     // and enough characters after it, peeling it into garbage before this
     // reached `hill::solve` at all. `encodings::tests` covers the decoder
     // fix; this covers the pipeline actually reaching the cipher now.
-    let message = b"the treasure is buried under the old oak tree at the north end of the wide open field";
+    let message =
+        b"the treasure is buried under the old oak tree at the north end of the wide open field";
     let key: hill::Key = [3, 2, 5, 7];
     let reading = read(&hill::encipher(message, &key));
 
@@ -894,7 +895,10 @@ fn probe_enciphered_flag() {
     println!("derived     {} keys", r.derived.len());
     println!("vigenere    {:?}", r.vigenere.is_some());
     println!("letters     {}", ngram::letters(cipher).len());
-    println!("direct derive -> {} keys", vigenere::derive(cipher, &[]).len());
+    println!(
+        "direct derive -> {} keys",
+        vigenere::derive(cipher, &[]).len()
+    );
     for d in vigenere::derive(cipher, &[]).iter().take(3) {
         println!(
             "   {:<8} perCol={} -> {:?}",
@@ -903,4 +907,35 @@ fn probe_enciphered_flag() {
             String::from_utf8_lossy(&d.plaintext)
         );
     }
+}
+
+#[test]
+fn runs_a_brainfuck_program_end_to_end() {
+    let hello = "++++++++[>++++[>++>+++>+++>+<<<<-]>+>+>->>+[<]<-]>>.>---.+++++++..+++.>>.<-.<.+++.------.--------.>>+.>++.";
+    let peel = peeled(hello);
+    assert!(
+        text(&peel).starts_with("Hello World"),
+        "got {:?}",
+        text(&peel)
+    );
+    assert_eq!(names(&peel), vec!["Brainfuck"]);
+}
+
+#[test]
+fn reads_a_bacon_message_end_to_end() {
+    // "theflag" in the 24-letter table.
+    let bacon = "BAABA AABBB AABAA AABAB ABABA AAAAA AABBA";
+    let peel = peeled(bacon);
+    assert_eq!(text(&peel), "theflag");
+    assert_eq!(names(&peel), vec!["Bacon cipher"]);
+}
+
+#[test]
+fn reads_a_polybius_message_without_over_peeling_it() {
+    // "attackatdawn": a plaintext that is coincidentally valid base64, so the
+    // peeler has to stop once it reads as a word rather than decode it again.
+    let poly = "11 44 44 11 13 25 11 44 14 11 52 33";
+    let peel = peeled(poly);
+    assert_eq!(text(&peel), "attackatdawn");
+    assert_eq!(names(&peel), vec!["Polybius square"]);
 }

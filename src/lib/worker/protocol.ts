@@ -311,6 +311,97 @@ export type RegistryHive = {
 	searched: string[];
 };
 
+/** One value in a database row, rendered to the text a cell shows. */
+export type SqliteValue = {
+	/** "integer", "real", "text", "blob", or "null". */
+	kind: string;
+	text: string;
+};
+
+export type SqliteTable = {
+	name: string;
+	columns: string[];
+	/** The CREATE TABLE statement, verbatim from the schema. */
+	sql: string;
+	/** Live rows a query would return, capped for display. */
+	rows: SqliteValue[][];
+	/** The true live-row count, which `rows` is a capped copy of. */
+	rowCount: number;
+	/** Rows recovered from this table's free space: deleted, and still there. */
+	deleted: SqliteValue[][];
+};
+
+/** What a SQLite database holds, read from the file rather than queried: its
+ *  tables and rows, and the rows that were deleted but never left the file. */
+export type SqliteDatabase = {
+	pageSize: number;
+	pageCount: number;
+	encoding: string;
+	/** Pages the database has released to its freelist and not yet reused. */
+	freelistPages: number;
+	tables: SqliteTable[];
+	/** The true table count, which `tables` is a capped copy of. */
+	tableCount: number;
+};
+
+/** A protocol seen in a capture, named at the highest layer that was obvious. */
+export type PcapProtocol = { name: string; packets: number; bytes: number };
+
+/** Two endpoints that talked, however the packets flowed between them. */
+export type PcapConversation = {
+	a: string;
+	b: string;
+	/** The transport carrying it: TCP, UDP, ICMP. */
+	protocol: string;
+	packets: number;
+	bytes: number;
+};
+
+/** One direction of a TCP connection, put back together from its segments. */
+export type PcapStream = {
+	src: string;
+	dst: string;
+	bytes: number;
+	/** The reassembled bytes as printable text, control characters as dots. */
+	text: string;
+	/** How much of the stream is printable, to tell a transcript from a file. */
+	printable: number;
+	/** A file signature at the stream's very start, when the connection carried
+	 *  a whole file. Null otherwise. Invisible to the raw scan, which sees the
+	 *  magic sitting mid-packet after a header. */
+	embeddedFile: string | null;
+	/** Flag shapes in the reassembled bytes: the point of reassembling, and
+	 *  absent from any scan of the file as it sits on disk. */
+	flags: string[];
+};
+
+/** One name asked for in a DNS question. A long or strange name is a common
+ *  channel for smuggling data out one query at a time. */
+export type PcapDnsQuery = { name: string; type: string };
+
+/** What a packet capture carried, read rather than replayed: the protocol mix,
+ *  who talked to whom, the DNS questions, and the reassembled TCP streams that
+ *  hold anything split across packets. Null when the file is not a capture. */
+export type PcapCapture = {
+	/** "pcap" or "pcapng". */
+	format: string;
+	linkType: string;
+	packetCount: number;
+	/** Sum of on-the-wire lengths, above the file size when frames were snapped. */
+	captureBytes: number;
+	truncated: boolean;
+	/** The span first frame to last, worded, or empty when timestamps say nothing. */
+	duration: string;
+	protocols: PcapProtocol[];
+	conversations: PcapConversation[];
+	/** True conversation count, which `conversations` is a capped copy of. */
+	conversationCount: number;
+	streams: PcapStream[];
+	/** True count of reassembled streams that carried payload. */
+	streamCount: number;
+	dns: PcapDnsQuery[];
+};
+
 export type BinarySection = {
 	name: string;
 	kind: string;
@@ -851,6 +942,10 @@ export type AnalysisResponse =
 			binary: BinaryStructure | null;
 			/** Null when the file is not a Windows registry hive. */
 			hive: RegistryHive | null;
+			/** Null when the file is not a SQLite database. */
+			sqlite: SqliteDatabase | null;
+			/** Null when the file is neither a pcap nor a pcapng capture. */
+			pcap: PcapCapture | null;
 			/** AES-CBC decryptions the file's own key and payload produced. Empty for most files. */
 			aes: AesSolved[];
 			sweep: Sweep | null;

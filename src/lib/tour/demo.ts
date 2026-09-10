@@ -365,6 +365,20 @@ export const SAMPLE_GROUPS: SampleGroup[] = [
 				url: '/samples/forensics/usb-history.hiv',
 				blurb:
 					'A Windows SYSTEM hive remembering three USB sticks, with the date each was last plugged in. One of the three reported no serial number, so Windows invented one and it names the port rather than the stick.'
+			},
+			{
+				name: 'app.sqlite',
+				mime: 'application/vnd.sqlite3',
+				url: '/samples/databases/app.sqlite',
+				blurb:
+					'A SQLite database whose members table had a row deleted. The row is gone from the table but still in the file, and the reader recovers flag{deleted_rows_never_left} out of the free space.'
+			},
+			{
+				name: 'http-flag.pcap',
+				mime: 'application/vnd.tcpdump.pcap',
+				url: '/samples/network/http-flag.pcap',
+				blurb:
+					'A packet capture of an HTTP download. The flag is split across two TCP segments, so the byte scan never sees it whole; reassembling the stream reads flag{tcp_streams_reassemble_in_trawl}.'
 			}
 		]
 	},
@@ -517,6 +531,27 @@ export const SAMPLE_GROUPS: SampleGroup[] = [
 				url: '/samples/crypto/mantis-hex-base64.txt',
 				open: 'paste',
 				blurb: 'Peels hex, then base64, reads flag{mantis_hex_then_base64}.'
+			},
+			{
+				name: 'brainfuck-hello.txt',
+				mime: 'text/plain',
+				url: '/samples/crypto/brainfuck-hello.txt',
+				open: 'paste',
+				blurb: 'Runs the Brainfuck program and reads its output, Hello World!.'
+			},
+			{
+				name: 'bacon-theflag.txt',
+				mime: 'text/plain',
+				url: '/samples/crypto/bacon-theflag.txt',
+				open: 'paste',
+				blurb: "Bacon's cipher in groups of A and B, reads theflag."
+			},
+			{
+				name: 'polybius-message.txt',
+				mime: 'text/plain',
+				url: '/samples/crypto/polybius-message.txt',
+				open: 'paste',
+				blurb: 'Polybius square pairs of 1-to-5 digits, reads thecakeisalie.'
 			},
 			{
 				name: 'aes-cbc.txt',

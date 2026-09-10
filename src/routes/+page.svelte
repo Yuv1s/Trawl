@@ -23,6 +23,8 @@
 	import PdfView from '$lib/components/PdfView.svelte';
 	import BinaryView from '$lib/components/BinaryView.svelte';
 	import HiveView from '$lib/components/HiveView.svelte';
+	import SqliteView from '$lib/components/SqliteView.svelte';
+	import PcapView from '$lib/components/PcapView.svelte';
 	import GifFramesView from '$lib/components/GifFramesView.svelte';
 	import HexView from '$lib/components/HexView.svelte';
 	import StringsView from '$lib/components/StringsView.svelte';
@@ -39,6 +41,7 @@
 	import PaletteView from '$lib/components/PaletteView.svelte';
 	import JpegView from '$lib/components/JpegView.svelte';
 	import { flagsOf, nestedFindings, PLANNED, tools, WRITTEN_BY_HAND } from '$lib/analysis/tools';
+	import { buildSolvePaths } from '$lib/analysis/solve-path';
 	import {
 		COLOR_TYPES,
 		isHeaderError,
@@ -156,6 +159,16 @@
 					// only reason to open a hive at all.
 					const hiveDevices = (analysis.hive?.devices.length ?? 0) > 0;
 
+					// A row deleted from a database and still in the file is the
+					// same kind of find: a query would never return it.
+					const sqliteDeleted = (analysis.sqlite?.tables ?? []).some((t) => t.deleted.length > 0);
+
+					// A flag reassembled from a TCP stream, or a file carried whole
+					// over one, is a find no scan of the bytes on disk could make.
+					const pcapFinding = (analysis.pcap?.streams ?? []).some(
+						(s) => s.flags.length > 0 || s.embeddedFile !== null
+					);
+
 					activeTool = flags.some((f) => f.credible)
 						? 'flags'
 						: analysis.aes.length
@@ -164,31 +177,35 @@
 								? 'archive'
 								: hiveDevices
 									? 'hive'
-									: analysis.sweep?.candidates.length
-										? 'lsb'
-										: analysis.audio?.candidates.length
-											? 'audio-lsb'
-											: analysis.jpeg &&
-												  !isJpegError(analysis.jpeg) &&
-												  analysis.jpeg.candidates.length
-												? 'jsteg'
-												: analysis.paletteStego?.candidates.length
-													? 'palette'
-													: written
-														? 'exif'
-														: analysis.survey.jpegComments.length
-															? 'jpeg'
-															: analysis.chi?.detected
-																? 'chi'
-																: analysis.rs?.detected
-																	? 'rs'
-																	: analysis.survey.magic.some((m) => m.embedded)
-																		? 'magic'
-																		: isWav
-																			? 'spectrogram'
-																			: analysis.structure
-																				? 'chunks'
-																				: 'strings';
+									: sqliteDeleted
+										? 'sqlite'
+										: pcapFinding
+											? 'pcap'
+											: analysis.sweep?.candidates.length
+												? 'lsb'
+												: analysis.audio?.candidates.length
+													? 'audio-lsb'
+													: analysis.jpeg &&
+														  !isJpegError(analysis.jpeg) &&
+														  analysis.jpeg.candidates.length
+														? 'jsteg'
+														: analysis.paletteStego?.candidates.length
+															? 'palette'
+															: written
+																? 'exif'
+																: analysis.survey.jpegComments.length
+																	? 'jpeg'
+																	: analysis.chi?.detected
+																		? 'chi'
+																		: analysis.rs?.detected
+																			? 'rs'
+																			: analysis.survey.magic.some((m) => m.embedded)
+																				? 'magic'
+																				: isWav
+																					? 'spectrogram'
+																					: analysis.structure
+																						? 'chunks'
+																						: 'strings';
 				});
 			});
 		}
@@ -525,6 +542,14 @@
 		view.phase === 'done' && view.result.status === 'ok' ? view.result.hive : null
 	);
 
+	const sqlite = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.sqlite : null
+	);
+
+	const pcap = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result.pcap : null
+	);
+
 	const nested = $derived(
 		view.phase === 'done' && view.result.status === 'ok' ? view.result.nested : null
 	);
@@ -564,6 +589,8 @@
 					pdf,
 					binary,
 					hive,
+					sqlite,
+					pcap,
 					aes,
 					nested,
 					gif
@@ -626,12 +653,39 @@
 						origin: `from object ${o.number}, inside the PDF stream`
 					}))
 				) ?? []),
+				...(pcap?.streams.flatMap((s) =>
+					s.flags.map((text) => ({
+						text,
+						origin: `reassembled from the stream ${s.src} → ${s.dst}`
+					}))
+				) ?? []),
 				...nestedFindings(nested?.roots ?? []).map((found) => ({
 					text: found.text,
 					origin: `from ${found.origin}`
 				}))
 			].filter((found) => matchesFlagTag(found.text, flagTags))
 		)
+	);
+
+	/** For each recovered flag, the route it was reached by, shown in the Cod-end. */
+	const solvePaths = $derived(
+		view.phase === 'done' && view.result.status === 'ok'
+			? buildSolvePaths({
+					fileName: view.result.name,
+					survey,
+					structure,
+					sweep,
+					audio,
+					jpeg: jpegRaw,
+					paletteStego,
+					gif,
+					aes,
+					zip,
+					pdf,
+					pcap,
+					nested
+				})
+			: []
 	);
 
 	/** Both sweeps feed one view, so a find looks the same wherever it came from. */
@@ -845,6 +899,7 @@
 						candidates={credibleFlags}
 						sources={flagSources}
 						fromPixels={sweepFlags}
+						paths={solvePaths}
 						onpeel={acceptText}
 					/>
 				</div>
@@ -937,6 +992,18 @@
 							<PdfView doc={pdf} onpeel={acceptText} />
 						{:else}
 							<p class="clear">This file is not a PDF document, so there is nothing to read.</p>
+						{/if}
+					{:else if activeTool === 'sqlite'}
+						{#if sqlite}
+							<SqliteView db={sqlite} />
+						{:else}
+							<p class="clear">This file is not a SQLite database, so there is nothing to read.</p>
+						{/if}
+					{:else if activeTool === 'pcap'}
+						{#if pcap}
+							<PcapView cap={pcap} />
+						{:else}
+							<p class="clear">This file is not a packet capture, so there is nothing to read.</p>
 						{/if}
 					{:else if activeTool === 'hive'}
 						{#if hive}

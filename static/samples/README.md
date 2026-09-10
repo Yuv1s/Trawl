@@ -73,6 +73,8 @@ Hand-built rather than copied off a machine. A real SYSTEM hive is tens of megab
 | File | Main tools | Expected result |
 | --- | --- | --- |
 | [`forensics/usb-history.hiv`](forensics/usb-history.hiv) | Registry hive | A SYSTEM hive remembering three USB sticks under `ControlSet001\Enum\USBSTOR`, each with the date it was last plugged in. Two reported their own serial numbers; the third did not, so Windows generated `7&1ec5b3e5&0` and the reader marks it as naming the port rather than the device. |
+| [`databases/app.sqlite`](databases/app.sqlite) | SQLite database | Two tables. A row was deleted from `members` and is still in the file's free space; the reader recovers it and reads `flag{deleted_rows_never_left}` out of the deleted row, alongside `flag{live_row_in_a_table}` in a live `sessions` row. Built with `secure_delete` off, the way a database that keeps its deleted rows is. |
+| [`network/http-flag.pcap`](network/http-flag.pcap) | Network capture | A four-packet capture of a DNS lookup and an HTTP download over Ethernet. The response body's `flag{tcp_streams_reassemble_in_trawl}` is split across two TCP segments, so it appears nowhere contiguous in the file and the byte scan stays quiet; reassembling the server-to-client stream reads it back. |
 
 ## Cuttlefish image tools
 

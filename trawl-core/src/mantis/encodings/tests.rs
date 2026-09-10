@@ -262,7 +262,10 @@ fn uuencode_declines_a_line_with_extra_bytes_past_its_declared_length() {
     // first letter looks like a length and has plenty of characters
     // following it, without the rest of the string having anything to do
     // with what that byte declared.
-    assert_eq!(uuencode(b"#0V%Tsomelongtrailingrunoflettersthatisnotencodeddata"), None);
+    assert_eq!(
+        uuencode(b"#0V%Tsomelongtrailingrunoflettersthatisnotencodeddata"),
+        None
+    );
 }
 
 #[test]
@@ -297,4 +300,62 @@ fn atbash_is_its_own_inverse() {
         atbash(&atbash(b"attack at dawn")),
         b"attack at dawn".to_vec()
     );
+}
+
+#[test]
+fn brainfuck_runs_a_program_and_returns_its_output() {
+    // The canonical "Hello World!" program.
+    let hello = b"++++++++[>++++[>++>+++>+++>+<<<<-]>+>+>->>+[<]<-]>>.>---.+++++++..+++.>>.<-.<.+++.------.--------.>>+.>++.";
+    assert_eq!(brainfuck(hello).as_deref(), Some(&b"Hello World!\n"[..]));
+}
+
+#[test]
+fn brainfuck_declines_prose_with_a_stray_bracket() {
+    // Ordinary text picks up a period and the odd bracket, but is nowhere near
+    // dense enough with commands to be a program.
+    assert_eq!(brainfuck(b"See figure [1]. It shows the result."), None);
+    assert_eq!(brainfuck(b"nothing here"), None);
+}
+
+#[test]
+fn brainfuck_declines_an_unbalanced_program() {
+    assert_eq!(brainfuck(b"+++[>+++.<"), None);
+}
+
+#[test]
+fn bacon_reads_letters_out_of_two_symbols() {
+    // FLAG in the 24-letter table.
+    let f = "AABAB";
+    let l = "ABABA";
+    let a = "AAAAA";
+    let g = "AABBA";
+    let text = format!("{f} {l} {a} {g}");
+    assert_eq!(bacon(text.as_bytes()).as_deref(), Some(&b"flag"[..]));
+    // 0 and 1 are read the same way.
+    let zeros = f.replace('A', "0").replace('B', "1");
+    assert_eq!(bacon(zeros.as_bytes()).as_deref(), Some(&b"f"[..]));
+}
+
+#[test]
+fn bacon_declines_two_letters_that_are_not_a_bacon_pair() {
+    // Even in clean groups of five, X and Y are not a Bacon pair.
+    assert_eq!(bacon(b"XYXYX"), None);
+    // Three distinct symbols is not Bacon either.
+    assert_eq!(bacon(b"AABAC"), None);
+    // A length that is not a multiple of five cannot be groups of five.
+    assert_eq!(bacon(b"AAB"), None);
+}
+
+#[test]
+fn polybius_reads_pairs_of_digits() {
+    // H=(2,3) E=(1,5) L=(3,1) L=(3,1) O=(3,4) in the I/J-combined square.
+    assert_eq!(polybius(b"23 15 31 31 34").as_deref(), Some(&b"hello"[..]));
+}
+
+#[test]
+fn polybius_declines_digits_outside_one_to_five() {
+    assert_eq!(polybius(b"23 60"), None);
+    // An odd number of digits cannot be pairs.
+    assert_eq!(polybius(b"231"), None);
+    assert_eq!(polybius(b"hello"), None);
 }
