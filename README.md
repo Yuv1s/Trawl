@@ -1,66 +1,66 @@
 # Trawl
 
-A browser-based toolkit for finding hidden data in CTF files, text, and websites.
+Browser toolkit for finding hidden data in CTF files, text and web pages.
 
 ![Trawl](src/lib/assets/TrawlBanner.png)
 
 **Try it:** [trawlctf.vercel.app](https://trawlctf.vercel.app)
 
-Drop in a file or paste a string and Trawl runs the checks you would normally need several separate tools for.
+Drop in a file or some text and Trawl performs all the checks which otherwise would have required several separate tools.
 
-Your files stay on your machine.
+Your files are always local.
 
 ## Quick start
 
-Open [trawlctf.vercel.app](https://trawlctf.vercel.app), then:
+Open [trawlctf.vercel.app](https://trawlctf.vercel.app) and:
 
-1. Drop in a file, paste some text, or enter a target URL.
-2. Let Trawl run the relevant checks.
-3. Review everything it finds in the Cod-end.
+1. Drop in a file, paste some text or provide a target URL.
+2. Wait while Trawl performs the appropriate checks.
+3. Look at the result in the Cod-end.
 
-No installation or account is required for the hosted version.
+No setup or account is required for the hosted version.
 
 ## Why Trawl exists
 
-A CTF challenge might give you a normal-looking image with a password hidden inside its pixel values.
+A challenge in a CTF can give you an ordinary looking image, containing a password inside its pixels.
 
-Looking at the image will not help. You might need to inspect metadata, extract bit planes, check for appended data, run steganography tools, or try several decoders before finding anything useful.
+Looking at the image won't help much. You may need to examine metadata, extract bit planes, check for additional data, use various stegano tools or decode something using several decoders.
 
-That usually means jumping between a collection of unrelated tools.
+Which usually involves jumping between various separate tools.
 
-Trawl puts those checks in one interface and shows you which ones produced useful results.
+Trawl puts all these checks into a single interface and shows you which of them produce useful results.
 
 ## Features
 
-* Analyze PNG, BMP, GIF, WAV, and JPEG files
-* Search for hidden text, metadata, embedded files, and appended data
-* Inspect image bit planes, GIF frames, spectrograms, and JPEG data
-* Detect and unwrap multiple layers of encoded or encrypted text
-* Crawl websites and analyze discovered files
-* Check possible flag formats without presenting unverified guesses as flags
-* Generate a Markdown writeup from the results
+* Analysis of PNG, BMP, GIF, WAV, and JPEG files
+* Searching for hidden text, metadata, embedded files and appended data
+* Inspection of image bit planes, GIF frames, spectrograms and JPEG data
+* Detection and unwrapping of several layers of encoded or encrypted text
+* Crawling of websites and analysis of discovered files
+* Checking of possible flag formats without guessing unverified results as flags
+* Markdown writeup generation based on results
 
 ## Cuttlefish
 
-Cuttlefish handles file analysis.
+Cuttlefish deals with file analysis.
 
-Upload a PNG, BMP, GIF, WAV, or JPEG and it automatically checks the file for hidden text, metadata, embedded files, extra data, and other content that may not be visible normally.
+Drop in a PNG, BMP, GIF, WAV or a JPEG file and Cuttlefish automatically analyses it for hidden text, metadata, embedded files, extra data, and anything else hidden within.
 
-For images and audio, Cuttlefish can inspect:
+For images and audio it analyses:
 
 * Bit planes
-* Steganography patterns
+* Steganographic patterns
 * GIF frames
 * Spectrograms
 * JPEG data
 
 ## Mantis
 
-Mantis handles text decoding.
+Mantis deals with text decoding.
 
-Paste encoded or encrypted text and it attempts to detect and unwrap multiple layers.
+Paste some encoded or encrypted text and Mantis tries to detect and unwrap several layers of encoding/encryption.
 
-Supported techniques include:
+Currently supported methods:
 
 * gzip
 * zlib
@@ -74,48 +74,48 @@ Supported techniques include:
 
 ## Remora
 
-Remora handles web analysis.
+Remora deals with web analysis.
 
-Paste in a website URL and Remora crawls the target, analyzes discovered files, and sends discovered images through Cuttlefish.
+Paste a website URL and Remora crawls the target site, analyses discovered files and passes images to Cuttlefish.
 
-An optional advanced mode can also fuzz requests and test JWT weaknesses.
+There is an optional advanced mode with web fuzzing and testing of JWT tokens vulnerabilities.
 
-Because Remora needs to reach the target website, it is the part of Trawl that uses the network.
+Because Remora requires web access to analyse the target, this is the part of Trawl that actually uses the network.
 
-It only connects to the target you choose.
+It only makes connections to the target you select.
 
 ## Cod-end
 
-Results from the different tools collect in the Cod-end.
+Analysis results from different tools are collected in the Cod-end.
 
-It checks possible flag formats, avoids presenting unverified results as confirmed flags, and can generate a Markdown writeup of what was found.
+It analyses possible flag formats, avoids guessing unverified results as flags and allows to generate markdown writeup of the results.
 
 ## Local by default
 
-Trawl does not require a server, uploads, accounts, or tracking for file and text analysis.
+File and text analysis in Trawl does not require server, file uploads, user accounts or any kind of tracking.
 
-Once the page has loaded, those parts can work completely offline. Files are opened read-only and are not uploaded for analysis.
+Once the app is loaded in the browser, file and text analysis can happen completely offline. Files are opened in a read-only mode and are not uploaded anywhere for analysis.
 
-Remora is the exception because web analysis requires network access.
+Remora is an exception because it requires web access for analysis.
 
 ## How it works
 
-Trawl's analysis core is written in Rust and compiled to WebAssembly.
+Trawl's analysis core is implemented in Rust and compiled to WebAssembly.
 
-Heavy processing runs in a background thread so analysis does not block the interface. The browser handles the application without requiring runtime dependencies for the analysis core.
+Processing is done in a background thread to avoid blocking the interface. Browser handles the app without requiring any additional runtimes for the analysis core.
 
-Trawl also decodes images itself instead of depending entirely on browser image decoding. This helps preserve small pixel-level changes that may contain hidden data.
+Trawl also decodes images manually, which is useful in preserving small pixel level changes containing hidden data.
 
 ## Run locally
 
-Requirements:
+Dependencies:
 
 * Rust
 * `wasm32-unknown-unknown` target
 * `wasm-pack`
 * Node 20+
 
-Clone the repository and start the development server:
+Clone the repo and start the development server:
 
 ```bash
 git clone https://github.com/yuv1s/trawl
@@ -139,14 +139,14 @@ Run the Rust analysis-core tests:
 cd trawl-core && cargo test
 ```
 
-Test files are generated from scratch by `fixtures/generate.mjs`, so the planted data used by the tests can be reproduced.
+Test files are generated from scratch by `fixtures/generate.mjs`, thus allowing to reproduce planted data used in tests.
 
-The repository also includes a labelled [sample library](static/samples/README.md) with clean PNG, JPEG, and WAV controls alongside planted examples.
+The repo also contains a labelled [samples library](static/samples/README.md) with clean PNG, JPEG and WAV controls and planted samples.
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for current progress and planned work.
+See [ROADMAP.md](ROADMAP.md) for current status and future plans.
 
-## License
+## Licence
 
 [MIT](LICENCE.md)
