@@ -1,6 +1,6 @@
 [package]
 name = "trawl-scan"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 
 # The web reconnaissance service. Separate from trawl-core on purpose: the core

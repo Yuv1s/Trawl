@@ -59,7 +59,7 @@
 	let scannerVersion = $state<string | null>(null);
 
 	/** The scanner this page was built with. An older one lacks fixes this page expects. */
-	const CURRENT_SCANNER = [0, 1, 3];
+	const CURRENT_SCANNER = [0, 1, 4];
 
 	const outdated = $derived.by(() => {
 		if (!scannerVersion) return false;

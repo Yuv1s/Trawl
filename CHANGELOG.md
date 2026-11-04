@@ -2,7 +2,10 @@
 
 The scanner's version is what changes here. The site is always the latest code.
 
-## 0.1.3 (2026-11-04)
+## 0.1.4 (2026-11-04)
+
+The tag `v0.1.3` has no release. A settings mistake stopped the workflow before it built anything, so
+everything meant for it is here.
 
 ### Fixed
 
