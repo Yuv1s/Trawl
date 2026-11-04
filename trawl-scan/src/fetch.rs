@@ -44,7 +44,7 @@ const MAX_REDIRECTS: usize = 5;
 /// Most of a body to read by default. Enough for any page or script worth
 /// scanning, and a cap so a hostile server cannot stream gigabytes at the
 /// scanner. A caller that needs more, such as the file proxy, sets its own.
-const MAX_BODY: usize = 2 * 1024 * 1024;
+pub const MAX_BODY: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct Fetched {

@@ -1600,6 +1600,13 @@ pub fn json(data: &[u8]) -> String {
     out.push(',');
     push_number(&mut out, "objectCount", doc.objects.len());
     out.push(',');
+    // What the caller cannot open because it was never told about it.
+    let streams = |objects: &mut dyn Iterator<Item = &Object>| objects.filter(|o| o.stream.is_some()).count();
+    let streams_listed = streams(&mut listed.iter().copied());
+    push_number(&mut out, "streamsUnlisted", streams(&mut doc.objects.iter()) - streams_listed);
+    out.push(',');
+    push_bool(&mut out, "objectsCapped", doc.objects.len() >= MAX_OBJECTS);
+    out.push(',');
     push_number(&mut out, "trailing", doc.trailing);
     out.push(',');
     push_bool(&mut out, "encrypted", doc.encrypted);

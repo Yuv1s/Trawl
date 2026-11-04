@@ -733,6 +733,21 @@ fn the_last_of_a_repeated_parameter_is_the_one_read() {
 }
 
 #[test]
+fn streams_the_caller_is_not_told_about_are_counted() {
+    let puts: Vec<Put> = (0..MAX_OBJECTS_LISTED as u32 + 3)
+        .map(|number| Put::new(number + 1, "<< /Length 1 >>\nstream\nA\nendstream"))
+        .collect();
+    let file = build(&puts);
+
+    let reading = json(&file);
+    assert!(reading.contains(r#""streamsUnlisted":3,"#), "{}", &reading[..200]);
+    assert!(reading.contains(r#""objectsCapped":false"#));
+
+    let small = json(&build(&[Put::new(1, "<< /Length 1 >>\nstream\nA\nendstream")]));
+    assert!(small.contains(r#""streamsUnlisted":0,"#));
+}
+
+#[test]
 fn a_filter_can_go_by_its_short_key() {
     assert_eq!(filter_field("<< /F /FlateDecode >>").as_deref(), Some("FlateDecode"));
     assert_eq!(filter_field("<< /F (a file.bin) >>"), None);

@@ -359,8 +359,8 @@ struct ScanResult {
     /// Where the entry request ended up, after redirects.
     target: String,
     /// What the person should know did not happen: active checks skipped, the
-    /// time limit reached, findings capped. Always present, empty when the scan
-    /// ran in full.
+    /// time limit reached, findings capped, long responses cut. Always present,
+    /// empty when the scan ran in full.
     notices: Vec<String>,
     /// Every page the crawl visited, the entry first.
     pages: Vec<PageResult>,
@@ -653,18 +653,27 @@ async fn glean_off_thread(
 /// Fetches each text resource once and reads flags out of it, plain and decoded.
 /// This is what catches a flag written into a stylesheet or a script the crawl
 /// linked but never opened.
+///
+/// Says how many of those it read were cut at the body limit, how many it left unread
+/// at its own limit, and how many could not be fetched.
 async fn harvest_resources(
     allow_local: bool,
     deadline: Instant,
     resources: &[String],
     visited: &mut HashSet<String>,
     result: &mut ScanResult,
-) {
-    const MAX_RESOURCES: usize = 30;
+) -> Harvested {
     let mut fetched = 0;
+    let mut harvested = Harvested::default();
 
-    for url in resources {
-        if fetched >= MAX_RESOURCES || Instant::now() >= deadline {
+    for (index, url) in resources.iter().enumerate() {
+        if fetched >= MAX_RESOURCES {
+            // A file every page links is listed once for each of them.
+            let rest = resources[index..].iter().filter(|url| !visited.contains(*url));
+            harvested.left = rest.collect::<HashSet<_>>().len();
+            break;
+        }
+        if Instant::now() >= deadline {
             break;
         }
         if !is_texty(url) || !visited.insert(url.clone()) {
@@ -672,9 +681,13 @@ async fn harvest_resources(
         }
         fetched += 1;
 
-        if let Ok(res) = crate::fetch::fetch(url, allow_local).await
+        let answer = crate::fetch::fetch(url, allow_local).await;
+        harvested.failed += usize::from(answer.is_err());
+        if let Ok(res) = answer
             && res.status == 200
         {
+            harvested.cut += usize::from(res.truncated);
+
             // The decode battery is pure CPU over the body, so it runs off the
             // async worker the same way the page gleaning does.
             let body = res.body;
@@ -698,6 +711,19 @@ async fn harvest_resources(
             result.flags.extend(found);
         }
     }
+
+    harvested
+}
+
+/// Most scripts and stylesheets one scan will open.
+const MAX_RESOURCES: usize = 30;
+
+/// What reading a page's scripts and stylesheets came to.
+#[derive(Default)]
+struct Harvested {
+    cut: usize,
+    left: usize,
+    failed: usize,
 }
 
 /// Most files one sweep will report. A soft-404 server that slips calibration
@@ -712,6 +738,9 @@ const MAX_FOUND: usize = 40;
 /// baseline so a soft-404 server does not turn every guess into a find. A hit
 /// is recorded as a found file, its body read for flags, and anything it in
 /// turn references bucketed like any other page's.
+///
+/// Returns how many of those hits were cut at the body limit, and whether the sweep
+/// stopped at its limit on finds with names still to try.
 #[allow(clippy::too_many_arguments)]
 async fn probe_by_name(
     allow_local: bool,
@@ -723,8 +752,10 @@ async fn probe_by_name(
     scripts: &mut Vec<String>,
     assets: &mut Vec<String>,
     external: &mut Vec<String>,
-) {
+) -> (usize, bool) {
     let base = entry.clone();
+    let mut cut = 0;
+    let mut capped = false;
 
     // Ask for two paths that cannot be there and remember the answer, so a
     // server that says 200 to everything does not make every name look found.
@@ -748,7 +779,11 @@ async fn probe_by_name(
         .map(|p| (*p, false));
 
     for (path, sensitive) in sensitive.chain(loot) {
-        if result.found.len() >= MAX_FOUND || Instant::now() >= deadline {
+        if result.found.len() >= MAX_FOUND {
+            capped = true;
+            break;
+        }
+        if Instant::now() >= deadline {
             break;
         }
         let Ok(url) = base.join(path) else {
@@ -765,6 +800,7 @@ async fn probe_by_name(
         if !baseline.is_hit(page.status, page.body.len()) {
             continue;
         }
+        cut += usize::from(page.truncated);
 
         result.found.push(Found {
             url: probe.clone(),
@@ -788,6 +824,55 @@ async fn probe_by_name(
             categorize(references, entry, &mut buckets);
         }
     }
+
+    (cut, capped)
+}
+
+/// What a scan left undone, apart from running out of time, which has a notice of its own.
+#[derive(Default)]
+struct Undone {
+    pages_left: usize,
+    resources_left: usize,
+    failed: usize,
+    sweep_capped: bool,
+    active_stopped: bool,
+}
+
+/// One line for each thing a scan stopped short of, so that what it did not reach does not
+/// read as somewhere it looked and found nothing.
+fn undone_notices(undone: &Undone) -> Vec<String> {
+    let mut notices = Vec::new();
+    if undone.pages_left > 0 {
+        notices.push(format!(
+            "The crawl stopped at {MAX_PAGES} pages, with {} more left unread.",
+            undone.pages_left
+        ));
+    }
+    if undone.resources_left > 0 {
+        notices.push(format!(
+            "Trawl read {MAX_RESOURCES} scripts and stylesheets, with {} more left unread.",
+            undone.resources_left
+        ));
+    }
+    if undone.failed > 0 {
+        notices.push(format!(
+            "Pages and files the scan found but could not fetch, and so did not search: {}.",
+            undone.failed
+        ));
+    }
+    if undone.sweep_capped {
+        notices.push(format!(
+            "The file name sweep stopped after {MAX_FOUND} finds, so the names after that were not tried."
+        ));
+    }
+    if undone.active_stopped {
+        notices.push(format!(
+            "The active checks stopped at their limit of {} requests or {} seconds, so not every check ran.",
+            crate::active::REQUEST_BUDGET,
+            crate::active::ACTIVE_DEADLINE.as_secs()
+        ));
+    }
+    notices
 }
 
 async fn scan(
@@ -834,7 +919,9 @@ async fn scan(
             "The target redirected from {} to {}, so this is what that address holds.{}",
             request.url,
             entry_url,
-            if arrived.same_site { "" } else {
+            if arrived.same_site {
+                ""
+            } else {
                 " File names were not tried on it, since it is not the site you named."
             }
         ));
@@ -844,6 +931,10 @@ async fn scan(
     // site that answers slowly cannot hold the request open indefinitely.
     let deadline = Instant::now() + PASSIVE_DEADLINE;
     let mut time_limit_hit = false;
+
+    // Every response searched that stopped at the body limit, the entry first.
+    let mut cut = usize::from(entry.truncated);
+    let mut undone = Undone::default();
 
     let (mut images, mut scripts, mut assets, mut external) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -896,6 +987,7 @@ async fn scan(
     if let Ok(robots_url) = entry_parsed.join("/robots.txt")
         && let Ok(robots) = crate::fetch::fetch(robots_url.as_str(), allow_local).await
     {
+        cut += usize::from(robots.truncated);
         for path in crate::crawl::robots_paths(&entry_parsed, &robots.body) {
             if same_origin(&path, &entry_parsed) && visited.insert(path.clone()) {
                 queue.push(path);
@@ -914,7 +1006,10 @@ async fn scan(
         let url = queue[cursor].clone();
         cursor += 1;
 
-        if let Ok(page) = crate::fetch::fetch(&url, allow_local).await {
+        let answer = crate::fetch::fetch(&url, allow_local).await;
+        undone.failed += usize::from(answer.is_err());
+        if let Ok(page) = answer {
+            cut += usize::from(page.truncated);
             let (flags, comments, references) =
                 glean_off_thread(url.clone(), page.body.clone(), page.headers.clone()).await;
             result.pages.push(PageResult {
@@ -936,12 +1031,18 @@ async fn scan(
         }
     }
 
+    // Reaching the limit is one thing and running out of time is another, with its own notice.
+    if !time_limit_hit && result.pages.len() >= MAX_PAGES {
+        undone.pages_left = queue.len() - cursor;
+    }
+
     // Files a crawl never links to, tried by name: a source backup left in
     // place, a dotfile served by mistake, a flag dropped at the root. The
     // server's own not-found answer is learned first so a soft-404 site does
     // not turn every guess into a find. Each hit still runs the guard.
-    if arrived.same_site { if Instant::now() < deadline {
-            probe_by_name(
+    if arrived.same_site {
+        if Instant::now() < deadline {
+            let (sweep_cut, sweep_capped) = probe_by_name(
                 allow_local,
                 deadline,
                 &entry_parsed,
@@ -953,6 +1054,8 @@ async fn scan(
                 &mut external,
             )
             .await;
+            cut += sweep_cut;
+            undone.sweep_capped = sweep_capped;
         } else {
             time_limit_hit = true;
         }
@@ -966,7 +1069,11 @@ async fn scan(
         .filter(|url| is_texty(url))
         .cloned()
         .collect();
-    harvest_resources(allow_local, deadline, &resources, &mut visited, &mut result).await;
+    let harvested =
+        harvest_resources(allow_local, deadline, &resources, &mut visited, &mut result).await;
+    cut += harvested.cut;
+    undone.resources_left = harvested.left;
+    undone.failed += harvested.failed;
     if Instant::now() >= deadline {
         time_limit_hit = true;
     }
@@ -976,7 +1083,12 @@ async fn scan(
     // the entry redirected to another origin: the person authorised the target
     // they named, not wherever it pointed.
     if request.active {
-        if arrived.same_service { for hit in crate::active::run(&entry_url, allow_local, &bodies, &request.hints).await {
+        if arrived.same_service {
+            let active =
+                crate::active::run(&entry_url, allow_local, &bodies, &request.hints).await;
+            cut += active.cut;
+            undone.active_stopped = active.stopped;
+            for hit in active.hits {
                 result
                     .flags
                     .push(located(hit.value, &hit.source, &hit.note));
@@ -1003,6 +1115,10 @@ async fn scan(
             .notices
             .push("The scan reached its time limit; these are the results found by then.".into());
     }
+    if let Some(notice) = cut_notice(cut) {
+        result.notices.push(notice);
+    }
+    result.notices.extend(undone_notices(&undone));
 
     // Hold the result to sensible sizes, so one hostile page cannot return
     // megabytes of findings. Each cap that bites leaves a notice with the count.
@@ -1039,6 +1155,18 @@ async fn scan(
     );
 
     Ok(Json(result))
+}
+
+/// The one line that covers every response cut at the body limit, so a scan that
+/// stopped short of a flag does not read as one that looked and found nothing.
+fn cut_notice(cut: usize) -> Option<String> {
+    let limit = crate::fetch::MAX_BODY / (1024 * 1024);
+    let responses = if cut == 1 { "response" } else { "responses" };
+    (cut > 0).then(|| {
+        format!(
+            "{cut} {responses} ran past the {limit} MiB Trawl reads of each. The rest went unread, so a flag there would not show here."
+        )
+    })
 }
 
 /// Truncates a list to a cap and, when that drops anything, records how many were
@@ -1158,6 +1286,9 @@ async fn raw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
@@ -1174,6 +1305,244 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, HeaderValue::from_str(value).unwrap());
         headers
+    }
+
+    /// Answers every connection for as long as the test runs: the body a path names,
+    /// whatever its query, or else a 404 carrying `not_found`.
+    async fn site(routes: Vec<(&'static str, Vec<u8>)>, not_found: Vec<u8>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = listener.local_addr().unwrap();
+        let answers = Arc::new((routes, not_found));
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let answers = answers.clone();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 2048];
+                    let read = socket.read(&mut request).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&request[..read]);
+                    let path = request.split([' ', '?']).nth(1).unwrap_or("/");
+
+                    let (routes, not_found) = &*answers;
+                    let (status, body) = match routes.iter().find(|(route, _)| *route == path) {
+                        Some((_, body)) => ("200 OK", body),
+                        None => ("404 Not Found", not_found),
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                    // Left unread, a request's tail would reset the connection under the
+                    // reply on its way back.
+                    let _ = socket.shutdown().await;
+                    while matches!(socket.read(&mut [0u8; 2048]).await, Ok(1..)) {}
+                });
+            }
+        });
+        at
+    }
+
+    /// `head`, filler up to all a fetch reads, then `tail`, which it never gets to.
+    fn past_the_limit(head: &str, tail: &str) -> Vec<u8> {
+        let mut body = head.as_bytes().to_vec();
+        body.resize(crate::fetch::MAX_BODY, b' ');
+        body.extend_from_slice(tail.as_bytes());
+        body
+    }
+
+    async fn scanned(at: SocketAddr, active: bool) -> ScanResult {
+        let config =
+            Config::new(true, TOKEN.to_string(), "https://trawl.example".to_string()).unwrap();
+        let request = ScanRequest {
+            url: format!("http://{at}/"),
+            active,
+            hints: Vec::new(),
+        };
+        let headers = authorization(&format!("Bearer {TOKEN}"));
+        let Ok(Json(result)) = scan(State(config), headers, Json(request)).await else {
+            panic!("the scan was refused");
+        };
+        result
+    }
+
+    fn flags_of(result: &ScanResult) -> Vec<&str> {
+        result.flags.iter().map(|flag| flag.value.as_str()).collect()
+    }
+
+    #[test]
+    fn a_cut_notice_gives_the_count_and_the_limit() {
+        assert_eq!(cut_notice(0), None);
+
+        let one = cut_notice(1).unwrap();
+        assert!(one.starts_with("1 response ran past the 2 MiB "), "{one}");
+
+        let five = cut_notice(5).unwrap();
+        assert!(five.starts_with("5 responses ran past the 2 MiB "), "{five}");
+    }
+
+    #[tokio::test]
+    async fn everything_a_scan_searched_that_was_cut_is_counted_in_one_notice() {
+        let page = r#"<a href="/next">on</a><script src="/app.js"></script> flag{before_the_cut}"#;
+        let tail = "flag{after_the_cut}";
+        let routes = vec![
+            ("/", past_the_limit(page, tail)),
+            ("/next", past_the_limit("", tail)),
+            ("/robots.txt", past_the_limit("", tail)),
+            ("/.env", past_the_limit("", tail)),
+            ("/app.js", past_the_limit("", tail)),
+        ];
+        let at = site(routes, Vec::new()).await;
+
+        let result = scanned(at, false).await;
+
+        assert_eq!(result.notices, [cut_notice(5).unwrap()]);
+        let flags = flags_of(&result);
+        assert!(flags.contains(&"flag{before_the_cut}"), "{flags:?}");
+        assert!(!flags.contains(&tail), "{flags:?}");
+    }
+
+    /// A route for a path that has to outlive the site it is served from.
+    fn leaked(path: String) -> &'static str {
+        Box::leak(path.into_boxed_str())
+    }
+
+    #[tokio::test]
+    async fn a_crawl_that_stops_at_its_limit_on_pages_says_so() {
+        let extra = 5;
+        let links: String = (0..MAX_PAGES + extra)
+            .map(|i| format!(r#"<a href="/p{i}">page</a>"#))
+            .collect();
+        let at = site(vec![("/", links.into_bytes())], Vec::new()).await;
+
+        let result = scanned(at, false).await;
+
+        let expected = undone_notices(&Undone {
+            pages_left: 1 + extra,
+            ..Undone::default()
+        });
+        assert!(result.notices.contains(&expected[0]), "{:?}", result.notices);
+    }
+
+    #[tokio::test]
+    async fn a_scan_that_stops_at_its_limit_on_scripts_says_so() {
+        // Two pages linking every one of them, which must not count each of them twice.
+        let scripts: String = (0..MAX_RESOURCES + 4)
+            .map(|i| format!(r#"<script src="/s{i}.js"></script>"#))
+            .collect();
+        let entry = format!(r#"<a href="/next">next</a>{scripts}"#);
+        let routes = vec![("/", entry.into_bytes()), ("/next", scripts.into_bytes())];
+        let at = site(routes, Vec::new()).await;
+
+        let result = scanned(at, false).await;
+
+        let expected = undone_notices(&Undone {
+            resources_left: 4,
+            ..Undone::default()
+        });
+        assert!(result.notices.contains(&expected[0]), "{:?}", result.notices);
+    }
+
+    #[tokio::test]
+    async fn a_sweep_that_stops_at_its_limit_on_finds_says_so() {
+        // Every name tried answers differently from the calibration paths, so each is a find.
+        let names = SENSITIVE_PATHS.iter().chain(crate::discovery::DISCOVERY_PATHS.iter());
+        let mut routes: Vec<(&'static str, Vec<u8>)> =
+            names.map(|path| (*path, b"something is here".to_vec())).collect();
+        routes.push((leaked("/".to_string()), b"home".to_vec()));
+        let at = site(routes, Vec::new()).await;
+
+        let result = scanned(at, false).await;
+
+        let expected = undone_notices(&Undone {
+            sweep_capped: true,
+            ..Undone::default()
+        });
+        assert!(result.notices.contains(&expected[0]), "{:?}", result.notices);
+    }
+
+    #[tokio::test]
+    async fn an_active_pass_that_runs_out_of_requests_says_so() {
+        // More names in the page's source than the pass has requests to spend on them.
+        let paths: Vec<String> = (0..crate::active::REQUEST_BUDGET + 50)
+            .map(|i| format!("/api/e{i}"))
+            .collect();
+        let source: String = paths.iter().map(|p| format!(r#"fetch("{p}");"#)).collect();
+        let mut routes: Vec<(&'static str, Vec<u8>)> = paths
+            .into_iter()
+            .map(|path| (leaked(path), b"answered".to_vec()))
+            .collect();
+        routes.push(("/", format!("<script>{source}</script>").into_bytes()));
+        let at = site(routes, Vec::new()).await;
+
+        let outcome =
+            crate::active::run(&format!("http://{at}/"), true, &[source.into_bytes()], &[]).await;
+
+        assert!(outcome.stopped);
+    }
+
+    #[tokio::test]
+    async fn an_active_pass_that_finishes_does_not_say_it_stopped() {
+        let at = site(vec![("/", b"nothing to see".to_vec())], Vec::new()).await;
+
+        let outcome = crate::active::run(&format!("http://{at}/"), true, &[], &[]).await;
+
+        assert!(!outcome.stopped);
+    }
+
+    #[test]
+    fn nothing_left_undone_leaves_no_notice() {
+        assert!(undone_notices(&Undone::default()).is_empty());
+
+        let failed = undone_notices(&Undone {
+            failed: 2,
+            ..Undone::default()
+        });
+        assert!(failed[0].ends_with("did not search: 2."), "{failed:?}");
+    }
+
+    #[tokio::test]
+    async fn a_page_that_ends_right_at_the_limit_leaves_no_notice() {
+        let flag = "flag{on_the_last_byte}";
+        let mut body = vec![b' '; crate::fetch::MAX_BODY - flag.len()];
+        body.extend_from_slice(flag.as_bytes());
+        let at = site(vec![("/", body)], Vec::new()).await;
+
+        let result = scanned(at, false).await;
+
+        assert!(flags_of(&result).contains(&flag));
+        assert!(result.notices.is_empty(), "{:?}", result.notices);
+    }
+
+    #[tokio::test]
+    async fn a_long_answer_the_scan_did_not_search_is_not_counted() {
+        // The script and every name tried answer with a long 404, which only says nothing
+        // is there. The calibration requests get the same, and are only ever measured.
+        let page = br#"<script src="/gone.js"></script>"#.to_vec();
+        let routes = vec![("/", page), ("/robots.txt", Vec::new())];
+        let at = site(routes, past_the_limit("", "x")).await;
+
+        let result = scanned(at, false).await;
+
+        assert!(result.notices.is_empty(), "{:?}", result.notices);
+    }
+
+    #[tokio::test]
+    async fn the_active_pass_adds_what_it_cut_to_the_same_notice() {
+        let routes = vec![
+            ("/", past_the_limit("", "x")),
+            ("/api", past_the_limit("", "flag{after_the_cut}")),
+        ];
+        let at = site(routes, Vec::new()).await;
+
+        let passive = scanned(at, false).await;
+        assert_eq!(passive.notices, [cut_notice(1).unwrap()]);
+
+        let active = scanned(at, true).await;
+        assert_eq!(active.notices.len(), 1, "{:?}", active.notices);
+        let count = active.notices[0].split(' ').next().unwrap();
+        assert!(count.parse::<usize>().unwrap() > 1, "{:?}", active.notices);
+        assert!(!flags_of(&active).contains(&"flag{after_the_cut}"));
     }
 
     #[test]

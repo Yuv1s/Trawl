@@ -274,6 +274,10 @@ export type PdfStructure = {
 	version: string;
 	/** The true object count, which `objects` is a capped copy of. */
 	objectCount?: number;
+	/** Streams past what `objects` lists, so never opened. */
+	streamsUnlisted?: number;
+	/** True when the reader stopped at its limit on objects, with the file perhaps holding more. */
+	objectsCapped?: boolean;
 	/** True when the classic cross-reference table could not be read, so no object was
 	 *  checked against it. */
 	xrefUnread?: boolean;
@@ -937,7 +941,7 @@ export type NestedArtifact = {
 	status: 'analysed' | 'skipped' | 'error';
 	/** Set when status is not `analysed`: what stopped the walk. */
 	reason?: string;
-	/** Set on an analysed child read from a damaged or cut-off stream. */
+	/** Set on an analysed child that damage, a limit or a failed detector left part unread. */
 	damage?: string;
 	/** This child's findings and everything below it. */
 	findings: DerivedFinding[];

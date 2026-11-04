@@ -58,8 +58,8 @@
 	let localMode = $state(false);
 	let scannerVersion = $state<string | null>(null);
 
-	/** The scanner this page was built with. An older one lacks security fixes. */
-	const CURRENT_SCANNER = [0, 1, 2];
+	/** The scanner this page was built with. An older one lacks fixes this page expects. */
+	const CURRENT_SCANNER = [0, 1, 3];
 
 	const outdated = $derived.by(() => {
 		if (!scannerVersion) return false;
@@ -428,9 +428,10 @@
 
 			{#if outdated}
 				<p class="notice" role="status">
-					This scanner is version {scannerVersion}, which is missing security fixes. Stop it with
-					<span class="mono">Ctrl+C</span> and this page will show the line that installs the current
-					one.
+					This scanner is version {scannerVersion}, and this page expects {CURRENT_SCANNER.join(
+						'.'
+					)}. Stop it with <span class="mono">Ctrl+C</span> and this page will show the line that installs
+					the current one.
 				</p>
 			{/if}
 

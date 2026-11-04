@@ -61,7 +61,7 @@ import type {
 	AesSolved
 } from './protocol';
 import { attack, looksLikeRsa } from '$lib/analysis/rsa';
-import { isWavError } from './protocol';
+import { isJpegError, isWavError } from './protocol';
 import { assertZlibHeader, boundedInflate, compressionOf, isGzip, SeenBytes } from './decompress';
 
 const ready = init();
@@ -739,14 +739,91 @@ function descend(
 	}
 }
 
-/** What a nested file's own streams would not give up, in a line. */
-function troubleIn(structure: Structure | null, pdf: PdfStructure | null): string | undefined {
+/** The readers of a nested file that can stop short or refuse it, named as a root's are. */
+type ChildReaders = Pick<
+	Extract<AnalysisResponse, { status: 'ok' }>,
+	'survey' | 'structure' | 'wav' | 'jpeg' | 'zip' | 'pdf' | 'sqlite' | 'pcap' | 'gif'
+>;
+
+/** What a PDF held past what was read, if anything. */
+function pdfShortfall(pdf: PdfStructure | null | undefined): string | null {
+	const unlisted = pdf?.streamsUnlisted ?? 0;
+	if (unlisted > 0) {
+		return `${unlisted.toLocaleString()} PDF ${unlisted === 1 ? 'stream was' : 'streams were'} never opened`;
+	}
+	return pdf?.objectsCapped ? 'Trawl stopped reading PDF objects at its limit' : null;
+}
+
+/** Whether a database held more tables than were read. */
+function tablesUnread(sqlite: SqliteDatabase | null | undefined): number {
+	return sqlite ? Math.max(sqlite.tableCount - sqlite.tables.length, 0) : 0;
+}
+
+/** Reasons one nested file's line gives before it counts the rest. */
+const TROUBLE_NAMED = 3;
+/** Longest any of them runs, since a stream's error can quote a name out of the file. */
+const TROUBLE_LENGTH = 160;
+
+/**
+ * What a nested file's readers stopped short of or failed on, in a line, since a tree can
+ * hold hundreds of them.
+ *
+ * @param detectors what only the pass over the file itself could tell, ahead of the rest
+ */
+function troubleIn(readers: ChildReaders, detectors: string[]): string | undefined {
+	const { survey, structure, wav, jpeg, zip, pdf, sqlite, pcap, gif } = readers;
 	const errors = [
 		...(structure?.text ?? []).map((chunk) => chunk.error),
 		...(pdf?.objects ?? []).map((object) => object.stream?.error)
 	].filter((error) => error !== undefined);
 
-	return errors.length > 1 ? `${errors[0]}, and ${errors.length - 1} more like it` : errors[0];
+	const said = [...detectors];
+	if (wav && isWavError(wav)) said.push(`the WAV could not be read: ${wav.error}`);
+	if (gif?.error) said.push(`GIF frames could not be read: ${gif.error}`);
+	if (errors.length > 0) {
+		said.push(
+			errors.length > 1 ? `${errors[0]}, and ${errors.length - 1} more like it` : errors[0]
+		);
+	}
+	if (gif?.stopped) said.push(`GIF frames stop short: ${gif.stopped}`);
+	if (gif?.capped) {
+		said.push(
+			`Trawl read ${gif.analysedFrames.toLocaleString()} of ${gif.declaredFrames.toLocaleString()} GIF frames`
+		);
+	}
+	if (survey.flagsTruncated || structure?.flagsTruncated || pcap?.flagsTruncated) {
+		said.push('the list of flags stops partway');
+	}
+	if (sqlite?.flagsTruncated) said.push('a long database cell was not read to its end');
+	const unreadTables = tablesUnread(sqlite);
+	if (unreadTables > 0) {
+		said.push(
+			`${unreadTables.toLocaleString()} database ${unreadTables === 1 ? 'table was' : 'tables were'} not read`
+		);
+	}
+	const unopened = pdfShortfall(pdf);
+	if (unopened) said.push(unopened);
+	if (jpeg && !isJpegError(jpeg) && jpeg.truncated) said.push('a JPEG scan ran out of data');
+
+	if (survey.magicOmitted) {
+		said.push(`${survey.magicOmitted.toLocaleString()} more file signatures were left out`);
+	}
+	if (zip?.capped) {
+		said.push(`Trawl stopped reading local headers at ${zip.entries.length.toLocaleString()}`);
+	}
+	if (pcap?.packetsCapped) {
+		said.push(`Trawl read the first ${pcap.packetCount.toLocaleString()} packets and stopped`);
+	}
+
+	if (said.length === 0) return undefined;
+
+	const named = said
+		.slice(0, TROUBLE_NAMED)
+		.map((reason) =>
+			reason.length > TROUBLE_LENGTH ? `${reason.slice(0, TROUBLE_LENGTH)}…` : reason
+		)
+		.join('; ');
+	return said.length > TROUBLE_NAMED ? `${named}; and ${said.length - TROUBLE_NAMED} more` : named;
 }
 
 /** Whether a range sits inside one of these stretches of a file. */
@@ -806,6 +883,10 @@ function analyseInternal(
 
 	const pixels = pixelInput(bytes, structure !== null, CHILD_PIXEL_LIMIT);
 
+	const detectors: string[] = [];
+	const failed = (detector: string, error: unknown) =>
+		detectors.push(`${detector} failed: ${error instanceof Error ? error.message : String(error)}`);
+
 	if (pixels.error === null) {
 		let image: DecodedPixels | null = null;
 		try {
@@ -821,20 +902,41 @@ function analyseInternal(
 			sweep = JSON.parse(image.lsb_sweep(SWEEP_BYTES, flagTags)) as Sweep;
 			chi = JSON.parse(image.chi_square(CHI_STEPS)) as ChiSquare;
 			rs = JSON.parse(image.rs_analysis()) as RsAnalysis;
-		} catch {
-			// Pixel detectors failed; leave them null
+
+			const rows = image.rows();
+			const declared = image.declared_rows();
+			if (rows < declared) {
+				detectors.push(
+					`Trawl read ${rows.toLocaleString()} of ${declared.toLocaleString()} image rows${pixels.damage ? ` (${pixels.damage})` : ''}`
+				);
+			} else if (pixels.damage) {
+				detectors.push(`the image data is damaged (${pixels.damage})`);
+			}
+		} catch (error: unknown) {
+			// Every file that is not an image comes through here, with no pixels to miss.
+			if (['PNG image', 'BMP image', 'GIF image'].includes(survey.format ?? '')) {
+				failed('the pixel tools', error);
+			}
 		} finally {
 			image?.free();
 		}
+	} else {
+		detectors.push(`the image data could not be read: ${pixels.error}`);
 	}
 
 	if (wav && !isWavError(wav)) {
 		try {
 			audio = JSON.parse(wav_lsb_sweep(bytes, SWEEP_BYTES, flagTags)) as AudioSweep;
-		} catch {
-			// Audio LSB failed; leave null
+		} catch (error: unknown) {
+			failed('the audio sweep', error);
 		}
 		// Skip spectrogram in recursive analysis to keep summaries compact
+	}
+
+	// A JPEG's signature turns up by chance in audio and the like, so one carved out that will
+	// not decode may never have been a JPEG. An entry someone put in an archive was a file.
+	if (jpeg && isJpegError(jpeg) && sourceKind === 'zip') {
+		detectors.push(`JPEG coefficients could not be read: ${jpeg.error}`);
 	}
 
 	// Collect direct findings from this level
@@ -1034,10 +1136,11 @@ function analyseInternal(
 
 	// GIF frame analysis for nested GIFs (children get frame/difference findings)
 	const gifFindings: DerivedFinding[] = [];
+	let gif: GifAnalysis | null = null;
 	if (survey.format === 'GIF image') {
 		try {
 			const json = gif_frame_analysis(bytes, flagTags, SWEEP_BYTES, CHI_STEPS);
-			const gif = normaliseGifAnalysis(JSON.parse(json)) as GifAnalysis;
+			gif = normaliseGifAnalysis(JSON.parse(json));
 			if (gif && !gif.error && gif.sources.length > 0) {
 				for (const source of gif.sources) {
 					const label =
@@ -1072,8 +1175,8 @@ function analyseInternal(
 					}
 				}
 			}
-		} catch {
-			// If the export fails, leave gifFindings empty
+		} catch (error: unknown) {
+			failed('the GIF frame reader', error);
 		}
 	}
 
@@ -1087,7 +1190,7 @@ function analyseInternal(
 		depth,
 		status: 'analysed',
 		findings: context.keepFindings([...findings, ...gifFindings]),
-		damage: troubleIn(structure, pdf),
+		damage: troubleIn({ survey, structure, wav, jpeg, zip, pdf, sqlite, pcap, gif }, detectors),
 		children: []
 	};
 
@@ -1097,7 +1200,7 @@ function analyseInternal(
 }
 
 function countDamaged(artifact: NestedArtifact): number {
-	let count = artifact.damage ? 1 : 0;
+	let count = artifact.damage || artifact.status === 'error' ? 1 : 0;
 	for (const child of artifact.children) {
 		count += countDamaged(child);
 	}
@@ -1348,12 +1451,29 @@ async function analyseRoot(
 	const damaged = countDamaged(top);
 	if (damaged > 0) {
 		notes.push(
-			`${damaged.toLocaleString()} nested ${damaged === 1 ? 'file' : 'files'} could not be read in full, so a flag in what went unread would not show here. The writeup lists which.`
+			`${damaged.toLocaleString()} nested ${damaged === 1 ? 'file' : 'files'} could not be read in full: a stream was damaged, a limit was reached or a detector failed. A flag in what went unread would not show here. The writeup lists which, and why.`
 		);
 	}
 	if (sqlite?.flagsTruncated) {
 		notes.push(
 			'Trawl could not read every long database cell to its end, so a flag in what it did not reach would not show here.'
+		);
+	}
+	if (tablesUnread(sqlite) > 0) {
+		notes.push(
+			`Trawl read the first ${sqlite?.tables.length.toLocaleString()} of ${sqlite?.tableCount.toLocaleString()} database tables. A flag in the others would not show here.`
+		);
+	}
+	const pdfUnread = pdfShortfall(pdf);
+	if (pdfUnread) notes.push(`${pdfUnread}. A flag in what went unread would not show here.`);
+	if (jpeg && !isJpegError(jpeg) && jpeg.truncated) {
+		notes.push(
+			'A scan in this JPEG ran out of data, so its last blocks read as zero and the coefficient tools cannot see them.'
+		);
+	}
+	if (pcap?.truncated) {
+		notes.push(
+			'Some packets in this capture were saved with fewer bytes than they carried, so the rest of them is not in the file.'
 		);
 	}
 	if (zip?.capped) {

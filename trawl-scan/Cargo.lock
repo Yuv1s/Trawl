@@ -1257,14 +1257,14 @@ dependencies = [
 
 [[package]]
 name = "trawl-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "wasm-bindgen",
 ]
 
 [[package]]
 name = "trawl-scan"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "axum",
  "reqwest",

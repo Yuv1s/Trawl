@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { writeupMarkdown } from '$lib/analysis/writeup';
 import { encodePng, pngChunk } from '$lib/pixels/png-encode';
 import AnalysisWorker from './analysis.worker?worker';
 import type { AnalysisRequest, AnalysisResponse, NestedArtifact } from './protocol';
@@ -260,6 +261,16 @@ function zipFile(entries: Put[]): Uint8Array<ArrayBuffer> {
 	);
 }
 
+/** An entry compressed, so what it holds is read as the entry and not in the archive's bytes. */
+async function packed(name: string, inside: Uint8Array): Promise<Put> {
+	return {
+		name,
+		data: await deflated(inside, 'deflate-raw'),
+		method: 8,
+		size: inside.length
+	};
+}
+
 function pdfFile(...objects: Uint8Array[]): Uint8Array<ArrayBuffer> {
 	return concat(ascii('%PDF-1.7\n'), ...objects, ascii('trailer<</Size 1>>\n%%EOF\n'));
 }
@@ -270,6 +281,86 @@ function pdfStream(number: number, filter: string, stream: Uint8Array): Uint8Arr
 		stream,
 		ascii('\nendstream\nendobj\n')
 	);
+}
+
+/** A GIF of this many one-pixel frames. */
+function gifFile(frames: number): Uint8Array<ArrayBuffer> {
+	const frame = Uint8Array.of(0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 0x01, 0);
+	return concat(
+		ascii('GIF89a'),
+		Uint8Array.of(1, 0, 1, 0, 0x80, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff),
+		...Array.from({ length: frames }, () => frame),
+		Uint8Array.of(0x3b)
+	);
+}
+
+/** A WAV of one 32-bit sample, in the format this tag names. */
+function wavFile(tag: number): Uint8Array<ArrayBuffer> {
+	const format = littleEndian([2, tag], [2, 1], [4, 8000], [4, 32000], [2, 4], [2, 32]);
+	const body = concat(
+		ascii('WAVEfmt '),
+		littleEndian([4, format.length]),
+		format,
+		ascii('data'),
+		littleEndian([4, 4], [4, 0])
+	);
+	return concat(ascii('RIFF'), littleEndian([4, body.length]), body);
+}
+
+const PCAP_HEADER = concat(
+	Uint8Array.of(0xd4, 0xc3, 0xb2, 0xa1),
+	littleEndian([2, 2], [2, 4], [4, 0], [4, 0], [4, 65535], [4, 1])
+);
+
+/** A capture of this many connections, one TCP segment each, every one carrying a flag. */
+function captureOfFlags(connections: number): Uint8Array<ArrayBuffer> {
+	const records = Array.from({ length: connections }, (_, i) => {
+		const payload = ascii(`flag{stream_${i}}`);
+		const ip = 40 + payload.length;
+		return concat(
+			littleEndian([4, i], [4, 0], [4, 14 + ip], [4, 14 + ip]),
+			new Uint8Array(12),
+			Uint8Array.of(0x08, 0x00, 0x45, 0, ip >> 8, ip & 0xff, 0, 0, 0, 0, 64, 6, 0, 0),
+			Uint8Array.of(10, 0, 0, 1, 10, 0, 0, 2),
+			Uint8Array.of(i >> 8, i & 0xff, 0, 80, 0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x18, 0, 0, 0, 0, 0, 0),
+			payload
+		);
+	});
+	return concat(PCAP_HEADER, ...records);
+}
+
+/** A database of one table whose only row runs on to an overflow page that is not there. */
+function databaseCutShort(): Uint8Array<ArrayBuffer> {
+	const size = 512;
+	const leaf = (head: number, cell: Uint8Array) => {
+		const page = new Uint8Array(size);
+		const at = size - cell.length;
+		page.set(cell, at);
+		page[head] = 0x0d;
+		page[head + 4] = 1;
+		page.set([at >> 8, at & 0xff], head + 5);
+		page.set([at >> 8, at & 0xff], head + 8);
+		return page;
+	};
+
+	const schema = concat(
+		Uint8Array.of(31, 1, 6, 23, 15, 15, 1, 47),
+		ascii('tablett\x02CREATE TABLE t(a)')
+	);
+	// A record of 1000 bytes, 39 of them here, and then no page for the rest to be on.
+	const row = concat(Uint8Array.of(0x87, 0x68, 1, 3, 0x8f, 0x57), new Uint8Array(40));
+
+	const first = leaf(100, schema);
+	first.set(ascii('SQLite format 3\0'));
+	first.set([size >> 8, size & 0xff, 1, 1, 0, 64, 32, 32], 16);
+	first.set([0, 0, 0, 2], 28);
+	first.set([0, 0, 0, 1], 56);
+	return concat(first, leaf(0, row));
+}
+
+/** One run of bytes, over and over. */
+function repeated(run: Uint8Array, times: number): Uint8Array<ArrayBuffer> {
+	return new Uint8Array(run.length * times).map((_, i) => run[i % run.length]);
 }
 
 function allFindings(artifacts: NestedArtifact[]): string[] {
@@ -406,12 +497,6 @@ describe('a file built to get in the way', () => {
 			expect(decoy.subarray(0, 64)).toEqual(real.subarray(0, 64));
 			expect(decoy.subarray(-64)).toEqual(real.subarray(-64));
 
-			const packed = async (name: string, inside: Uint8Array): Promise<Put> => ({
-				name,
-				data: await deflated(inside, 'deflate-raw'),
-				method: 8,
-				size: inside.length
-			});
 			const response = await analyse(
 				zipFile([await packed('one.zip', decoy), await packed('two.zip', real)])
 			);
@@ -717,6 +802,25 @@ describe('a file built to get in the way', () => {
 			expect(response.pdf?.objects[0].flags).toContain(REAL);
 		});
 
+		it(
+			'says when a PDF holds more streams than it was told about',
+			{ timeout: 120_000 },
+			async () => {
+				const objects = Array.from(
+					{ length: (1 << 16) + 2 },
+					(_, i) => `${i + 1} 0 obj\n<</Length 1>>\nstream\nx\nendstream\nendobj\n`
+				);
+				const pdf = pdfFile(ascii(objects.join('')));
+
+				const response = await analyse(pdf);
+				expect(response.notes?.join(' ')).toContain('2 PDF streams were never opened');
+
+				const nested = await analyse(zipFile([{ name: 'many.pdf', data: pdf }]));
+				const child = nested.nested?.roots.find((root) => root.name === 'many.pdf');
+				expect(child?.damage).toContain('2 PDF streams were never opened');
+			}
+		);
+
 		it('reads a stream whose filter array points at its name', async () => {
 			const response = await analyse(
 				pdfFile(
@@ -792,6 +896,181 @@ describe('a file built to get in the way', () => {
 			);
 
 			expect(allFindings(response.nested?.roots ?? [])).toContain(REAL);
+		});
+	});
+
+	describe('with a nested file it could not read in full', () => {
+		const DISTINCT = Array.from({ length: 12_000 }, (_, i) => `abc{aaaa${i}}`).join('\n');
+		const SIGNATURES = repeated(Uint8Array.of(0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c), 4100);
+		const LOCAL_HEADER = concat(
+			ascii('PK\x03\x04'),
+			littleEndian([2, 20], [2, 0], [2, 0], [2, 0], [2, 0], [4, 0], [4, 0], [4, 0], [2, 1], [2, 0]),
+			ascii('x')
+		);
+
+		async function nested(inner: Uint8Array) {
+			const response = await analyse(zipFile([await packed('inner', inner)]));
+			const child = response.nested?.roots.find((root) => root.name === 'inner');
+			if (!child) throw new Error('the walk did not reach it');
+			return { response, child };
+		}
+
+		it.each<[string, () => Uint8Array | Promise<Uint8Array>, string]>([
+			['more flags than are listed', () => ascii(DISTINCT), 'the list of flags stops partway'],
+			['more signatures than are listed', () => SIGNATURES, 'more file signatures were left out'],
+			[
+				'more flagged connections than are listed',
+				() => captureOfFlags(1025),
+				'the list of flags stops partway'
+			],
+			[
+				'more packets than are read',
+				() => concat(PCAP_HEADER, new Uint8Array(16 * 500_001)),
+				'packets and stopped'
+			],
+			[
+				'a database cell that stops short',
+				databaseCutShort,
+				'a long database cell was not read to its end'
+			],
+			[
+				'more local headers than are read',
+				() => repeated(LOCAL_HEADER, 65_537),
+				'stopped reading local headers at'
+			],
+			['more GIF frames than are read', () => gifFile(129), 'of 129 GIF frames'],
+			['a GIF cut off part way', () => gifFile(2).subarray(0, -4), 'GIF frames stop short'],
+			[
+				'pixel data cut off part way',
+				() => withIdat(lsbPng(REAL), (idat) => idat.subarray(0, idat.length >> 1)),
+				'of 32 image rows'
+			],
+			[
+				'pixel data with something after it',
+				() => withIdat(lsbPng(REAL), (idat) => concat(idat, ascii('x'))),
+				'the image data is damaged (1 byte follows'
+			],
+			[
+				'pixel data that cannot be read',
+				() => withIdat(plainPng(), () => noise(16, 3)),
+				'the image data could not be read'
+			],
+			[
+				'a row the pixel tools refuse',
+				async () => {
+					const stream = await deflated(Uint8Array.of(9, 1, 2, 3));
+					return withIdat(plainPng(), () => stream);
+				},
+				'the pixel tools failed'
+			],
+			['samples the audio sweep refuses', () => wavFile(3), 'the audio sweep failed'],
+			['a WAV that does not walk', () => wavFile(2), 'the WAV could not be read'],
+			[
+				'a JPEG that does not decode',
+				() => Uint8Array.of(0xff, 0xd8, 0xff, 0xe0, 0, 2, 0xff, 0xd9),
+				'JPEG coefficients could not be read'
+			],
+			['a GIF with no frames', () => gifFile(0), 'GIF frames could not be read']
+		])('says so about %s', { timeout: 60_000 }, async (_, inner, says) => {
+			const { response, child } = await nested(await inner());
+
+			expect(child.status).toBe('analysed');
+			expect(child.damage).toContain(says);
+			expect(response.notes?.join(' ')).toContain('1 nested file could not be read in full');
+		});
+
+		it(
+			'says how far it read an image too big for what a nested file gets',
+			{ timeout: 60_000 },
+			async () => {
+				const stream = await deflated(new Uint8Array(3001 * 12_000));
+				const pixels = new Uint8Array(3000 * 12_000);
+				const { child } = await nested(withIdat(encodePng(1000, 12_000, 2, pixels), () => stream));
+
+				expect(child.damage).toContain(`of ${(12_000).toLocaleString()} image rows`);
+				expect(child.damage).toContain('only the first');
+			}
+		);
+
+		it('gives the reason on the page and in the writeup at any depth', async () => {
+			const { response, child } = await nested(zipFile([await packed('deep.gif', gifFile(129))]));
+			const deep = child.children.find((artifact) => artifact.name === 'deep.gif');
+
+			expect(child.damage).toBeUndefined();
+			expect(deep?.damage).toContain('of 129 GIF frames');
+			expect(response.notes?.join(' ')).toContain('1 nested file could not be read in full');
+			expect(writeupMarkdown(response, [], [])).toContain(deep?.damage);
+		});
+
+		it('counts a nested file that could not be opened at all', async () => {
+			const reservedBlockType = Uint8Array.of(0x07);
+			const response = await analyse(
+				zipFile([{ name: 'broken', data: reservedBlockType, method: 8, size: 1 }])
+			);
+
+			expect(response.nested?.roots[0].status).toBe('error');
+			expect(response.notes?.join(' ')).toContain('1 nested file could not be read in full');
+		});
+
+		it.each<[string, () => Uint8Array]>([
+			['plain text', () => ascii('nothing to see in here')],
+			['text that opens like a bitmap', () => ascii('BMW built this, and it is no picture')],
+			['a whole PNG', () => lsbPng(REAL)],
+			['a whole GIF', () => gifFile(2)],
+			['a whole WAV', () => wavFile(1)]
+		])('says nothing about %s', async (_, inner) => {
+			const { response, child } = await nested(inner());
+
+			expect(child.status).toBe('analysed');
+			expect(child.damage).toBeUndefined();
+			expect(response.notes).toEqual([]);
+		});
+
+		it('says nothing about a JPEG signature that turned up by chance', async () => {
+			const chance = Uint8Array.of(0xff, 0xd8, 0xff, 0xe0, 0, 2, 0xff, 0xd9);
+
+			const response = await analyse(concat(noise(64), chance, noise(64, 5)));
+
+			const carved = response.nested?.roots.find((root) => root.format === 'JPEG image');
+			expect(carved?.status).toBe('analysed');
+			expect(carved?.damage).toBeUndefined();
+			expect(response.notes).toEqual([]);
+		});
+
+		it.each([
+			'/samples/spectrogram-and-lsb.wav',
+			'/samples/archives/recursive-files.zip',
+			'/samples/archives/doctored-directory.zip',
+			'/samples/survey/carved-zlib-text-png.bin',
+			'/samples/survey/png-post-iend.png'
+		])('says nothing about the nested files of %s', async (sample) => {
+			const bytes = await (await fetch(sample)).arrayBuffer();
+
+			const response = await analyse(new Uint8Array(bytes));
+
+			expect(response.nested?.analysed).toBeGreaterThan(0);
+			expect(response.notes).toEqual([]);
+		});
+
+		it('keeps a reason that quotes the file to a short line', async () => {
+			const { child } = await nested(pdfFile(pdfStream(1, `/${'A'.repeat(100_000)}`, ascii('x'))));
+
+			expect(child.damage).toContain('Trawl does not read AAAA');
+			expect(child.damage?.length).toBeLessThan(200);
+		});
+
+		it('counts the reasons past the first few rather than listing them', async () => {
+			const { child } = await nested(
+				withChunks(
+					withIdat(plainPng(), () => noise(16, 3)),
+					pngChunk('zTXt', concat(ascii('a\0\0'), noise(16, 3))),
+					pngChunk('tEXt', ascii(`c\0${DISTINCT}`)),
+					pngChunk('tEXt', concat(ascii('d\0'), SIGNATURES))
+				)
+			);
+
+			expect(child.damage).toContain('the image data could not be read');
+			expect(child.damage).toMatch(/; and 1 more$/);
 		});
 	});
 
@@ -875,6 +1154,21 @@ describe('a file built to get in the way', () => {
 		if (extracted.status !== 'extract') throw new Error(JSON.stringify(extracted));
 		expect(new TextDecoder().decode(extracted.bytes)).toContain(REAL);
 		expect(extracted.label).toContain('by column');
+	});
+
+	it('says when a capture saved fewer bytes of a packet than it carried', async () => {
+		worker = new AnalysisWorker();
+		const whole = new Uint8Array(
+			await (await fetch('/samples/network/http-flag.pcap')).arrayBuffer()
+		);
+		const snapped = whole.slice();
+		// The first record's original length, past what it says it saved.
+		const view = new DataView(snapped.buffer);
+		const little = view.getUint32(0, true) === 0xa1b2c3d4;
+		view.setUint32(24 + 12, view.getUint32(24 + 8, little) + 100, little);
+
+		expect((await analyse(whole)).notes).toEqual([]);
+		expect((await analyse(snapped)).notes?.join(' ')).toContain('saved with fewer bytes');
 	});
 
 	it('fails a plane request plainly when there are no pixels to read', async () => {

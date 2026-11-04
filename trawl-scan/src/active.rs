@@ -27,6 +27,15 @@ pub struct Hit {
     pub note: String,
 }
 
+/// What one active pass came back with.
+pub struct Outcome {
+    pub hits: Vec<Hit>,
+    /// Responses that ran past what a fetch reads, so their tails went unsearched.
+    pub cut: usize,
+    /// True when the budget or the clock turned a check away, so not every one ran.
+    pub stopped: bool,
+}
+
 fn flags_in(body: &[u8]) -> Vec<String> {
     trawl_core::bytes::flag_candidates(body)
         .into_iter()
@@ -95,7 +104,7 @@ const ACCEPT_MARKERS: &[&str] = &[
 
 /// A ceiling on how many requests one active pass may send, so a wide wordlist
 /// against a slow target cannot run away.
-const REQUEST_BUDGET: usize = 300;
+pub const REQUEST_BUDGET: usize = 300;
 
 /// The longest one probe waits. A window that only opens for a correct value
 /// often stalls a wrong one, and the whole pass cannot afford ten seconds each.
@@ -103,7 +112,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// A wall-clock ceiling on the whole active pass, so a target that stalls every
 /// probe still returns a scan rather than hanging the request.
-const ACTIVE_DEADLINE: Duration = Duration::from_secs(30);
+pub const ACTIVE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Extracts endpoint-shaped paths a page or script names, so a URL the source
 /// mentions but never links is still probed.
@@ -342,6 +351,8 @@ struct Probe<'a> {
     deadline: Instant,
     seen: HashSet<String>,
     hits: Vec<Hit>,
+    cut: usize,
+    stopped: bool,
     /// The wordlists a probe draws on, each already carrying any hints the person
     /// gave: a name to try as a parameter, a field, a header marker.
     params: Vec<String>,
@@ -385,7 +396,7 @@ impl Probe<'_> {
     /// real key is in hand.
     async fn forge_and_replay(&mut self) {
         for token_str in self.tokens.clone() {
-            if *self.budget == 0 || Instant::now() >= self.deadline {
+            if self.spent() {
                 return;
             }
             let Some(token) = crate::jwt::parse(&token_str) else {
@@ -409,7 +420,7 @@ impl Probe<'_> {
             };
 
             for url in self.existing.clone() {
-                if *self.budget == 0 || Instant::now() >= self.deadline {
+                if self.spent() {
                     return;
                 }
                 let request = Request {
@@ -430,8 +441,15 @@ impl Probe<'_> {
         }
     }
 
+    /// Whether the budget or the clock has run out, noting it when it has.
+    fn spent(&mut self) -> bool {
+        let spent = *self.budget == 0 || Instant::now() >= self.deadline;
+        self.stopped |= spent;
+        spent
+    }
+
     async fn send(&mut self, url: &str, request: &Request) -> Option<fetch::Fetched> {
-        if *self.budget == 0 || Instant::now() >= self.deadline {
+        if self.spent() {
             return None;
         }
         *self.budget -= 1;
@@ -441,9 +459,11 @@ impl Probe<'_> {
         // a redirect off the target's origin. This is the one place all probe
         // requests pass through, so the rule is set here once.
         request.stop_at_cross_origin = true;
-        fetch::fetch_with(url, self.allow_local, &request)
+        let response = fetch::fetch_with(url, self.allow_local, &request)
             .await
-            .ok()
+            .ok()?;
+        self.cut += usize::from(response.truncated);
+        Some(response)
     }
 
     /// Whether an endpoint answers to a name, so techniques are not spent on one
@@ -479,7 +499,7 @@ impl Probe<'_> {
     async fn flows(&mut self) {
         for carriable in self.carries.clone() {
             for url in self.existing.clone() {
-                if *self.budget == 0 || Instant::now() >= self.deadline {
+                if self.spent() {
                     return;
                 }
                 let request = Request {
@@ -577,7 +597,8 @@ impl Probe<'_> {
     }
 }
 
-/// Runs the active battery against a target, returning the flags it drew out.
+/// Runs the active battery against a target, returning the flags it drew out and how
+/// many of its responses were too long to read to the end.
 ///
 /// `entry_url` fixes the host; every probe is built against it, so a redirect, a
 /// wordlist entry or a hint can never send a crafted request off to another
@@ -590,9 +611,13 @@ pub async fn run(
     allow_local: bool,
     source_bodies: &[Vec<u8>],
     hints: &[String],
-) -> Vec<Hit> {
+) -> Outcome {
     let Ok(base) = reqwest::Url::parse(entry_url) else {
-        return Vec::new();
+        return Outcome {
+            hits: Vec::new(),
+            cut: 0,
+            stopped: false,
+        };
     };
     let hints = clean_hints(hints);
 
@@ -636,6 +661,8 @@ pub async fn run(
         deadline: Instant::now() + ACTIVE_DEADLINE,
         seen: HashSet::new(),
         hits: Vec::new(),
+        cut: 0,
+        stopped: false,
         params,
         time_params,
         fields,
@@ -656,7 +683,7 @@ pub async fn run(
     }
 
     for path in candidates {
-        if *probe.budget == 0 || Instant::now() >= probe.deadline {
+        if probe.spent() {
             break;
         }
         let Ok(endpoint) = base.join(&path) else {
@@ -687,7 +714,11 @@ pub async fn run(
     probe.flows().await;
     probe.forge_and_replay().await;
 
-    probe.hits
+    Outcome {
+        hits: probe.hits,
+        cut: probe.cut,
+        stopped: probe.stopped,
+    }
 }
 
 #[cfg(test)]

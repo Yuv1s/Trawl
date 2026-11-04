@@ -77,6 +77,19 @@ jobs:
       - name: Publish to the release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          make_latest: false
           files: |
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
+
+  # The installers fetch whatever is marked latest, so a release only gets that once every
+  # platform's binary is on it. One that fails to build, or never gets a runner, leaves them
+  # on the last complete release.
+  latest:
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark this release as the latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --latest

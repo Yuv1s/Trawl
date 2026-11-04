@@ -68,20 +68,20 @@ describe('WebRecon scanner version', () => {
 		});
 
 	it('warns about a scanner older than this page', async () => {
-		healthAnswering('0.1.1');
-		const view = await render(WebRecon, { onreset: vi.fn() });
-		unmount = view.unmount;
-
-		await expect.element(page.getByText(/missing security fixes/)).toBeVisible();
-	});
-
-	it('says nothing about a current scanner', async () => {
 		healthAnswering('0.1.2');
 		const view = await render(WebRecon, { onreset: vi.fn() });
 		unmount = view.unmount;
 
+		await expect.element(page.getByText(/this page expects 0\.1\.3/)).toBeVisible();
+	});
+
+	it('says nothing about a current scanner', async () => {
+		healthAnswering('0.1.3');
+		const view = await render(WebRecon, { onreset: vi.fn() });
+		unmount = view.unmount;
+
 		await expect.element(page.getByRole('heading', { name: 'Scanner connected' })).toBeVisible();
-		expect(document.body.textContent).not.toContain('missing security fixes');
+		expect(document.body.textContent).not.toContain('this page expects');
 	});
 });
 
