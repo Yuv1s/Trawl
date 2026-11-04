@@ -56,6 +56,19 @@
 	let connected = $state(false);
 	/** Whether the scanner will reach local and private targets, from /health. */
 	let localMode = $state(false);
+	let scannerVersion = $state<string | null>(null);
+
+	/** The scanner this page was built with. An older one lacks security fixes. */
+	const CURRENT_SCANNER = [0, 1, 2];
+
+	const outdated = $derived.by(() => {
+		if (!scannerVersion) return false;
+		const parts = scannerVersion.split('.').map(Number);
+		for (const [i, wanted] of CURRENT_SCANNER.entries()) {
+			if ((parts[i] ?? 0) !== wanted) return (parts[i] ?? 0) < wanted;
+		}
+		return false;
+	});
 	let copied = $state<CopyTarget | null>(null);
 	let copyError = $state<CopyTarget | null>(null);
 	let copyTimer: ReturnType<typeof setTimeout> | undefined;
@@ -82,7 +95,8 @@
 			});
 			connected = res.ok;
 			if (res.ok) {
-				const health = (await res.json()) as { allow_local?: boolean };
+				const health = (await res.json()) as { allow_local?: boolean; version?: string };
+				scannerVersion = health.version ?? null;
 				const nextLocalMode = health.allow_local === true;
 				if (nextLocalMode && localRefusal) scanError = null;
 				localMode = nextLocalMode;
@@ -185,6 +199,15 @@
 			return decodeURIComponent(seg) || u.hostname;
 		} catch {
 			return url;
+		}
+	}
+
+	/** Only web addresses become links, whatever the scanner's answer says. */
+	function webLink(url: string): string | undefined {
+		try {
+			return ['http:', 'https:'].includes(new URL(url).protocol) ? url : undefined;
+		} catch {
+			return undefined;
 		}
 	}
 
@@ -403,6 +426,14 @@
 				</p>
 			</div>
 
+			{#if outdated}
+				<p class="notice" role="status">
+					This scanner is version {scannerVersion}, which is missing security fixes. Stop it with
+					<span class="mono">Ctrl+C</span> and this page will show the line that installs the current
+					one.
+				</p>
+			{/if}
+
 			<form class="target" onsubmit={runScan} aria-busy={scanning}>
 				<label class="label" for="target-url">Target URL</label>
 				<input
@@ -511,7 +542,7 @@
 					<span class="mono">{r.target}</span>, {r.pages.length}
 					{r.pages.length === 1 ? 'page' : 'pages'} crawled.
 				</p>
-				{#each r.notices ?? [] as notice (notice)}
+				{#each r.notices ?? [] as notice, i (i)}
 					<p class="notice">{notice}</p>
 				{/each}
 
@@ -574,8 +605,11 @@
 								<p class="d-value mono flagged">{s.label}</p>
 								<p class="where">
 									Found on
-									<a href={s.source} target="_blank" rel="external noreferrer noopener" class="mono"
-										>{shortPath(s.source)}</a
+									<a
+										href={webLink(s.source)}
+										target="_blank"
+										rel="external noreferrer noopener"
+										class="mono">{shortPath(s.source)}</a
 									>
 								</p>
 								{#if s.note}
@@ -586,8 +620,11 @@
 								<pre class="d-block mono">{s.label}</pre>
 								<p class="where">
 									On
-									<a href={s.source} target="_blank" rel="external noreferrer noopener" class="mono"
-										>{shortPath(s.source)}</a
+									<a
+										href={webLink(s.source)}
+										target="_blank"
+										rel="external noreferrer noopener"
+										class="mono">{shortPath(s.source)}</a
 									>
 								</p>
 							{:else if s.kind === 'found'}
@@ -607,8 +644,11 @@
 										A file that responded at a guessed path. Nothing on the site links to it.
 									{/if}
 								</p>
-								<a class="open" href={s.id} target="_blank" rel="external noreferrer noopener"
-									>Open in a tab</a
+								<a
+									class="open"
+									href={webLink(s.id)}
+									target="_blank"
+									rel="external noreferrer noopener">Open in a tab</a
 								>
 							{:else if s.kind === 'page'}
 								<div class="d-head">
@@ -636,8 +676,11 @@
 										</ul>
 									</div>
 								{/if}
-								<a class="open" href={s.id} target="_blank" rel="external noreferrer noopener"
-									>Open in a tab</a
+								<a
+									class="open"
+									href={webLink(s.id)}
+									target="_blank"
+									rel="external noreferrer noopener">Open in a tab</a
 								>
 							{:else if s.kind === 'image'}
 								<span class="d-kind label">Image</span>
@@ -649,8 +692,11 @@
 									<button type="button" class="do" onclick={() => checkWithTrawl(s.id)}>
 										Check with Trawl
 									</button>
-									<a class="open" href={s.id} target="_blank" rel="external noreferrer noopener"
-										>Open</a
+									<a
+										class="open"
+										href={webLink(s.id)}
+										target="_blank"
+										rel="external noreferrer noopener">Open</a
 									>
 								</div>
 								<p class="hint">
@@ -661,8 +707,11 @@
 							{:else}
 								<span class="d-kind label">{s.kind}</span>
 								<p class="d-value mono">{s.kind === 'external' ? s.id : shortPath(s.id)}</p>
-								<a class="open" href={s.id} target="_blank" rel="external noreferrer noopener"
-									>Open</a
+								<a
+									class="open"
+									href={webLink(s.id)}
+									target="_blank"
+									rel="external noreferrer noopener">Open</a
 								>
 							{/if}
 						{:else}

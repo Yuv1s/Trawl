@@ -20,7 +20,6 @@ describe('repeated values from a file', () => {
 		const view = await render(SweepView, {
 			rows: [
 				{
-					key: 'rgb',
 					title: 'rgb',
 					chips: [],
 					reason: 'flag-shaped string',

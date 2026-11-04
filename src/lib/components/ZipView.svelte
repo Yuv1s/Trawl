@@ -1,5 +1,6 @@
 <script lang="ts">
-	import type { ZipArchive, ZipEntry, NestedArtifact, NestedAnalysis } from '$lib/worker/protocol';
+	import type { NestedAnalysis, NestedArtifact, ZipArchive, ZipEntry } from '$lib/worker/protocol';
+	import { firstOfEach, tally } from './tally';
 
 	let {
 		archive,
@@ -13,12 +14,24 @@
 		nested?: NestedAnalysis | null;
 	} = $props();
 
+	/** Rows drawn. An archive can list sixty-five thousand, and past a few hundred a table
+	 *  stops being something a person reads and starts being what freezes the tab. */
+	const ROWS_SHOWN = 500;
+	/** How many rows also show what the entry holds. */
+	const CONTENTS_SHOWN = 100;
+	/** Lines each kind of finding gets above the table. */
+	const FINDINGS_SHOWN = 50;
+
 	const listed = $derived(archive.entries.filter((e) => !e.undeclared).length);
 	const hidden = $derived(archive.entries.filter((e) => e.undeclared));
 	const locked = $derived(archive.entries.filter((e) => e.encrypted));
 	const arguing = $derived(archive.entries.filter((e) => e.disagreement !== null));
-	/** Entries whose decompressed content carried a flag shape. */
-	const carrying = $derived(archive.entries.filter((e) => (e.flags?.length ?? 0) > 0));
+
+	/** Every distinct flag the entries carried, with the first entry that had it. */
+	const carried = $derived(firstOfEach(archive.entries, (entry) => entry.flags));
+
+	/** Why entries were not opened, with how many of them for each reason. */
+	const unopened = $derived([...tally(archive.entries, (entry) => entry.notOpened).counts]);
 
 	/** Everything about the archive itself that a zip tool would not have written. */
 	const notes = $derived(
@@ -28,31 +41,50 @@
 			archive.trailing > 0 &&
 				`${archive.trailing.toLocaleString()} bytes follow the end of the directory, which no zip tool writes`,
 			archive.declared !== listed &&
-				`the directory says it holds ${archive.declared} but lists ${listed}`
+				`the directory says it holds ${archive.declared} but lists ${listed}`,
+			archive.capped &&
+				`Trawl stopped walking headers at ${archive.entries.length.toLocaleString()}, so this file may hold more than the directory lists`
 		].filter((note): note is string => typeof note === 'string')
 	);
 
 	const bytes = (n: number) => `${n.toLocaleString()} B`;
 	const hex = (n: number) => `0x${n.toString(16).padStart(6, '0')}`;
 
-	/** Find nested analysis matching this entry by name and/or offset. */
-	function nestedFor(entry: ZipEntry): NestedArtifact | undefined {
-		if (!nested) return undefined;
-		const walk = (roots: NestedArtifact[]): NestedArtifact | undefined => {
-			for (const child of roots) {
-				if (
-					child.source === 'zip' &&
-					(child.name === entry.name || child.offset === entry.offset)
-				) {
-					return child;
-				}
-				const deeper = walk(child.children);
-				if (deeper) return deeper;
-			}
-			return undefined;
-		};
-		return walk(nested.roots);
+	/** What the walk made of each entry, by where its header sits. */
+	const children = $derived(
+		new Map(
+			(nested?.roots ?? [])
+				.filter((child) => child.source === 'zip')
+				.map((child) => [child.offset, child])
+		)
+	);
+
+	function findingsCount(artifact: NestedArtifact): number {
+		let count = artifact.findings.length;
+		for (const child of artifact.children) count += findingsCount(child);
+		return count;
 	}
+
+	/** Found once per child, rather than walking its whole tree again for every row. */
+	const findingsOf = $derived(
+		new Map([...children].map(([offset, child]) => [offset, findingsCount(child)]))
+	);
+
+	const worthAlook = (entry: ZipEntry) =>
+		entry.undeclared ||
+		entry.disagreement !== null ||
+		(entry.flags?.length ?? 0) > 0 ||
+		(findingsOf.get(entry.offset) ?? 0) > 0;
+
+	/** The rows drawn. When they cannot all be, the ones with something to say go first. */
+	const rows = $derived(
+		archive.entries.length <= ROWS_SHOWN
+			? archive.entries
+			: [
+					...archive.entries.filter(worthAlook),
+					...archive.entries.filter((entry) => !worthAlook(entry))
+				].slice(0, ROWS_SHOWN)
+	);
 
 	function statusChip(status: 'analysed' | 'skipped' | 'error', reason?: string): string {
 		switch (status) {
@@ -64,36 +96,43 @@
 				return reason ? `error: ${reason}` : 'error';
 		}
 	}
-
-	function findingsCount(artifact: NestedArtifact): number {
-		let count = artifact.findings.length;
-		for (const child of artifact.children) count += findingsCount(child);
-		return count;
-	}
 </script>
 
 <div class="zip">
-	{#if hidden.length > 0 || arguing.length > 0 || notes.length > 0 || carrying.length > 0}
+	{#if hidden.length > 0 || arguing.length > 0 || notes.length > 0 || carried.length > 0}
 		<ul class="findings">
-			{#each carrying as entry, i (i)}
-				{#each new Set(entry.flags ?? []) as flag (flag)}
-					<li class="flagged">
-						<span class="mono big">{flag}</span>
-						<span class="muted"> inside <span class="mono">{entry.name}</span></span>
-					</li>
-				{/each}
+			{#each carried.slice(0, FINDINGS_SHOWN) as [flag, entry] (flag)}
+				<li class="flagged">
+					<span class="mono big">{flag}</span>
+					<span class="muted"> inside <span class="mono">{entry.name}</span></span>
+				</li>
 			{/each}
-			{#each hidden as entry, i (i)}
+			{#if carried.length > FINDINGS_SHOWN}
+				<li>Showing the first {FINDINGS_SHOWN} of {carried.length.toLocaleString()} flags.</li>
+			{/if}
+			{#each hidden.slice(0, FINDINGS_SHOWN) as entry, i (i)}
 				<li class="flagged">
 					<span class="mono">{entry.name}</span> is in the file but not in the directory, so no ordinary
 					reader will list it
 				</li>
 			{/each}
-			{#each arguing as entry, i (i)}
+			{#if hidden.length > FINDINGS_SHOWN}
+				<li>
+					Showing the first {FINDINGS_SHOWN} of {hidden.length.toLocaleString()} entries missing from
+					the directory.
+				</li>
+			{/if}
+			{#each arguing.slice(0, FINDINGS_SHOWN) as entry, i (i)}
 				<li class="flagged">
 					<span class="mono">{entry.name}</span>: {entry.disagreement}
 				</li>
 			{/each}
+			{#if arguing.length > FINDINGS_SHOWN}
+				<li>
+					Showing the first {FINDINGS_SHOWN} of {arguing.length.toLocaleString()} entries the two descriptions
+					disagree about.
+				</li>
+			{/if}
 			{#each notes as note (note)}
 				<li>{note}</li>
 			{/each}
@@ -105,6 +144,17 @@
 		</p>
 	{/if}
 
+	{#if unopened.length > 0}
+		<ul class="findings">
+			{#each unopened as [reason, count] (reason)}
+				<li>
+					{count.toLocaleString()}
+					{count === 1 ? 'entry' : 'entries'} not opened: {reason}
+				</li>
+			{/each}
+		</ul>
+	{/if}
+
 	{#if archive.comment}
 		<div class="comment">
 			<h3 class="label">Archive comment</h3>
@@ -114,9 +164,9 @@
 
 	<table>
 		<caption class="label"
-			>{archive.entries.length}
+			>{archive.entries.length.toLocaleString()}
 			{archive.entries.length === 1 ? 'entry' : 'entries'}{locked.length > 0
-				? `, ${locked.length} encrypted`
+				? `, ${locked.length.toLocaleString()} encrypted`
 				: ''}</caption
 		>
 		<thead>
@@ -130,7 +180,9 @@
 			</tr>
 		</thead>
 		<tbody>
-			{#each archive.entries as entry, i (i)}
+			{#each rows as entry, i (i)}
+				{@const child = children.get(entry.offset)}
+				{@const childFindings = findingsOf.get(entry.offset) ?? 0}
 				<tr class:odd={entry.undeclared || entry.disagreement !== null}>
 					<td>
 						<span class="mono name">{entry.name}</span>
@@ -155,14 +207,17 @@
 					<td class="mono num">{bytes(entry.uncompressed)}</td>
 					<td class="mono muted">{hex(entry.offset)}</td>
 					<td class="muted">
-						{#if nestedFor(entry)}
-							{@const child = nestedFor(entry)!}
-							<span class="chip">{statusChip(child.status, child.reason)}</span>
-							{#if findingsCount(child) > 0}
+						{#if child}
+							<span class="chip wraps">{statusChip(child.status, child.reason)}</span>
+							{#if childFindings > 0}
 								<span class="mono chip flagged"
-									>{findingsCount(child)} finding{findingsCount(child) === 1 ? '' : 's'}</span
+									>{childFindings} finding{childFindings === 1 ? '' : 's'}</span
 								>
 							{/if}
+						{:else if entry.notOpened}
+							<span class="muted">not opened: {entry.notOpened}</span>
+						{:else if (entry.readLength ?? entry.compressed) === 0}
+							<span class="muted">empty</span>
 						{:else}
 							<span class="muted">not analysed</span>
 						{/if}
@@ -173,7 +228,7 @@
 						<td colspan="6"><span class="label">comment</span> {entry.comment}</td>
 					</tr>
 				{/if}
-				{#if entry.text}
+				{#if entry.text && i < CONTENTS_SHOWN}
 					<tr class="aside">
 						<td colspan="6">
 							<div class="content-head">
@@ -186,17 +241,31 @@
 							<pre class="content mono">{entry.text}</pre>
 						</td>
 					</tr>
-				{:else if entry.readError}
+				{/if}
+				{#if entry.readError}
 					<tr class="aside">
 						<td colspan="6">
 							<span class="label">content</span>
-							<span class="muted">could not read: {entry.readError}</span>
+							<span class="muted">
+								{#if entry.flags}
+									read as far as it goes: {entry.readError}
+								{:else}
+									could not read: {entry.readError}
+								{/if}
+							</span>
 						</td>
 					</tr>
 				{/if}
 			{/each}
 		</tbody>
 	</table>
+
+	{#if archive.entries.length > rows.length}
+		<p class="capped label">
+			Showing the first {rows.length} of {archive.entries.length.toLocaleString()} entries, with anything
+			out of the ordinary moved to the top.
+		</p>
+	{/if}
 
 	{#if locked.length > 0}
 		<p class="footnote">
@@ -362,6 +431,17 @@
 	.chip.flagged {
 		color: var(--signal);
 		border-color: var(--signal);
+	}
+
+	/* A reason can run to a whole path, and the column is not worth the table's width. */
+	.chip.wraps {
+		white-space: normal;
+		overflow-wrap: anywhere;
+	}
+
+	.capped {
+		margin: 0;
+		color: var(--muted);
 	}
 
 	.footnote {

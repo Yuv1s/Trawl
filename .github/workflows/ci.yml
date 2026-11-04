@@ -14,10 +14,13 @@ jobs:
     name: WASM core
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@5059963b1731bf1580991b5f3b1eecfb5da406c0 # 1.98.0
+        with:
+          toolchain: 1.98.0
           targets: wasm32-unknown-unknown
 
       - name: Install wasm-pack
@@ -28,7 +31,7 @@ jobs:
       # The frontend imports $lib/wasm/trawl_core, which is generated from
       # trawl-core rather than committed. Building it once and passing it on
       # keeps every check that needs it from rebuilding the same thing.
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: wasm
           path: src/lib/wasm
@@ -39,15 +42,17 @@ jobs:
     needs: wasm
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           cache: npm
 
       - run: npm ci
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: wasm
           path: src/lib/wasm
@@ -62,15 +67,17 @@ jobs:
     needs: wasm
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           cache: npm
 
       - run: npm ci
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: wasm
           path: src/lib/wasm
@@ -84,14 +91,17 @@ jobs:
     name: Rust quality and tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       # Pinned rather than @stable on purpose: Clippy runs with -D warnings, and
       # each Rust release adds lints, so a floating toolchain would fail unrelated
       # PRs the day a new compiler ships. Bump this deliberately, fixing any new
       # lints in the same change.
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@5059963b1731bf1580991b5f3b1eecfb5da406c0 # 1.98.0
         with:
+          toolchain: 1.98.0
           components: clippy
 
       - name: Run Clippy
@@ -107,15 +117,18 @@ jobs:
     name: Production build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@5059963b1731bf1580991b5f3b1eecfb5da406c0 # 1.98.0
         with:
+          toolchain: 1.98.0
           targets: wasm32-unknown-unknown
 
       - run: npm ci
@@ -126,3 +139,5 @@ jobs:
       # works from a clean checkout, which is what a person actually runs.
       - name: Build the production site
         run: npm run build
+      - name: Check what the build exposes
+        run: npm run exposure

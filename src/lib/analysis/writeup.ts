@@ -10,7 +10,20 @@ import {
 
 type Analysis = Extract<AnalysisResponse, { status: 'ok' }>;
 
-const clean = (value: string) => value.replaceAll('\r', '').replaceAll('```', "''' ");
+/**
+ * A value from the file, as inert inline code.
+ *
+ * The file controls these strings. Left as plain Markdown they could add headings and
+ * links to the writeup, or images that phone home when it is viewed somewhere else.
+ */
+function clean(value: string): string {
+	const flat = value
+		.replace(/[\r\n]+/g, ' ')
+		.replaceAll('`', "'")
+		.trim();
+	return flat ? `\`${flat}\`` : "''";
+}
+
 const list = (items: string[]) => items.map((item) => `- ${item}`).join('\n');
 
 /** One line per embedded file, including the ones a budget stopped. */
@@ -20,9 +33,9 @@ function nestedArtifacts(roots: NestedArtifact[], path: string): string[] {
 		const here = path ? `${path} / ${artifact.name}` : artifact.name;
 		const status =
 			artifact.status === 'analysed'
-				? `analysed, ${artifact.findings.length} finding${artifact.findings.length === 1 ? '' : 's'} here`
-				: (artifact.reason ?? artifact.status);
-		out.push(`${here} (${status})`);
+				? `analysed, ${artifact.findings.length} finding${artifact.findings.length === 1 ? '' : 's'} here${artifact.damage ? `, ${clean(artifact.damage)}` : ''}`
+				: clean(artifact.reason ?? artifact.status);
+		out.push(`${clean(here)} (${status})`);
 		out.push(...nestedArtifacts(artifact.children, here));
 	}
 	return out;
@@ -61,10 +74,21 @@ export function writeupMarkdown(
 	}
 
 	const candidates = [
-		...flags.map((flag) => `${flag.text} (${flag.region}, offset 0x${flag.offset.toString(16)})`),
-		...derivedFlags.map((flag) => `${flag.text} (${flag.origin})`)
+		...flags.map(
+			(flag) => `${clean(flag.text)} (${clean(flag.region)}, offset 0x${flag.offset.toString(16)})`
+		),
+		...derivedFlags.map((flag) => `${clean(flag.text)} (${clean(flag.origin)})`)
 	];
 	sections.push('', '## Recovered candidates', candidates.length ? list(candidates) : 'None.');
+
+	// A writeup gets read without the page, so what the page warns about has to travel with it.
+	const limits = [
+		...analysis.crashed.map(
+			(reader) => `Trawl's ${reader} reader crashed on this file, so its results are missing.`
+		),
+		...(analysis.notes ?? [])
+	];
+	if (limits.length) sections.push('', '## What this does not cover', list(limits.map(clean)));
 
 	const findings: string[] = [];
 	const structure = analysis.structure;
@@ -74,13 +98,16 @@ export function writeupMarkdown(
 		);
 	for (const chunk of structure?.chunks ?? []) {
 		if (!chunk.crcOk)
-			findings.push(`CRC mismatch on ${chunk.kind} at 0x${chunk.offset.toString(16)}`);
+			findings.push(`CRC mismatch on ${clean(chunk.kind)} at 0x${chunk.offset.toString(16)}`);
 	}
 	if (structure?.ihdrRepair) {
 		const repair = structure.ihdrRepair;
 		findings.push(
 			`IHDR ${repair.field} recovers to ${repair.recoveredWidth} × ${repair.recoveredHeight} from stored CRC ${repair.targetCrc}`
 		);
+	}
+	for (const chunk of structure?.text ?? []) {
+		if (chunk.error) findings.push(`${clean(chunk.kind)} chunk: ${clean(chunk.error)}`);
 	}
 	for (const hit of analysis.survey.magic.filter((item) => item.embedded)) {
 		findings.push(`Embedded ${hit.label}, ${hit.length} bytes at 0x${hit.offset.toString(16)}`);
@@ -95,13 +122,13 @@ export function writeupMarkdown(
 
 	const metadata = (analysis.survey.exif ?? [])
 		.filter((entry) => entry.value.trim())
-		.map((entry) => `${entry.name}: ${clean(entry.value)}`);
+		.map((entry) => `${clean(entry.name)}: ${clean(entry.value)}`);
 	sections.push('', '## Metadata', metadata.length ? list(metadata) : 'No EXIF metadata.');
 
 	const stego: string[] = [];
 	for (const candidate of analysis.sweep?.candidates ?? [])
 		stego.push(
-			`Pixel LSB ${candidate.channels}, bit ${candidate.bit}, ${candidate.msbFirst ? 'MSB' : 'LSB'} first: ${clean(candidate.reason)}`
+			`Pixel LSB ${candidate.channels}, bit ${candidate.bit}, ${candidate.msbFirst ? 'MSB' : 'LSB'} first${candidate.columnMajor ? ', by column' : ''}: ${clean(candidate.reason)}`
 		);
 	if (analysis.chi?.detected)
 		stego.push(
@@ -129,7 +156,7 @@ export function writeupMarkdown(
 	const archive: string[] = [];
 	for (const entry of analysis.zip?.entries ?? []) {
 		archive.push(
-			`${entry.name}: ${entry.uncompressed.toLocaleString()} bytes, ${entry.method}${entry.undeclared ? ', not in directory' : ''}${entry.disagreement ? `, ${entry.disagreement}` : ''}`
+			`${clean(entry.name)}: ${entry.uncompressed.toLocaleString()} bytes, ${entry.method}${entry.undeclared ? ', not in directory' : ''}${entry.disagreement ? `, ${clean(entry.disagreement)}` : ''}${entry.readError ? `, ${clean(entry.readError)}` : ''}${entry.notOpened ? `, not opened: ${clean(entry.notOpened)}` : ''}`
 		);
 	}
 	sections.push(
@@ -141,14 +168,21 @@ export function writeupMarkdown(
 	const pdf = analysis.pdf;
 	if (pdf) {
 		const lines = [
-			`PDF ${pdf.version}, ${pdf.objects.length} objects, ${pdf.revisions} revision${pdf.revisions === 1 ? '' : 's'}`
+			`PDF ${clean(pdf.version)}, ${pdf.objects.length} objects, ${pdf.revisions} revision${pdf.revisions === 1 ? '' : 's'}`
 		];
 		for (const object of pdf.objects.filter((o) => o.orphaned))
 			lines.push(
 				`Object ${object.number} ${object.generation} is not in the cross-reference table`
 			);
+		for (const object of pdf.objects) {
+			if (object.stream?.error)
+				lines.push(
+					`Object ${object.number} ${object.generation} stream: ${clean(object.stream.error)}`
+				);
+		}
 		if (pdf.trailing > 0) lines.push(`${pdf.trailing} bytes after the last %%EOF`);
 		if (pdf.encrypted) lines.push('Password protected');
+		if (pdf.xrefUnread) lines.push('The cross-reference table could not be read');
 		if (pdf.embeddedFiles.length > 0) lines.push(`${pdf.embeddedFiles.length} attached files`);
 		sections.push('', '## PDF', list(lines));
 	}
@@ -202,7 +236,7 @@ export function writeupMarkdown(
 			lines.push(`DNS questions: ${pcap.dns.map((query) => clean(query.name)).join(', ')}`);
 		for (const stream of pcap.streams) {
 			if (stream.embeddedFile)
-				lines.push(`${stream.src} to ${stream.dst} carries a ${stream.embeddedFile}`);
+				lines.push(`${clean(stream.src)} to ${clean(stream.dst)} carries a ${stream.embeddedFile}`);
 		}
 		sections.push('', '## Network capture', list(lines));
 	}

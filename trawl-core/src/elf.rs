@@ -89,6 +89,11 @@ const MAX_SECTION_NAME: usize = 256;
 /// million.
 const MAX_SYMBOLS_WALKED: usize = 1 << 22;
 
+/// Bytes of symbol name read across every table. What a walk costs is its names, and
+/// four million of them at the longest kept is sixteen gigabytes out of a 28 KB file. A
+/// real symbol table runs to tens of megabytes, mangled C++ and all.
+const MAX_NAME_BYTES: usize = 256 << 20;
+
 /// A file offset or size from the headers. Those are 64 bits wide in a 64-bit file,
 /// and cast down to a WASM `usize` they keep their low half and point somewhere real.
 /// Saturated instead, so a value too large to address fails the bounds checks it
@@ -295,6 +300,8 @@ pub fn read(data: &[u8]) -> Option<Binary> {
     let mut canary = false;
     let mut fortify = false;
     let mut symbols_left = MAX_SYMBOLS_WALKED;
+    let mut name_bytes_left = MAX_NAME_BYTES;
+    let mut symbols_capped = false;
 
     // Both symbol tables are walked, not just the dynamic one: a statically
     // linked binary has no `.dynsym` at all, and its guard symbols live in
@@ -309,7 +316,8 @@ pub fn read(data: &[u8]) -> Option<Binary> {
         let count = address(table.size) / stride;
 
         for index in 0..count {
-            if symbols_left == 0 {
+            if symbols_left == 0 || name_bytes_left == 0 {
+                symbols_capped = true;
                 break;
             }
             symbols_left -= 1;
@@ -332,6 +340,7 @@ pub fn read(data: &[u8]) -> Option<Binary> {
             let Some(name) = string_at(data, strings, name_offset) else {
                 continue;
             };
+            name_bytes_left = name_bytes_left.saturating_sub(name.len());
             if name.is_empty() {
                 continue;
             }
@@ -418,6 +427,7 @@ pub fn read(data: &[u8]) -> Option<Binary> {
         exports,
         import_count,
         export_count,
+        symbols_capped,
     })
 }
 

@@ -176,7 +176,13 @@ fn prefix_end(total: usize, step: usize, steps: usize) -> usize {
 /// @param samples 8-bit values in the order an embedder would traverse them
 /// @param steps how many prefixes to evaluate
 pub fn sweep(samples: &[u8], steps: usize) -> Vec<Point> {
-    if samples.is_empty() || steps == 0 {
+    sweep_over(samples.iter().copied(), samples.len(), steps)
+}
+
+/// The same sweep over samples that need not sit in one buffer, since a copy of a large
+/// image's samples is a third of a gigabyte that gets read once.
+pub fn sweep_over(mut samples: impl Iterator<Item = u8>, length: usize, steps: usize) -> Vec<Point> {
+    if length == 0 || steps == 0 {
         return Vec::new();
     }
 
@@ -185,15 +191,15 @@ pub fn sweep(samples: &[u8], steps: usize) -> Vec<Point> {
     let mut cursor = 0usize;
 
     for step in 1..=steps {
-        let end = prefix_end(samples.len(), step, steps);
-        for &value in &samples[cursor..end] {
+        let end = prefix_end(length, step, steps);
+        for value in samples.by_ref().take(end - cursor) {
             histogram[value as usize] += 1;
         }
         cursor = end;
 
         let (chi_square, degrees) = statistic(&histogram);
         points.push(Point {
-            fraction: end as f32 / samples.len() as f32,
+            fraction: end as f32 / length as f32,
             samples: end,
             chi_square: chi_square as f32,
             degrees,

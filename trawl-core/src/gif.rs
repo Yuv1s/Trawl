@@ -19,7 +19,6 @@ pub enum GifError {
     BadCode,
     DimensionOverflow,
     ZeroDimension,
-    FrameLimit,
     WorkLimit,
 }
 
@@ -32,7 +31,6 @@ impl fmt::Display for GifError {
             Self::BadCode => write!(f, "the compressed data contains an impossible code"),
             Self::DimensionOverflow => write!(f, "frame dimensions overflow logical screen"),
             Self::ZeroDimension => write!(f, "the header declares a zero width or height"),
-            Self::FrameLimit => write!(f, "too many frames for automatic analysis"),
             Self::WorkLimit => write!(f, "the canvas is larger than Trawl will composite"),
         }
     }
@@ -102,6 +100,10 @@ struct Parsed {
     global_palette: Vec<[u8; 3]>,
     background: Option<[u8; 3]>,
     frames: Vec<FrameInfo>,
+    /// Image descriptors counted, which runs on past the frames kept.
+    declared: usize,
+    /// What stopped the walk before the trailer, when frames had already been read.
+    damage: Option<GifError>,
 }
 
 fn u16_at(file: &[u8], at: usize) -> Option<usize> {
@@ -242,6 +244,10 @@ fn lzw(min_code_size: u8, data: &[u8], limit: usize) -> Result<Vec<u8>, GifError
 
 /// Parses the header and every frame descriptor in one pass, associating each
 /// Graphic Control Extension with the image right after it.
+///
+/// A viewer shows the frames it has read when the rest is cut off or makes no sense, so
+/// those are kept, with what stopped the walk. Only a file with no frame to show is
+/// refused.
 fn parse(file: &[u8]) -> Result<Parsed, GifError> {
     if !has_signature(file) {
         return Err(GifError::NotGif);
@@ -269,8 +275,40 @@ fn parse(file: &[u8]) -> Result<Parsed, GifError> {
         None
     };
 
-    let mut at = 13 + global_entries * 3;
     let mut frames = Vec::new();
+    let mut declared = 0usize;
+    let walked = walk_blocks(
+        file,
+        13 + global_entries * 3,
+        (screen_width, screen_height),
+        &mut frames,
+        &mut declared,
+    );
+
+    match (frames.len(), walked) {
+        (0, Err(error)) => Err(error),
+        (0, Ok(())) => Err(GifError::NoImage),
+        (_, walked) => Ok(Parsed {
+            screen_width,
+            screen_height,
+            global_palette,
+            background,
+            frames,
+            declared,
+            damage: walked.err(),
+        }),
+    }
+}
+
+/// Reads blocks up to the trailer, keeping the first [`MAX_FRAMES`] images and counting
+/// the rest. Nothing past those can be composited, so holding on to them only costs.
+fn walk_blocks(
+    file: &[u8],
+    mut at: usize,
+    (screen_width, screen_height): (usize, usize),
+    frames: &mut Vec<FrameInfo>,
+    declared: &mut usize,
+) -> Result<(), GifError> {
     let mut pending_gce: Option<(Option<u8>, u16, u8)> = None;
 
     while let Some(&marker) = file.get(at) {
@@ -291,13 +329,7 @@ fn parse(file: &[u8]) -> Result<Parsed, GifError> {
                 at = next;
             }
             0x2c => {
-                if frames.len() >= MAX_FRAMES * 2 {
-                    // The parser accepts a larger number so that a valid animation
-                    // over the work budget is reported as capped by compose(),
-                    // not rejected as malformed. The hard ceiling prevents
-                    // absurd allocations in the frame vector.
-                    return Err(GifError::FrameLimit);
-                }
+                *declared += 1;
 
                 let left = u16_at(file, at + 1).ok_or(GifError::Truncated)?;
                 let top = u16_at(file, at + 3).ok_or(GifError::Truncated)?;
@@ -314,15 +346,21 @@ fn parse(file: &[u8]) -> Result<Parsed, GifError> {
                 } else {
                     0
                 };
+
+                let local_bytes = local_entries * 3;
+                let code_at = at + 10 + local_bytes;
+                let min_code_size = *file.get(code_at).ok_or(GifError::Truncated)?;
+
+                if frames.len() >= MAX_FRAMES {
+                    at = skip_sub_blocks(file, code_at + 1).ok_or(GifError::Truncated)?;
+                    continue;
+                }
+
                 let local_palette = if local_entries > 0 {
                     Some(colour_table(file, at + 10, local_entries))
                 } else {
                     None
                 };
-
-                let local_bytes = local_entries * 3;
-                let code_at = at + 10 + local_bytes;
-                let min_code_size = *file.get(code_at).ok_or(GifError::Truncated)?;
                 let (data, next) = sub_blocks(file, code_at + 1).ok_or(GifError::Truncated)?;
 
                 let (transparent, delay, disposal) = pending_gce.take().unwrap_or((None, 0, 0));
@@ -348,16 +386,7 @@ fn parse(file: &[u8]) -> Result<Parsed, GifError> {
         }
     }
 
-    match frames.len() {
-        0 => Err(GifError::NoImage),
-        _ => Ok(Parsed {
-            screen_width,
-            screen_height,
-            global_palette,
-            background,
-            frames,
-        }),
-    }
+    Ok(())
 }
 
 /// Paints frames onto the canvas in order, keeping each result.
@@ -371,6 +400,7 @@ fn compose(parsed: &Parsed, frame_limit: usize) -> Result<List, GifError> {
         global_palette,
         background,
         frames,
+        ..
     } = parsed;
     let global_palette = global_palette.as_slice();
     // Sixty-five thousand squared fits 32 bits, and that times four does not.
@@ -384,6 +414,7 @@ fn compose(parsed: &Parsed, frame_limit: usize) -> Result<List, GifError> {
         displayed: Vec::new(),
         differences: Vec::new(),
         timings: Vec::new(),
+        broken: None,
     };
     let mut canvas = vec![0u8; canvas_size];
     if let Some([r, g, b]) = background {
@@ -405,6 +436,17 @@ fn compose(parsed: &Parsed, frame_limit: usize) -> Result<List, GifError> {
         if total > MAX_COMPOSITED_PIXELS {
             break;
         }
+
+        // Inside the canvas, as `parse` checked, so inside the canvas budget too.
+        let pixels = frame.width * frame.height;
+        let indices = match lzw(frame.min_code_size, &frame.data, pixels) {
+            Ok(indices) => indices,
+            Err(error) => {
+                list.broken = Some(error);
+                break;
+            }
+        };
+
         list.timings.push(Timing {
             delay: frame.delay,
             disposal: frame.disposal,
@@ -414,10 +456,6 @@ fn compose(parsed: &Parsed, frame_limit: usize) -> Result<List, GifError> {
 
         // Keep the pre-frame canvas for disposal 3, and only for disposal 3.
         let saved = (frame.disposal == 3).then(|| canvas.clone());
-
-        // Inside the canvas, as `parse` checked, so inside the canvas budget too.
-        let pixels = frame.width * frame.height;
-        let indices = lzw(frame.min_code_size, &frame.data, pixels)?;
 
         let width = *w;
         for row in 0..frame.height {
@@ -501,6 +539,8 @@ struct List {
     displayed: Vec<Vec<u8>>,
     differences: Vec<Vec<u8>>,
     timings: Vec<Timing>,
+    /// What stopped the frames short, when one could not be decoded.
+    broken: Option<GifError>,
 }
 
 impl List {
@@ -509,7 +549,7 @@ impl List {
             width: parsed.screen_width,
             height: parsed.screen_height,
             frames: self.timings.len(),
-            declared_frames: parsed.frames.len(),
+            declared_frames: parsed.declared,
             interlaced: false,
             palette_entries: parsed.global_palette.len(),
             timings: core::mem::take(&mut self.timings),
@@ -528,7 +568,10 @@ type DecodedFrames = (Header, Vec<Vec<u8>>, Vec<Vec<u8>>, bool);
 pub fn decode_frames(file: &[u8]) -> Result<DecodedFrames, GifError> {
     let parsed = parse(file)?;
     let mut list = compose(&parsed, MAX_FRAMES)?;
-    let capped = list.timings.len() < parsed.frames.len();
+    if let Some(error) = list.broken {
+        return Err(error);
+    }
+    let capped = list.timings.len() < parsed.declared;
 
     let header = list.header(&parsed);
     Ok((header, list.displayed, list.differences, capped))
@@ -540,7 +583,7 @@ pub fn decode_frames(file: &[u8]) -> Result<DecodedFrames, GifError> {
 pub fn decode(file: &[u8]) -> Result<(Header, Vec<u8>), GifError> {
     let parsed = parse(file)?;
     let mut list = compose(&parsed, 1)?;
-    let first = list.displayed.pop().ok_or(GifError::NoImage)?;
+    let first = list.displayed.pop().ok_or(list.broken.unwrap_or(GifError::NoImage))?;
     Ok((list.header(&parsed), first))
 }
 
@@ -592,7 +635,19 @@ pub fn analysis_json(file: &[u8], tags: &[String], max_bytes: usize, chi_steps: 
     }
 
     let mut out = String::from("{");
-    let (header, frames, differences, capped) = match decode_frames(file) {
+    let read = parse(file).and_then(|parsed| {
+        let mut list = compose(&parsed, MAX_FRAMES)?;
+        // A broken frame ends the walk, and the frames before it are as good as they were.
+        let stopped = list.broken.or(parsed.damage);
+        if list.displayed.is_empty() {
+            return Err(stopped.unwrap_or(GifError::NoImage));
+        }
+        let capped = list.timings.len() < parsed.declared;
+        let header = list.header(&parsed);
+        Ok((header, list.displayed, list.differences, capped, stopped))
+    });
+
+    let (header, frames, differences, capped, stopped) = match read {
         Ok(decoded) => decoded,
         Err(error) => {
             push_number(&mut out, "width", u16_at(file, 6).unwrap_or(0));
@@ -607,6 +662,8 @@ pub fn analysis_json(file: &[u8], tags: &[String], max_bytes: usize, chi_steps: 
             out.push(',');
             push_field(&mut out, "error", &error.to_string());
             out.push(',');
+            push_string(&mut out, "stopped");
+            out.push_str(":null,");
             push_string(&mut out, "sources");
             out.push_str(":[]}");
             return out;
@@ -625,6 +682,14 @@ pub fn analysis_json(file: &[u8], tags: &[String], max_bytes: usize, chi_steps: 
     out.push(',');
     push_string(&mut out, "error");
     out.push_str(":null,");
+    match stopped {
+        Some(error) => push_field(&mut out, "stopped", &error.to_string()),
+        None => {
+            push_string(&mut out, "stopped");
+            out.push_str(":null");
+        }
+    }
+    out.push(',');
     push_string(&mut out, "sources");
     out.push_str(":[");
 

@@ -54,6 +54,14 @@ const MAX_BLOCKS: usize = 1 << 21;
 /// block for a few bytes of entropy data, so a file of nothing else is a hang.
 const MAX_SCANS: usize = 128;
 
+/// Most times the scans may visit a block between them, which is what they cost.
+///
+/// An end-of-band run covers thirty thousand blocks with fifteen bits, so what a scan
+/// walks has nothing to do with the bytes it holds, and a refinement scan reads the whole
+/// band of every block it visits. Two million blocks over a dozen scans is the most a
+/// real photograph asks for, and it fits this with room left.
+const MAX_BLOCK_VISITS: usize = 1 << 25;
+
 /// Largest magnitude category a DC table can name. Larger is a corrupt table, and
 /// reading that many bits into a 32-bit value means nothing.
 const MAX_CATEGORY: u32 = 16;
@@ -507,6 +515,7 @@ fn decode_scan(
     restart_interval: usize,
     order: &mut Vec<(usize, usize)>,
     record_order: bool,
+    visits_left: &mut usize,
 ) -> Result<bool, DctError> {
     let interleaved = header.components.len() > 1;
 
@@ -558,6 +567,11 @@ fn decode_scan(
             if at >= planes[index].blocks.len() {
                 continue;
             }
+
+            if *visits_left == 0 {
+                return Ok(true);
+            }
+            *visits_left -= 1;
 
             let (_, dc_slot, ac_slot) = header.components[slot];
 
@@ -793,14 +807,14 @@ fn nudge(coefficient: &mut i32, plus: i32, minus: i32) {
     *coefficient = coefficient.wrapping_add(if *coefficient >= 0 { plus } else { minus });
 }
 
-/// Blocks a frame's planes will hold, once that is known to be a number a file of
-/// this length could justify.
+/// Blocks a frame's planes will hold, once that is known to be a number the file's scans
+/// could justify.
 ///
 /// Every block takes at least one bit of entropy data, whichever way it is coded, so
-/// a frame with more blocks than the file has bits is not a truncated image. It is a
+/// a frame with more blocks than the scans have bits is not a truncated image. It is a
 /// 17-byte file asking for seventeen gigabytes. A block count that does not fit a
 /// `usize` is the same claim, in the form that wraps in WASM.
-fn check_block_count(frame: &Frame, mcus_across: usize, mcus_down: usize, file_len: usize) -> Result<(), DctError> {
+fn check_block_count(frame: &Frame, mcus_across: usize, mcus_down: usize, coded_bytes: usize) -> Result<(), DctError> {
     let total = frame.components.iter().try_fold(0usize, |sum, c| {
         let across = mcus_across.checked_mul(c.horizontal)?;
         let down = mcus_down.checked_mul(c.vertical)?;
@@ -808,9 +822,23 @@ fn check_block_count(frame: &Frame, mcus_across: usize, mcus_down: usize, file_l
     });
 
     match total {
-        Some(blocks) if blocks <= MAX_BLOCKS && blocks <= file_len.saturating_mul(8) => Ok(()),
+        Some(blocks) if blocks <= MAX_BLOCKS && blocks <= coded_bytes.saturating_mul(8) => Ok(()),
         _ => Err(DctError::TooLarge),
     }
+}
+
+/// Bytes of entropy-coded data across every scan, which is all a block count can be held
+/// against. A comment segment can pad a file to any length and code nothing.
+fn entropy_bytes(walked: &[Segment], file_len: usize) -> Option<usize> {
+    let scans = walked.iter().enumerate().filter(|(_, s)| s.marker == 0xda);
+
+    let mut total = None;
+    for (i, scan) in scans {
+        let start = scan.data_offset + scan.length;
+        let end = walked.get(i + 1).map_or(file_len, |next| next.offset);
+        total = Some(total.unwrap_or(0) + end.saturating_sub(start));
+    }
+    total
 }
 
 /// Decodes every scan into quantized coefficients.
@@ -820,6 +848,10 @@ pub fn coefficients(file: &[u8]) -> Result<Coefficients, DctError> {
     }
 
     let walked = segments(file);
+    // With no scan there is nothing to hold the frame against but the file, and nothing
+    // to allocate blocks for either.
+    let coded = entropy_bytes(&walked, file.len());
+    let mut visits_left = MAX_BLOCK_VISITS;
 
     let mut quant = [[0u16; 64]; 4];
     let mut dc_tables: [Option<Huffman>; 4] = Default::default();
@@ -843,22 +875,24 @@ pub fn coefficients(file: &[u8]) -> Result<Coefficients, DctError> {
                 let v_max = read.components.iter().map(|c| c.vertical).max().unwrap();
                 let mcus_across = read.width.div_ceil(8 * h_max);
                 let mcus_down = read.height.div_ceil(8 * v_max);
-                check_block_count(&read, mcus_across, mcus_down, file.len())?;
+                check_block_count(&read, mcus_across, mcus_down, coded.unwrap_or(file.len()))?;
 
-                planes = read
-                    .components
-                    .iter()
-                    .map(|c| {
-                        let stride = mcus_across * c.horizontal;
-                        let rows = mcus_down * c.vertical;
-                        Plane {
-                            stride,
-                            across: (read.width * c.horizontal).div_ceil(8 * h_max),
-                            down: (read.height * c.vertical).div_ceil(8 * v_max),
-                            blocks: vec![[0i32; 64]; stride * rows],
-                        }
-                    })
-                    .collect();
+                if coded.is_some() {
+                    planes = read
+                        .components
+                        .iter()
+                        .map(|c| {
+                            let stride = mcus_across * c.horizontal;
+                            let rows = mcus_down * c.vertical;
+                            Plane {
+                                stride,
+                                across: (read.width * c.horizontal).div_ceil(8 * h_max),
+                                down: (read.height * c.vertical).div_ceil(8 * v_max),
+                                blocks: vec![[0i32; 64]; stride * rows],
+                            }
+                        })
+                        .collect();
+                }
 
                 frame = Some(read);
             }
@@ -872,7 +906,7 @@ pub fn coefficients(file: &[u8]) -> Result<Coefficients, DctError> {
 
                 // What the scans so far wrote is still worth reading, and no less
                 // honest than a file that was cut short.
-                if scans >= MAX_SCANS {
+                if scans >= MAX_SCANS || visits_left == 0 {
                     truncated = true;
                     break;
                 }
@@ -922,6 +956,7 @@ pub fn coefficients(file: &[u8]) -> Result<Coefficients, DctError> {
                     restart_interval,
                     &mut order,
                     record,
+                    &mut visits_left,
                 )?;
 
                 scans += 1;
@@ -938,23 +973,26 @@ pub fn coefficients(file: &[u8]) -> Result<Coefficients, DctError> {
         return Err(DctError::Unsupported("sample precision other than 8 bits"));
     }
 
-    // Drop the MCU overhang, so what comes out is exactly the image's blocks.
+    // Drop the MCU overhang, so what comes out is exactly the image's blocks. In place,
+    // since at the sizes a frame can reach a second copy of them is half a gigabyte.
     let mut trimmed: Vec<Vec<Block>> = Vec::with_capacity(planes.len());
     let mut remap: Vec<Vec<usize>> = Vec::with_capacity(planes.len());
 
-    for plane in &planes {
-        let mut blocks = Vec::with_capacity(plane.across * plane.down);
+    for mut plane in planes {
         let mut indices = vec![usize::MAX; plane.blocks.len()];
+        let mut kept = 0usize;
 
         for row in 0..plane.down {
+            let start = row * plane.stride;
+            plane.blocks.copy_within(start..start + plane.across, kept);
             for col in 0..plane.across {
-                let at = row * plane.stride + col;
-                indices[at] = blocks.len();
-                blocks.push(plane.blocks[at]);
+                indices[start + col] = kept + col;
             }
+            kept += plane.across;
         }
 
-        trimmed.push(blocks);
+        plane.blocks.truncate(kept);
+        trimmed.push(plane.blocks);
         remap.push(indices);
     }
 

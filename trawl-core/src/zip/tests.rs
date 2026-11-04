@@ -121,6 +121,60 @@ fn an_offset_at_the_top_of_the_address_space_is_not_a_signature() {
 }
 
 #[test]
+fn looking_for_descriptors_stays_a_single_pass() {
+    // Headers past the walk's limit, then a run of descriptor signatures, with a directory
+    // naming every one past the limit, each of which looked through all the signatures.
+    const PAST_THE_LIMIT: usize = 20_000;
+
+    let header = |out: &mut Vec<u8>| {
+        out.extend_from_slice(b"PK\x03\x04");
+        push16(out, 20);
+        push16(out, 8);
+        out.extend_from_slice(&[0; 18]);
+        push16(out, 1);
+        push16(out, 0);
+        out.push(b'a');
+    };
+
+    let mut file = Vec::new();
+    for _ in 0..MAX_ENTRIES {
+        header(&mut file);
+    }
+    let first_past = file.len();
+    for _ in 0..PAST_THE_LIMIT {
+        header(&mut file);
+    }
+    file.extend_from_slice(&b"PK\x07\x08".repeat(1 << 18));
+
+    let directory = file.len();
+    for index in 0..PAST_THE_LIMIT {
+        file.extend_from_slice(b"PK\x01\x02");
+        file.extend_from_slice(&[0; 2]);
+        push16(&mut file, 20);
+        push16(&mut file, 8);
+        file.extend_from_slice(&[0; 18]);
+        push16(&mut file, 1);
+        file.extend_from_slice(&[0; 12]);
+        push32(&mut file, (first_past + index * 31) as u32);
+        file.push(b'a');
+    }
+    let size = file.len() - directory;
+    file.extend_from_slice(b"PK\x05\x06");
+    file.extend_from_slice(&[0; 4]);
+    push16(&mut file, PAST_THE_LIMIT as u16);
+    push16(&mut file, PAST_THE_LIMIT as u16);
+    push32(&mut file, size as u32);
+    push32(&mut file, directory as u32);
+    push16(&mut file, 0);
+
+    let started = std::time::Instant::now();
+    let archive = read(&file).unwrap();
+
+    assert!(archive.entries.len() >= PAST_THE_LIMIT);
+    assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+}
+
+#[test]
 fn reads_an_ordinary_archive() {
     let archive = read(&plain()).expect("not read as an archive");
 
@@ -511,6 +565,200 @@ fn a_size_claimed_for_compressed_data_does_not_hide_what_follows_it() {
     file[18..22].copy_from_slice(&claim);
     file[directory + 10..directory + 12].copy_from_slice(&8u16.to_le_bytes());
     file[directory + 20..directory + 24].copy_from_slice(&claim);
+
+    let archive = read(&file).unwrap();
+    let hidden = archive.entries.iter().find(|e| e.name == ".hidden.txt");
+    assert!(hidden.is_some_and(|e| e.undeclared), "{:?}", archive.entries);
+}
+
+/// Where the only local header's two sizes sit, for a test to overwrite them.
+const LOCAL_COMPRESSED: usize = 18;
+const LOCAL_UNCOMPRESSED: usize = 22;
+
+fn with_local_sizes(claim: u32) -> Vec<u8> {
+    let mut file = build(&[Put::new("x.txt", b"flag{the_real_one}")], b"", b"", b"");
+    file[LOCAL_COMPRESSED..LOCAL_COMPRESSED + 4].copy_from_slice(&claim.to_le_bytes());
+    file[LOCAL_UNCOMPRESSED..LOCAL_UNCOMPRESSED + 4].copy_from_slice(&claim.to_le_bytes());
+    file
+}
+
+#[test]
+fn the_directory_settles_what_a_cleared_or_stretched_local_header_says() {
+    // Python reads the directory, so these open for it, and they never opened here.
+    for claim in [0u32, 0xffff_ffff] {
+        let archive = read(&with_local_sizes(claim)).unwrap();
+        let entry = &archive.entries[0];
+
+        assert_eq!(entry.compressed, 18, "claim {claim:#x}");
+        assert_eq!(entry.uncompressed, 18, "claim {claim:#x}");
+        assert_eq!(entry.read_length, 18, "claim {claim:#x}");
+        assert!(entry.disagreement.is_some(), "it is still worth saying they differ");
+        assert!(!entry.undeclared);
+    }
+}
+
+#[test]
+fn the_longer_of_two_possible_claims_is_what_gets_read() {
+    // The directory says four bytes and the header ten, and both could be true. Reading
+    // the longer costs six bytes, and the shorter could cost the flag.
+    let mut lying = Put::new("payload.bin", b"0123456789");
+    lying.lie = Some(4);
+    let archive = read(&build(&[lying], b"", b"", b"")).unwrap();
+    assert_eq!(archive.entries[0].compressed, 4);
+    assert_eq!(archive.entries[0].read_length, 10);
+}
+
+#[test]
+fn a_directory_stretched_past_the_end_leaves_the_header_to_say() {
+    let mut file = build(&[Put::new("a.txt", b"flag{real}")], b"", b"", b"");
+    let directory = bytes::find(&file, 0, CENTRAL).unwrap();
+    file[directory + 20..directory + 24].copy_from_slice(&0xffff_fff8u32.to_le_bytes());
+
+    let archive = read(&file).unwrap();
+    assert_eq!(archive.entries[0].read_length, 10);
+}
+
+#[test]
+fn nothing_fitting_reads_as_far_as_the_next_header() {
+    let mut file = build(
+        &[
+            Put {
+                listed: false,
+                ..Put::new("a.txt", b"flag{real}")
+            },
+            Put {
+                listed: false,
+                ..Put::new("b.txt", b"next")
+            },
+        ],
+        b"",
+        b"",
+        b"",
+    );
+    file[LOCAL_COMPRESSED..LOCAL_COMPRESSED + 4].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+
+    let archive = read(&file).unwrap();
+    assert_eq!(archive.entries[0].read_length, 10);
+    assert_eq!(archive.entries[1].read_length, 4);
+}
+
+#[test]
+fn an_empty_file_is_not_read_to_the_next_header() {
+    let archive = read(&build(
+        &[Put::new("empty/", b""), Put::new("b.txt", b"next")],
+        b"",
+        b"",
+        b"",
+    ))
+    .unwrap();
+    assert_eq!(archive.entries[0].read_length, 0);
+    assert_eq!(archive.entries[1].read_length, 4);
+}
+
+#[test]
+fn a_compressed_size_of_zero_with_something_inside_is_read_anyway() {
+    // Both places call it zero bytes stored and eighteen bytes when opened.
+    let mut file = build(&[Put::new("x.txt", b"flag{the_real_one}")], b"", b"", b"");
+    let directory = bytes::find(&file, 0, CENTRAL).unwrap();
+    file[LOCAL_COMPRESSED..LOCAL_COMPRESSED + 4].copy_from_slice(&0u32.to_le_bytes());
+    file[directory + 20..directory + 24].copy_from_slice(&0u32.to_le_bytes());
+
+    let entry = &read(&file).unwrap().entries[0];
+    assert_eq!(entry.compressed, 0);
+    assert_eq!(entry.read_length, file.len() - entry.data_offset.unwrap());
+}
+
+#[test]
+fn a_streamed_entry_with_no_sizes_anywhere_reads_to_what_follows() {
+    let mut file = streamed("flag.txt", b"flag{streamed}", false, false);
+    // No descriptor signature and no directory, so nothing says how long it is.
+    let end = bytes::find(&file, 0, END).unwrap();
+    file.truncate(end);
+
+    let archive = read(&file).unwrap();
+    let entry = &archive.entries[0];
+    assert_eq!(entry.compressed, 0);
+    assert_eq!(entry.read_length, file.len() - entry.data_offset.unwrap());
+}
+
+#[test]
+fn the_directorys_method_is_used_and_the_headers_is_kept() {
+    let mut file = build(&[Put::new("x.txt", b"data")], b"", b"", b"");
+    let directory = bytes::find(&file, 0, CENTRAL).unwrap();
+    file[directory + 10..directory + 12].copy_from_slice(&8u16.to_le_bytes());
+
+    let archive = read(&file).unwrap();
+    let entry = &archive.entries[0];
+    assert_eq!(entry.method, "deflate");
+    assert_eq!(entry.local_method, Some("stored"));
+    assert!(entry.disagreement.as_ref().unwrap().contains("stored here, deflate in the directory"));
+
+    // A method the format does not define leaves the one that means something.
+    file[directory + 10..directory + 12].copy_from_slice(&77u16.to_le_bytes());
+    let archive = read(&file).unwrap();
+    assert_eq!(archive.entries[0].method, "stored");
+    assert_eq!(archive.entries[0].local_method, None);
+}
+
+#[test]
+fn a_listed_entry_past_where_the_walk_stopped_is_still_opened() {
+    // Sixty-five thousand decoy headers end the walk, and the directory still says where
+    // the real one is.
+    let mut decoy = Vec::new();
+    decoy.extend_from_slice(LOCAL);
+    decoy.extend_from_slice(&[0u8; 22]);
+    push16(&mut decoy, 1);
+    push16(&mut decoy, 0);
+    decoy.push(b'x');
+
+    let file = build(&[Put::new("x.txt", b"flag{real}")], &decoy.repeat(MAX_ENTRIES), b"", b"");
+
+    let archive = read(&file).unwrap();
+    assert!(archive.capped);
+    let entry = archive.entries.iter().find(|e| e.name == "x.txt").unwrap();
+    assert!(!entry.undeclared);
+    assert_eq!(entry.disagreement, None, "it has a header, and the two agree");
+    assert_eq!(entry.read_length, 10);
+    let start = entry.data_offset.unwrap();
+    assert_eq!(&file[start..start + 10], b"flag{real}");
+}
+
+#[test]
+fn entries_past_the_limit_are_said_to_exist() {
+    let mut header = Vec::new();
+    header.extend_from_slice(LOCAL);
+    header.extend_from_slice(&[0u8; 22]);
+    push16(&mut header, 1);
+    push16(&mut header, 0);
+    header.push(b'x');
+
+    let archive = read(&header.repeat(MAX_ENTRIES + 1)).unwrap();
+    assert_eq!(archive.entries.len(), MAX_ENTRIES);
+    assert!(archive.capped);
+    assert!(json(&header.repeat(MAX_ENTRIES + 1)).contains("\"capped\":true"));
+
+    assert!(!read(&header.repeat(MAX_ENTRIES)).unwrap().capped);
+    assert!(!read(&plain()).unwrap().capped);
+}
+
+#[test]
+fn a_directory_stretched_over_the_file_does_not_swallow_a_hidden_entry() {
+    // Stored data measured by the directory's word alone, a size this large would make
+    // the undeclared header behind it look like something inside this file.
+    let mut file = build(
+        &[
+            Put::new("cover.txt", b"nothing here"),
+            Put {
+                listed: false,
+                ..Put::new(".hidden.txt", b"flag{behind_the_claim}")
+            },
+        ],
+        b"",
+        b"",
+        b"",
+    );
+    let directory = bytes::find(&file, 0, CENTRAL).unwrap();
+    file[directory + 20..directory + 24].copy_from_slice(&(directory as u32).to_le_bytes());
 
     let archive = read(&file).unwrap();
     let hidden = archive.entries.iter().find(|e| e.name == ".hidden.txt");

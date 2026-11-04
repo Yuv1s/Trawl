@@ -743,6 +743,97 @@ fn bytes_after_the_trailer_are_found() {
     }
 }
 
+/// One frame whose pixels carry a message in their low bits, then `more` single-pixel
+/// frames: an ordinary long animation with something hidden in its first picture.
+fn message_then_frames(message: &[u8], more: usize) -> Vec<u8> {
+    let bits: Vec<u8> = message
+        .iter()
+        .flat_map(|byte| (0..8).rev().map(move |shift| (byte >> shift) & 1))
+        .collect();
+    let width = 16usize;
+    let height = bits.len().div_ceil(3).div_ceil(width);
+
+    let mut indices = vec![0u8; width * height];
+    for (i, chunk) in bits.chunks(3).enumerate() {
+        indices[i] = chunk.iter().fold(0, |acc, bit| (acc << 1) | bit) << (3 - chunk.len());
+    }
+    let table: Vec<[u8; 3]> = (0..8)
+        .map(|i| [((i >> 2) & 1) as u8, ((i >> 1) & 1) as u8, (i & 1) as u8])
+        .collect();
+
+    let mut frames = vec![Frame::full(width, height, indices)];
+    frames.extend((0..more).map(|_| Frame::full(1, 1, vec![0])));
+    build_multi(&table, 0, frames)
+}
+
+#[test]
+fn more_frames_than_are_kept_does_not_cost_the_ones_that_are() {
+    // Two hundred and fifty-seven frames in seven kilobytes used to refuse the file, and
+    // the flag in the first frame went with it.
+    for more in [256, 300, 1000] {
+        let file = message_then_frames(b"flag{in_the_first_frame}", more);
+
+        let (header, displayed, _, capped) = decode_frames(&file).unwrap();
+        assert!(capped);
+        assert_eq!(displayed.len(), MAX_FRAMES);
+        assert_eq!(header.declared_frames, more + 1, "the rest are still counted");
+
+        let json = analysis_json(&file, &[], 256, 4);
+        assert!(crate::json::is_well_formed(&json), "{json}");
+        assert!(json.contains("flag{in_the_first_frame}"), "more={more}");
+        assert!(json.contains("\"capped\":true"));
+        assert!(json.contains("\"error\":null"));
+
+        assert!(decode(&file).is_ok(), "the pixel tools read this one too");
+    }
+}
+
+#[test]
+fn a_file_cut_off_after_a_frame_still_shows_that_frame() {
+    let file = message_then_frames(b"flag{before_the_cut}", 3);
+    let (_, whole) = decode(&file).unwrap();
+
+    // Through the last frame's image data, then a marker that means nothing.
+    let cut = &file[..file.len() - 4];
+    let (_, first) = decode(cut).unwrap();
+    assert_eq!(first, whole);
+
+    let json = analysis_json(cut, &[], 256, 4);
+    assert!(json.contains("flag{before_the_cut}"), "{json}");
+    assert!(json.contains("\"stopped\":\"the file ends part way through a block\""), "{json}");
+
+    let mut junk = file[..file.len() - 1].to_vec();
+    junk.extend_from_slice(b"\x55\x55\x55");
+    assert_eq!(decode(&junk).unwrap().1, whole);
+}
+
+#[test]
+fn a_broken_frame_costs_the_frames_after_it_and_no_others() {
+    let mut file = tiny_frames_on(2, 2, 3);
+    let last_code_size = file.len() - 6;
+    file[last_code_size] = 1;
+
+    let json = analysis_json(&file, &[], 256, 4);
+    assert!(crate::json::is_well_formed(&json), "{json}");
+    assert!(json.contains("\"analysedFrames\":2"), "{json}");
+    assert!(json.contains("\"stopped\":\"the compressed data contains an impossible code\""), "{json}");
+    assert!(json.contains("\"error\":null"), "{json}");
+}
+
+#[test]
+fn a_file_with_no_frame_to_show_is_still_refused() {
+    let mut file = tiny_frames_on(2, 2, 1);
+    file.truncate(file.len() - 3);
+    assert_eq!(decode(&file).unwrap_err(), GifError::Truncated);
+
+    let json = analysis_json(&file, &[], 256, 4);
+    assert!(crate::json::is_well_formed(&json), "{json}");
+    assert!(json.contains("\"error\":\"the file ends"), "{json}");
+    assert!(json.contains("\"sources\":[]"), "{json}");
+
+    assert_eq!(decode(&tiny_frames_on(2, 2, 0)).unwrap_err(), GifError::NoImage);
+}
+
 #[test]
 fn over_the_frame_budget_reports_capped() {
     // The frame budget is 128; 200 declared frames trip the work cap so the

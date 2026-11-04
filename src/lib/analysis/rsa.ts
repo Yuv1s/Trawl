@@ -200,6 +200,10 @@ export function cubeRoot(found: Parameters): Recovery | null {
 /** Longest Fermat runs before giving up. Close primes fall in a handful. */
 const FERMAT_ROUNDS = 100_000;
 
+/** Each round is a square root of a number as long as the key, so 100,000 of them on a
+ *  2048-bit key take half a minute. Close primes turn up in the first few rounds. */
+const FERMAT_BUDGET_MS = 2_000;
+
 /**
  * Primes picked too close together.
  *
@@ -214,7 +218,10 @@ export function fermat(found: Parameters): Recovery | null {
 	let a = isqrt(n);
 	if (a * a < n) a += ONE;
 
+	const started = Date.now();
 	for (let round = 0; round < FERMAT_ROUNDS; round++) {
+		if (round % 256 === 0 && Date.now() - started > FERMAT_BUDGET_MS) return null;
+
 		const b2 = a * a - n;
 		const b = isqrt(b2);
 

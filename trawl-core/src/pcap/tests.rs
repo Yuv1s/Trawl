@@ -514,6 +514,234 @@ fn gaps_across_many_connections_stay_inside_the_budget() {
     assert!(reassemble(b"xy", &segments, 0).is_empty());
 }
 
+fn tagged(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| name.to_string()).collect()
+}
+
+fn flags_of(cap: &Capture) -> Vec<String> {
+    cap.streams.iter().flat_map(|s| s.flags.clone()).collect()
+}
+
+#[test]
+fn a_stray_byte_far_behind_does_not_move_the_stream_out_of_reach() {
+    // One byte a whole window behind made that byte the start of the stream, and put
+    // everything that mattered past the end.
+    for behind in [MAX_STREAM_BYTES as u32, 0x7000_0000, 1 << 20, MAX_STREAM_BYTES as u32 + 1] {
+        let file = pcap_file(
+            1,
+            &[
+                tcp_frame(SRV, CLI, 80, 5000, 1000, b"hello fla"),
+                tcp_frame(SRV, CLI, 80, 5000, 1009, b"g{the_real_one}"),
+                tcp_frame(SRV, CLI, 80, 5000, 1000u32.wrapping_sub(behind), b"x"),
+            ],
+        );
+
+        let cap = read(&file, &[]).unwrap();
+        assert_eq!(cap.streams[0].flags, vec!["flag{the_real_one}"], "behind by {behind}");
+        assert_eq!(cap.streams[0].bytes, 24, "the stray byte is not in the window");
+        assert_eq!(cap.streams[0].carried, 25, "and is still counted as carried");
+    }
+}
+
+#[test]
+fn a_run_that_fits_in_with_the_longest_stays_in_the_window() {
+    // A lost packet is a hole in one stream, and reads as one stream with a hole in it.
+    let file = pcap_file(
+        1,
+        &[
+            tcp_frame(SRV, CLI, 80, 5000, 100, b"start "),
+            tcp_frame(SRV, CLI, 80, 5000, 120, b"and the longer part"),
+        ],
+    );
+
+    let cap = read(&file, &[]).unwrap();
+    assert_eq!(cap.streams[0].bytes, 39);
+    assert!(cap.streams[0].text.starts_with("start "));
+}
+
+#[test]
+fn a_flag_outside_the_window_is_found_all_the_same() {
+    let file = pcap_file(
+        1,
+        &[
+            tcp_frame(SRV, CLI, 80, 5000, 1, &[b'.'; 1400]),
+            tcp_frame(SRV, CLI, 80, 5000, 0x4000_0000, b"flag{a_long_way_off}"),
+        ],
+    );
+    let cap = read(&file, &[]).unwrap();
+    assert_eq!(cap.streams[0].flags, vec!["flag{a_long_way_off}"]);
+    assert_eq!(cap.streams[0].bytes, 1400);
+}
+
+#[test]
+fn a_forged_first_copy_does_not_take_the_place_of_the_real_one() {
+    let file = pcap_file(
+        1,
+        &[
+            tcp_frame(SRV, CLI, 80, 5000, 1000, b"flag{forged_flag_goes_here}"),
+            tcp_frame(SRV, CLI, 80, 5000, 1000, b"hello fla"),
+            tcp_frame(SRV, CLI, 80, 5000, 1009, b"g{the_real_one}"),
+        ],
+    );
+
+    let cap = read(&file, &[]).unwrap();
+    let stream = &cap.streams[0];
+    assert!(stream.flags.contains(&"flag{forged_flag_goes_here}".to_string()), "{:?}", stream.flags);
+    assert!(stream.flags.contains(&"flag{the_real_one}".to_string()), "{:?}", stream.flags);
+    assert!(stream.conflicting > 0, "the disagreement has to be said out loud");
+}
+
+#[test]
+fn a_real_flag_between_two_forgeries_is_found_too() {
+    let file = pcap_file(
+        1,
+        &[
+            tcp_frame(SRV, CLI, 80, 5000, 1000, b"flag{forged_number_one}"),
+            tcp_frame(SRV, CLI, 80, 5000, 1000, b"flag{the_real_one_here}"),
+            tcp_frame(SRV, CLI, 80, 5000, 1000, b"flag{forged_number_two}"),
+        ],
+    );
+
+    let cap = read(&file, &[]).unwrap();
+    let flags = &cap.streams[0].flags;
+    for flag in ["flag{forged_number_one}", "flag{the_real_one_here}", "flag{forged_number_two}"] {
+        assert!(flags.contains(&flag.to_string()), "{flag} missing from {flags:?}");
+    }
+}
+
+#[test]
+fn a_retransmission_is_no_disagreement() {
+    let file = pcap_file(
+        1,
+        &[
+            tcp_frame(SRV, CLI, 80, 5000, 10, b"flag{same_bytes}"),
+            tcp_frame(SRV, CLI, 80, 5000, 10, b"flag{same_bytes}"),
+        ],
+    );
+    let cap = read(&file, &[]).unwrap();
+    assert_eq!(cap.streams[0].conflicting, 0);
+    assert_eq!(cap.streams[0].carried, 16);
+}
+
+#[test]
+fn a_keep_alive_junk_byte_is_no_disagreement() {
+    let data = b"flag{keep_the_first_copy}";
+    let seq = 100 + data.len() as u32 - 1;
+    let file = pcap_file(
+        1,
+        &[
+            tcp_frame(SRV, CLI, 80, 5000, 100, data),
+            tcp_frame(SRV, CLI, 80, 5000, seq, &[0]),
+        ],
+    );
+    assert_eq!(read(&file, &[]).unwrap().streams[0].conflicting, 0);
+}
+
+#[test]
+fn a_one_byte_forgery_anywhere_else_is_one() {
+    let file = pcap_file(
+        1,
+        &[
+            tcp_frame(SRV, CLI, 80, 5000, 100, b"flag{one_byte_changes}"),
+            tcp_frame(SRV, CLI, 80, 5000, 103, b"x"),
+        ],
+    );
+    assert_eq!(read(&file, &[]).unwrap().streams[0].conflicting, 1);
+}
+
+#[test]
+fn decoy_flows_with_long_gaps_do_not_use_up_what_a_small_flow_needed() {
+    // 260 flows each claiming a window of gap, then the one that matters, which is the
+    // smallest and so is read last. The gaps used to spend the whole budget on nothing.
+    let mut frames = Vec::new();
+    for port in 0..260u16 {
+        frames.push(tcp_frame(SRV, CLI, 80, 6000 + port, 5000, &[b'.'; 24]));
+        frames.push(tcp_frame(SRV, CLI, 80, 6000 + port, 5000 + MAX_STREAM_BYTES as u32 - 1, b"."));
+    }
+    frames.push(tcp_frame(SRV, CLI, 1337, 5000, 1000, b"hello fla"));
+    frames.push(tcp_frame(SRV, CLI, 1337, 5000, 1009, b"g{the_real_one}"));
+
+    let cap = read(&pcap_file(1, &frames), &[]).unwrap();
+    assert_eq!(cap.stream_count, 261);
+    assert_eq!(flags_of(&cap), vec!["flag{the_real_one}"]);
+    assert_eq!(cap.streams[0].src, "10.0.0.1:1337", "it leads the list");
+    assert_eq!(cap.streams.len(), MAX_STREAMS);
+}
+
+#[test]
+fn a_flag_in_any_flow_past_the_listed_ones_still_reaches_the_list() {
+    // A stream carrying a finding is not held to the limit on the rest.
+    let mut frames = Vec::new();
+    for port in 0..200u16 {
+        let flag = format!("flag{{from_flow_{port}}}");
+        frames.push(tcp_frame(SRV, CLI, 80, 6000 + port, 1, flag.as_bytes()));
+    }
+
+    let cap = read(&pcap_file(1, &frames), &[]).unwrap();
+    assert_eq!(cap.streams.len(), 200);
+    assert_eq!(flags_of(&cap).len(), 200);
+    assert!(!cap.flags_truncated);
+}
+
+#[test]
+fn hundreds_of_thousands_of_segments_in_one_flow_do_not_cost_another_its_place() {
+    let mut frames: Vec<Vec<u8>> = (0..200_001u32)
+        .map(|i| tcp_frame(CLI, SRV, 7000, 80, 7000 + i, b"."))
+        .collect();
+    frames.push(tcp_frame(SRV, CLI, 80, 5000, 1000, b"hello fla"));
+    frames.push(tcp_frame(SRV, CLI, 80, 5000, 1009, b"g{the_real_one}"));
+
+    let cap = read(&pcap_file(1, &frames), &[]).unwrap();
+    assert_eq!(flags_of(&cap), vec!["flag{the_real_one}"]);
+}
+
+#[test]
+fn decoys_nobody_named_do_not_hide_a_flag_in_a_stream() {
+    let mut body = b"abc{aaaa}\n".repeat(bytes::MAX_FLAGS + 10);
+    body.extend_from_slice(b"flag{the_real_one}");
+
+    let frames: Vec<Vec<u8>> = body
+        .chunks(1400)
+        .enumerate()
+        .map(|(i, chunk)| tcp_frame(SRV, CLI, 80, 5000, 1000 + (i * 1400) as u32, chunk))
+        .collect();
+
+    let cap = read(&pcap_file(1, &frames), &tagged(&["flag"])).unwrap();
+    assert_eq!(flags_of(&cap), vec!["flag{the_real_one}"]);
+    assert!(!cap.flags_truncated);
+}
+
+#[test]
+fn a_capture_with_more_flags_than_are_kept_says_so() {
+    let mut body = Vec::new();
+    for i in 0..bytes::MAX_FLAGS + 5 {
+        body.extend_from_slice(format!("flag{{decoy_{i}}}\n").as_bytes());
+    }
+    let frames: Vec<Vec<u8>> = body
+        .chunks(1400)
+        .enumerate()
+        .map(|(i, chunk)| tcp_frame(SRV, CLI, 80, 5000, 1 + (i * 1400) as u32, chunk))
+        .collect();
+
+    let cap = read(&pcap_file(1, &frames), &tagged(&["flag"])).unwrap();
+    assert!(cap.flags_truncated);
+    assert!(json(&pcap_file(1, &frames), &tagged(&["flag"])).contains("\"flagsTruncated\":true"));
+    assert!(json(&pcap_file(1, &[]), &[]).contains("\"flagsTruncated\":false"));
+}
+
+#[test]
+fn a_capture_cut_off_at_the_packet_limit_says_so() {
+    let mut frames = vec![tcp_frame(SRV, CLI, 80, 5000, 1, b"x"); MAX_PACKETS];
+    let file = pcap_file(1, &frames);
+    assert!(!read(&file, &[]).unwrap().packets_capped);
+
+    frames.push(tcp_frame(SRV, CLI, 80, 5000, 1, b"x"));
+    let file = pcap_file(1, &frames);
+    let cap = read(&file, &[]).unwrap();
+    assert_eq!(cap.packet_count, MAX_PACKETS);
+    assert!(cap.packets_capped);
+}
+
 /// A pcapng whose interface declares a timestamp resolution, with two packets a
 /// given number of ticks apart.
 fn pcapng_with_resolution(tsresol: u8, ticks: u64) -> Vec<u8> {

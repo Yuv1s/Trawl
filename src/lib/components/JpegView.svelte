@@ -11,6 +11,10 @@
 		trailing: { offset: number; length: number } | null;
 	} = $props();
 
+	/** Rows drawn. A segment can be four bytes, so a file can hold tens of thousands. */
+	const ROWS_SHOWN = 500;
+	const COMMENTS_SHOWN = 50;
+
 	const hex = (n: number) => `0x${n.toString(16)}`;
 </script>
 
@@ -20,13 +24,18 @@
 	{#if comments.length > 0}
 		<h3 class="label">Comments</h3>
 		<ul class="comments">
-			{#each comments as comment (comment.offset)}
+			{#each comments.slice(0, COMMENTS_SHOWN) as comment (comment.offset)}
 				<li>
 					<span class="mono text">{comment.text}</span>
 					<span class="mono muted">at {hex(comment.offset)}</span>
 				</li>
 			{/each}
 		</ul>
+		{#if comments.length > COMMENTS_SHOWN}
+			<p class="capped label">
+				Showing the first {COMMENTS_SHOWN} of {comments.length.toLocaleString()} comments.
+			</p>
+		{/if}
 	{/if}
 
 	{#if trailing}
@@ -36,7 +45,7 @@
 		</p>
 	{/if}
 
-	<h3 class="label spaced">{segments.length} segments</h3>
+	<h3 class="label spaced">{segments.length.toLocaleString()} segments</h3>
 	<table>
 		<thead>
 			<tr>
@@ -46,7 +55,7 @@
 			</tr>
 		</thead>
 		<tbody>
-			{#each segments as segment (segment.offset)}
+			{#each segments.slice(0, ROWS_SHOWN) as segment (segment.offset)}
 				<tr>
 					<td class="mono">{segment.name}</td>
 					<td class="mono muted">{hex(segment.offset)}</td>
@@ -55,6 +64,11 @@
 			{/each}
 		</tbody>
 	</table>
+	{#if segments.length > ROWS_SHOWN}
+		<p class="capped label">
+			Showing the first {ROWS_SHOWN} of {segments.length.toLocaleString()} segments.
+		</p>
+	{/if}
 
 	<p class="caveat">
 		A JPEG is a run of marker segments. Most declare their own length, which makes them cheap to
@@ -130,6 +144,11 @@
 	}
 
 	.muted {
+		color: var(--muted);
+	}
+
+	.capped {
+		margin: var(--s3) 0 0;
 		color: var(--muted);
 	}
 

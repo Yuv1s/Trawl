@@ -144,6 +144,11 @@ pub struct Candidate {
 pub const COMBINATIONS: usize = 2;
 
 pub fn sweep(palette: &[u8], indices: &[u8], max_bytes: usize) -> Vec<Candidate> {
+    sweep_naming(palette, indices, max_bytes, &[])
+}
+
+/// [`sweep`], with configured flag tags let past what an unnamed flag has to look like.
+pub fn sweep_naming(palette: &[u8], indices: &[u8], max_bytes: usize, tags: &[String]) -> Vec<Candidate> {
     let mut out = Vec::new();
 
     for msb_first in [true, false] {
@@ -152,7 +157,7 @@ pub fn sweep(palette: &[u8], indices: &[u8], max_bytes: usize) -> Vec<Candidate>
             continue;
         }
 
-        let flags: Vec<String> = bytes::flag_candidates(&stream)
+        let flags: Vec<String> = bytes::flag_candidates_naming(&stream, tags)
             .into_iter()
             .map(|f| f.text)
             .collect();
@@ -186,6 +191,11 @@ pub fn sweep(palette: &[u8], indices: &[u8], max_bytes: usize) -> Vec<Candidate>
 }
 
 pub fn json(palette: &[u8], indices: &[u8], max_bytes: usize) -> String {
+    json_naming(palette, indices, max_bytes, &[])
+}
+
+/// [`json`], with configured flag tags.
+pub fn json_naming(palette: &[u8], indices: &[u8], max_bytes: usize, tags: &[String]) -> String {
     use crate::json::{push_bool, push_field, push_number, push_string};
 
     let found = groups(palette);
@@ -220,7 +230,7 @@ pub fn json(palette: &[u8], indices: &[u8], max_bytes: usize) -> String {
 
     push_string(&mut out, "candidates");
     out.push_str(":[");
-    for (i, candidate) in sweep(palette, indices, max_bytes).iter().enumerate() {
+    for (i, candidate) in sweep_naming(palette, indices, max_bytes, tags).iter().enumerate() {
         if i > 0 {
             out.push(',');
         }

@@ -401,6 +401,49 @@ fn many_sections_naming_one_symbol_table_stop_at_the_budget() {
 }
 
 #[test]
+fn long_names_run_out_before_the_symbols_do() {
+    // Twenty-eight kilobytes took twenty-one seconds: a thousand symbols sharing one long
+    // name, walked once for every section header claiming to be their table.
+    let strings = vec![b'A'; MAX_NAME + 100];
+    let mut symbols = Vec::new();
+    for _ in 0..1000 {
+        symbols.extend_from_slice(&symbol(true, 0, 0x12, 0, 0));
+    }
+    let mut file = Builder::new()
+        .section(BuildSection::new(".dynsym", SHT_DYNSYM, symbols).linked(2))
+        .section(BuildSection::new(".dynstr", SHT_STRTAB, strings))
+        .build();
+
+    let shoff = u64::from_le_bytes(file[40..48].try_into().unwrap()) as usize;
+    let shnum = u16::from_le_bytes(file[60..62].try_into().unwrap()) as usize;
+    let table = file[shoff..shoff + shnum * 64].to_vec();
+    let symbol_table = table[64..128].to_vec();
+
+    let moved = file.len() as u64;
+    file.extend_from_slice(&table);
+    for _ in 0..4000 {
+        file.extend_from_slice(&symbol_table);
+    }
+    file[40..48].copy_from_slice(&moved.to_le_bytes());
+    file[60..62].copy_from_slice(&((shnum + 4000) as u16).to_le_bytes());
+
+    let started = std::time::Instant::now();
+    let binary = read(&file).unwrap();
+    assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+
+    assert!(binary.symbols_capped);
+    assert_eq!(binary.import_count, MAX_NAME_BYTES.div_ceil(MAX_NAME));
+    assert_eq!(binary.imports.len(), MAX_SYMBOLS);
+}
+
+#[test]
+fn a_walk_that_reached_the_end_of_its_tables_is_not_called_capped() {
+    let (table, names) = dynsym(true, &[("puts", 0x12, 0, 0)]);
+    let file = Builder::new().section(table.linked(2)).section(names).build();
+    assert!(!read(&file).unwrap().symbols_capped);
+}
+
+#[test]
 fn sections_that_all_read_one_header_do_not_each_carry_a_long_name() {
     let long = "A".repeat(8192);
     let mut file = Builder::new()

@@ -50,7 +50,7 @@
 
 	{#if total > sample.length}
 		<p class="more">
-			Showing {sample.length.toLocaleString()} of {total.toLocaleString()}.
+			Showing the first {sample.length.toLocaleString()} of {total.toLocaleString()} strings.
 		</p>
 	{/if}
 </div>

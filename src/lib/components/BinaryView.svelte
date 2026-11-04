@@ -96,6 +96,15 @@
 		...(binary.interpreter ? [{ key: 'Interpreter', value: binary.interpreter }] : [])
 	]);
 
+	/** Rows drawn. A header table can name sixty-five thousand sections out of 128 bytes. */
+	const ROWS_SHOWN = 500;
+	/** Letters of a symbol's name in the page, with the whole of it kept for the tooltip. A
+	 *  name can run to four kilobytes, and laying out a thousand of those is what hangs. */
+	const NAME_SHOWN = 200;
+
+	const sectionCount = $derived(binary.sectionCount ?? binary.sections.length);
+	const segmentCount = $derived(binary.segmentCount ?? binary.segments.length);
+
 	const bytes = (n: number) => `${n.toLocaleString()} B`;
 	const hex = (n: number) => `0x${n.toString(16)}`;
 </script>
@@ -138,12 +147,18 @@
 		</dl>
 	</div>
 
+	{#if binary.symbolsCapped}
+		<p class="capped label">
+			Trawl stopped reading the symbol tables at its budget, so these counts cover what it reached.
+		</p>
+	{/if}
+
 	{#if binary.needed.length > 0}
 		<div class="info">
 			<h3 class="label">Needs at run time</h3>
 			<ul class="chips">
 				{#each binary.needed as library, i (i)}
-					<li class="mono chip">{library}</li>
+					<li class="mono chip" title={library}>{library.slice(0, NAME_SHOWN)}</li>
 				{/each}
 			</ul>
 		</div>
@@ -165,7 +180,7 @@
 						class="mono chip"
 						title={symbol.from ? `${symbol.name} from ${symbol.from}` : symbol.name}
 					>
-						{symbol.name}
+						{symbol.name.slice(0, NAME_SHOWN)}
 					</li>
 				{/each}
 			</ul>
@@ -185,7 +200,7 @@
 			<ul class="chips">
 				{#each binary.exports as symbol, i (i)}
 					<li class="mono chip" title={symbol.name}>
-						{symbol.name} <span class="muted">{symbol.address}</span>
+						{symbol.name.slice(0, NAME_SHOWN)} <span class="muted">{symbol.address}</span>
 					</li>
 				{/each}
 			</ul>
@@ -194,7 +209,7 @@
 
 	{#if binary.sections.length > 0}
 		<table>
-			<caption class="label">{binary.sections.length} sections</caption>
+			<caption class="label">{sectionCount.toLocaleString()} sections</caption>
 			<thead>
 				<tr>
 					<th scope="col" class="label">Section</th>
@@ -206,7 +221,7 @@
 				</tr>
 			</thead>
 			<tbody>
-				{#each binary.sections as section, index (index)}
+				{#each binary.sections.slice(0, ROWS_SHOWN) as section, index (index)}
 					<tr class:odd={section.flags.includes('execute') && section.flags.includes('write')}>
 						<td><span class="mono name">{section.name || '-'}</span></td>
 						<td class="muted">{section.kind}</td>
@@ -218,11 +233,18 @@
 				{/each}
 			</tbody>
 		</table>
+		{#if sectionCount > ROWS_SHOWN}
+			<p class="capped label">
+				Showing the first {ROWS_SHOWN} of {sectionCount.toLocaleString()} sections.
+			</p>
+		{/if}
 	{/if}
 
 	{#if binary.segments.length > 0}
 		<table>
-			<caption class="label">{binary.segments.length} segments, as the loader maps them</caption>
+			<caption class="label"
+				>{segmentCount.toLocaleString()} segments, as the loader maps them</caption
+			>
 			<thead>
 				<tr>
 					<th scope="col" class="label">Segment</th>
@@ -233,7 +255,7 @@
 				</tr>
 			</thead>
 			<tbody>
-				{#each binary.segments as segment, index (index)}
+				{#each binary.segments.slice(0, ROWS_SHOWN) as segment, index (index)}
 					<tr class:odd={segment.permissions === 'rwx'}>
 						<td><span class="mono name">{segment.kind}</span></td>
 						<td class="mono">{segment.permissions}</td>
@@ -244,6 +266,11 @@
 				{/each}
 			</tbody>
 		</table>
+		{#if segmentCount > ROWS_SHOWN}
+			<p class="capped label">
+				Showing the first {ROWS_SHOWN} of {segmentCount.toLocaleString()} segments.
+			</p>
+		{/if}
 	{/if}
 
 	<p class="footnote">
@@ -442,6 +469,11 @@
 	}
 
 	.muted {
+		color: var(--muted);
+	}
+
+	.capped {
+		margin: 0;
 		color: var(--muted);
 	}
 

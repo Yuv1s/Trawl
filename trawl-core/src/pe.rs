@@ -290,6 +290,7 @@ pub fn read(data: &[u8]) -> Option<Binary> {
         exports,
         import_count,
         export_count,
+        symbols_capped: false,
     })
 }
 

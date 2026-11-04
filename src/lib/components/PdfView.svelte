@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { PdfStructure, PdfObject } from '$lib/worker/protocol';
+	import { firstOfEach } from './tally';
 
 	let {
 		doc,
@@ -9,10 +10,31 @@
 		onpeel?: (text: string) => void;
 	} = $props();
 
+	/** Rows drawn. A file can list a quarter of a million objects at seven bytes each. */
+	const ROWS_SHOWN = 500;
+	/** How many rows also show what the stream holds. */
+	const CONTENTS_SHOWN = 40;
+	/** Lines each kind of finding gets above the table. */
+	const FINDINGS_SHOWN = 50;
+
+	const objectCount = $derived(doc.objectCount ?? doc.objects.length);
 	const orphaned = $derived(doc.objects.filter((o) => o.orphaned));
-	/** Objects whose decompressed stream carried a flag shape. */
-	const carrying = $derived(doc.objects.filter((o) => (o.flags?.length ?? 0) > 0));
-	const embedded = $derived(doc.objects.filter((o) => doc.embeddedFiles.includes(o.number)));
+	const attachments = $derived(new Set(doc.embeddedFiles));
+
+	/** Every distinct flag the streams carried, with the first object that had it. */
+	const carried = $derived(firstOfEach(doc.objects, (object) => object.flags));
+
+	const worthAlook = (object: PdfObject) => object.orphaned || (object.flags?.length ?? 0) > 0;
+
+	/** The rows drawn. When they cannot all be, the ones with something to say go first. */
+	const rows = $derived(
+		doc.objects.length <= ROWS_SHOWN
+			? doc.objects
+			: [
+					...doc.objects.filter(worthAlook),
+					...doc.objects.filter((object) => !worthAlook(object))
+				].slice(0, ROWS_SHOWN)
+	);
 
 	const notes = $derived(
 		[
@@ -23,7 +45,9 @@
 			doc.encrypted &&
 				'the trailer names an /Encrypt dictionary, so this document is password protected',
 			doc.usesXrefStream &&
-				'the cross-reference table is a compressed stream rather than plain text, so objects cannot be checked against it here'
+				'the cross-reference table is a compressed stream rather than plain text, so objects cannot be checked against it here',
+			doc.xrefUnread &&
+				'the cross-reference table could not be read, so objects were not checked against it'
 		].filter((note): note is string => typeof note === 'string')
 	);
 
@@ -31,22 +55,29 @@
 </script>
 
 <div class="pdf">
-	{#if orphaned.length > 0 || carrying.length > 0 || notes.length > 0}
+	{#if orphaned.length > 0 || carried.length > 0 || notes.length > 0}
 		<ul class="findings">
-			{#each carrying as object, i (i)}
-				{#each new Set(object.flags ?? []) as flag (flag)}
-					<li class="flagged">
-						<span class="mono big">{flag}</span>
-						<span class="muted"> inside <span class="mono">{objectLabel(object)}</span></span>
-					</li>
-				{/each}
+			{#each carried.slice(0, FINDINGS_SHOWN) as [flag, object] (flag)}
+				<li class="flagged">
+					<span class="mono big">{flag}</span>
+					<span class="muted"> inside <span class="mono">{objectLabel(object)}</span></span>
+				</li>
 			{/each}
-			{#each orphaned as object, i (i)}
+			{#if carried.length > FINDINGS_SHOWN}
+				<li>Showing the first {FINDINGS_SHOWN} of {carried.length.toLocaleString()} flags.</li>
+			{/if}
+			{#each orphaned.slice(0, FINDINGS_SHOWN) as object, i (i)}
 				<li class="flagged">
 					<span class="mono">{objectLabel(object)}</span> is in the file but the cross-reference table
 					no longer points at it, so no ordinary reader will open it
 				</li>
 			{/each}
+			{#if orphaned.length > FINDINGS_SHOWN}
+				<li>
+					Showing the first {FINDINGS_SHOWN} of {orphaned.length.toLocaleString()} objects the table no
+					longer points at.
+				</li>
+			{/if}
 			{#each notes as note (note)}
 				<li>{note}</li>
 			{/each}
@@ -74,9 +105,9 @@
 
 	<table>
 		<caption class="label">
-			{doc.objects.length} object{doc.objects.length === 1 ? '' : 's'}, PDF {doc.version}{embedded.length >
-			0
-				? `, ${embedded.length} attached`
+			{objectCount.toLocaleString()} object{objectCount === 1 ? '' : 's'}, PDF {doc.version}{doc
+				.embeddedFiles.length > 0
+				? `, ${doc.embeddedFiles.length.toLocaleString()} attached`
 				: ''}
 		</caption>
 		<thead>
@@ -89,14 +120,14 @@
 			</tr>
 		</thead>
 		<tbody>
-			{#each doc.objects as object, i (i)}
-				<tr class:odd={object.orphaned || (object.flags?.length ?? 0) > 0}>
+			{#each rows as object, i (i)}
+				<tr class:odd={worthAlook(object)}>
 					<td>
 						<span class="mono name">{objectLabel(object)}</span>
 						{#if object.orphaned}
 							<span class="mono chip flagged">not in xref</span>
 						{/if}
-						{#if doc.embeddedFiles.includes(object.number)}
+						{#if attachments.has(object.number)}
 							<span class="mono chip">attachment</span>
 						{/if}
 					</td>
@@ -107,7 +138,7 @@
 					>
 					<td class="mono muted">0x{object.offset.toString(16)}</td>
 				</tr>
-				{#if object.stream?.text}
+				{#if object.stream?.text && i < CONTENTS_SHOWN}
 					<tr class="aside">
 						<td colspan="5">
 							<div class="content-head">
@@ -121,17 +152,31 @@
 							<pre class="content mono">{object.stream.text}</pre>
 						</td>
 					</tr>
-				{:else if object.stream?.error}
+				{/if}
+				{#if object.stream?.error}
 					<tr class="aside">
 						<td colspan="5">
 							<span class="label">stream content</span>
-							<span class="muted">could not read: {object.stream.error}</span>
+							<span class="muted">
+								{#if object.stream.decoded}
+									read as far as it goes: {object.stream.error}
+								{:else}
+									could not read: {object.stream.error}
+								{/if}
+							</span>
 						</td>
 					</tr>
 				{/if}
 			{/each}
 		</tbody>
 	</table>
+
+	{#if objectCount > rows.length}
+		<p class="capped label">
+			Showing the first {rows.length} of {objectCount.toLocaleString()} objects, with anything out of
+			the ordinary moved to the top.
+		</p>
+	{/if}
 
 	{#if doc.encrypted}
 		<p class="footnote">
@@ -295,6 +340,11 @@
 	.chip.flagged {
 		color: var(--signal);
 		border-color: var(--signal);
+	}
+
+	.capped {
+		margin: 0;
+		color: var(--muted);
 	}
 
 	.footnote {

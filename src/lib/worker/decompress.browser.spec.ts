@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { assertZlibHeader, boundedInflate, compressionOf, fingerprint, isGzip } from './decompress';
+import {
+	assertZlibHeader,
+	boundedInflate,
+	compressionOf,
+	fingerprint,
+	isGzip,
+	SeenBytes
+} from './decompress';
 
 async function gzip(bytes: Uint8Array): Promise<Uint8Array> {
 	const stream = new Blob([bytes as Uint8Array<ArrayBuffer>])
@@ -118,5 +125,38 @@ describe('fingerprint', () => {
 		const a = text('aaaabbbb');
 		const b = text('aaaabbba');
 		expect(fingerprint(a)).not.toBe(fingerprint(b));
+	});
+});
+
+describe('files already seen', () => {
+	/** The same head, tail and length, and one byte different in between. */
+	function differsInTheMiddle(byte: number): Uint8Array {
+		const bytes = new Uint8Array(400).fill(7);
+		bytes[200] = byte;
+		return bytes;
+	}
+
+	it('does not call a file a duplicate because it has the same fingerprint', () => {
+		const first = differsInTheMiddle(1);
+		const second = differsInTheMiddle(2);
+		expect(fingerprint(first)).toBe(fingerprint(second));
+
+		const seen = new SeenBytes<string>();
+		seen.add(first, 'first');
+		expect(seen.find(second)).toBeUndefined();
+
+		seen.add(second, 'second');
+		expect(seen.find(first)).toBe('first');
+		expect(seen.find(second)).toBe('second');
+	});
+
+	it('recognises the same bytes in another buffer', () => {
+		const seen = new SeenBytes<string>();
+		seen.add(differsInTheMiddle(1), 'first');
+		expect(seen.find(differsInTheMiddle(1))).toBe('first');
+	});
+
+	it('has nothing to say about a file it has not seen', () => {
+		expect(new SeenBytes<string>().find(differsInTheMiddle(1))).toBeUndefined();
 	});
 });

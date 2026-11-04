@@ -865,6 +865,39 @@ describe('chi-square against RS', () => {
 	});
 });
 
+describe('a file with more than the page lists', () => {
+	const long = {
+		...structure,
+		chunks: [chunk('IHDR', 8, 13), chunk('IDAT', 33, 900)],
+		chunkCount: 40_000,
+		text: [],
+		textCount: 9_000
+	} as Structure;
+
+	it('counts what the file holds rather than what was listed', () => {
+		expect(tool('chunks', survey, long)?.value).toBe(`${(40_000).toLocaleString()} chunks`);
+		expect(tool('text', survey, long)?.value).toBe(`${(9_000).toLocaleString()} found`);
+		expect(status('text', survey, long)).toBe('hit');
+	});
+
+	it('does not call a PNG cut short because its IEND was past the list', () => {
+		expect(status('chunks', survey, long)).toBe('ready');
+	});
+
+	it('does not vouch for checksums it did not list', () => {
+		expect(tool('crc', survey, long)?.value).toBe('first 2 valid');
+		expect(tool('crc')?.value).toBe('all valid');
+	});
+
+	it('marks a signature count that was cut short', () => {
+		const hit = { offset: 9, label: 'PNG image', length: 9, bounded: true, embedded: true };
+		const many = { ...survey, magic: [hit], magicOmitted: 5 };
+
+		expect(tool('magic', many)?.value).toBe('1+ to extract');
+		expect(tool('magic', { ...survey, magic: [hit] })?.value).toBe('1 to extract');
+	});
+});
+
 describe('a PNG that stops short', () => {
 	it('reports a missing IEND as a finding', () => {
 		const tool = tools({

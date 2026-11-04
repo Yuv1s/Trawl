@@ -97,6 +97,20 @@ impl std::fmt::Display for FetchError {
     }
 }
 
+/// Whether two addresses are the same service: one origin, or loopback names on one port,
+/// since `localhost` and `127.0.0.1` are one machine and a redirect between them leaves
+/// nothing.
+pub fn same_service(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    let loopback = |url: &reqwest::Url| {
+        matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+    };
+    a.origin() == b.origin()
+        || (a.scheme() == b.scheme()
+            && a.port_or_known_default() == b.port_or_known_default()
+            && loopback(a)
+            && loopback(b))
+}
+
 fn require_web_scheme(url: &reqwest::Url) -> Result<(), FetchError> {
     match url.scheme() {
         "http" | "https" => Ok(()),
@@ -157,6 +171,10 @@ pub async fn fetch_with(
 ) -> Result<Fetched, FetchError> {
     let mut current = reqwest::Url::parse(url).map_err(|e| FetchError::BadUrl(e.to_string()))?;
     require_web_scheme(&current)?;
+    // Local access is for the service that was asked for. A local page redirecting anywhere
+    // else is held to the strict guard, or it could send the scanner to any other service
+    // on the person's machine or network.
+    let asked_for = allow_local.then(|| current.clone());
 
     // The request as it stands this hop. A redirect may rewrite these: a
     // cross-origin hop strips the credentials and body, and 301/302/303 turn a
@@ -187,8 +205,9 @@ pub async fn fetch_with(
         // its own since it has none otherwise. Every address the name answered
         // with is vetted, and one bad answer condemns the name.
         let resolving = host.clone();
+        let local_here = asked_for.as_ref().is_some_and(|asked| same_service(asked, &current));
         let resolve = tokio::task::spawn_blocking(move || {
-            guard::resolve_and_check(&resolving, port, allow_local)
+            guard::resolve_and_check(&resolving, port, local_here)
         });
         let resolved = tokio::time::timeout(DNS_TIMEOUT.min(remaining), resolve)
             .await
@@ -197,7 +216,13 @@ pub async fn fetch_with(
             .map_err(|e| FetchError::Network(e.to_string()))?;
 
         if let Some(reason) = resolved.blocked() {
-            return Err(FetchError::Blocked(reason.to_string()));
+            return Err(FetchError::Blocked(if asked_for.is_some() && !local_here {
+                format!(
+                    "{reason}, and this redirect left the address you named, which is as far as local mode goes"
+                )
+            } else {
+                reason.to_string()
+            }));
         }
         let mut addresses = resolved.safe_addresses();
         if addresses.is_empty() {
@@ -339,6 +364,95 @@ pub async fn fetch_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Answers one connection with a redirect to `location`.
+    fn redirect_once(listener: TcpListener, location: String) {
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let answer = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = socket.write_all(answer.as_bytes()).await;
+        });
+    }
+
+    #[tokio::test]
+    async fn a_local_page_cannot_send_a_fetch_to_another_local_service() {
+        let other = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_at = other.local_addr().unwrap();
+        let entry = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let entry_at = entry.local_addr().unwrap();
+        redirect_once(entry, format!("http://{other_at}/admin"));
+
+        let outcome = fetch(&format!("http://{entry_at}/"), true).await;
+
+        assert!(matches!(outcome, Err(FetchError::Blocked(_))), "{outcome:?}");
+        let reached = tokio::time::timeout(Duration::from_millis(100), other.accept()).await;
+        assert!(reached.is_err(), "nothing was sent to the other service");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_between_loopback_names_stays_local() {
+        let entry = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = entry.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let redirect = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/home\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let page = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nhere";
+            for answer in [redirect.as_str(), page] {
+                let (mut socket, _) = entry.accept().await.unwrap();
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket.write_all(answer.as_bytes()).await;
+            }
+        });
+
+        let page = fetch(&format!("http://localhost:{port}/loc"), true).await.unwrap();
+
+        assert_eq!(page.body, b"here");
+    }
+
+    #[test]
+    fn a_service_is_an_origin_or_a_loopback_name_on_one_port() {
+        let url = |text: &str| reqwest::Url::parse(text).unwrap();
+        let same = |a: &str, b: &str| same_service(&url(a), &url(b));
+
+        assert!(same("http://target.example/a", "http://target.example/b"));
+        assert!(same("http://localhost:5000/", "http://127.0.0.1:5000/home"));
+        assert!(same("http://[::1]:5000/", "http://localhost:5000/"));
+
+        assert!(!same("http://localhost:5000/", "http://127.0.0.1:5001/"));
+        assert!(!same("http://localhost:5000/", "https://127.0.0.1:5000/"));
+        assert!(!same("http://localhost:5000/", "http://192.168.1.1:5000/"));
+        assert!(!same("http://target.example/", "http://other.example/"));
+    }
+
+    #[tokio::test]
+    async fn a_local_page_can_redirect_within_itself() {
+        let entry = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let entry_at = entry.local_addr().unwrap();
+        tokio::spawn(async move {
+            for answer in [
+                "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nhere",
+            ] {
+                let (mut socket, _) = entry.accept().await.unwrap();
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket.write_all(answer.as_bytes()).await;
+            }
+        });
+
+        let page = fetch(&format!("http://{entry_at}/"), true).await.unwrap();
+
+        assert_eq!(page.body, b"here");
+        assert!(page.final_url.ends_with("/next"));
+    }
 
     #[test]
     fn a_cross_origin_redirect_drops_credentials_and_body() {

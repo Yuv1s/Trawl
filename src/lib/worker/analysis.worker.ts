@@ -1,12 +1,9 @@
 import init, {
 	aes_probe,
-	chi_square,
+	DecodedPixels,
 	file_survey,
 	find_flags_for_tags,
-	lsb_extract,
-	lsb_sweep,
-	plane,
-	plane_wall,
+	inflate_stream,
 	png_idat,
 	png_palette,
 	png_patch_ihdr,
@@ -17,8 +14,8 @@ import init, {
 	palette_stego,
 	mantis_with_key_for_tags,
 	mantis_packed_pass,
+	pdf_stream,
 	peel_encodings_for_tags,
-	rs_analysis,
 	wav_lsb_extract,
 	wav_lsb_sweep,
 	wav_spectrogram,
@@ -42,7 +39,6 @@ import type {
 	JpegError,
 	JpegStego,
 	KeyAttempt,
-	NestedAnalysis,
 	NestedArtifact,
 	PaletteStego,
 	PdfStructure,
@@ -61,10 +57,12 @@ import type {
 	WavError,
 	WavStructure,
 	ZipArchive,
+	ZipEntry,
 	AesSolved
 } from './protocol';
+import { attack, looksLikeRsa } from '$lib/analysis/rsa';
 import { isWavError } from './protocol';
-import { assertZlibHeader, boundedInflate, compressionOf, fingerprint, isGzip } from './decompress';
+import { assertZlibHeader, boundedInflate, compressionOf, isGzip, SeenBytes } from './decompress';
 
 const ready = init();
 
@@ -78,8 +76,9 @@ const FFT_WINDOW = 1024;
 const SPECTROGRAM_WIDTH = 900;
 const CHI_STEPS_JPEG = 64;
 
-/** Kept so a plane or extraction request does not re-send the whole file. */
-let cached: { bytes: Uint8Array; inflated: Uint8Array } | null = null;
+/** Kept so a plane or extraction request does not re-send the whole file, and does not
+ *  decode the image a sixth time. */
+let cached: { bytes: Uint8Array; inflated: Uint8Array; image: DecodedPixels | null } | null = null;
 
 /** Fraction of bytes a person could read, to tell text content from binary. */
 function printableRatio(bytes: Uint8Array): number {
@@ -91,38 +90,124 @@ function printableRatio(bytes: Uint8Array): number {
 	return readable / bytes.length;
 }
 
-/** Recursion limits — one per-root context so nested ZIPs and carved files share a budget. */
-const RECURSION_MAX_DEPTH = 3; // below the root file
-const RECURSION_MAX_CHILDREN = 32; // total children analysed across the tree
-const RECURSION_PER_CHILD_LIMIT = 1 << 20; // 1 MiB per child (decompressed or carved)
-const RECURSION_AGGREGATE_LIMIT = 8 << 20; // 8 MiB aggregate bytes expanded
+/**
+ * What one file may spend inflating, across every stream it holds.
+ *
+ * A deflate stream turns a kilobyte into a megabyte, so a file under a megabyte can ask
+ * for more than a tab holds. Bytes read get scanned for flags and go no further; the much
+ * smaller share kept is what crosses to the page.
+ */
+const INFLATE_WORK_LIMIT = 128 << 20;
+const INFLATE_KEPT_LIMIT = 16 << 20;
+/** The most one stream gives, so one bomb cannot take what the rest of the file gets. */
+const STREAM_LIMIT = 16 << 20;
+/** Charged for opening a stream however little came out, so thousands of empty ones spend
+ *  this budget as well. It leaves room for some thirty thousand of them. */
+const STREAM_FLOOR = 4096;
+/** Streams can overlap, so bytes alone do not bound the time: one megabyte of input read
+ *  by ten thousand entries gives out nothing and takes minutes. */
+const INFLATE_TIME_LIMIT = 15_000;
+/** Flags kept from inflated streams across one file. */
+const STREAM_FLAGS_KEPT = 20_000;
+
+/** How much of an inflated stream the page gets as text. */
+const TEXT_PREVIEW = 64 << 10;
+const ZIP_TEXT_PREVIEW = 8192;
+
+class InflateBudget {
+	private work = INFLATE_WORK_LIMIT;
+	private kept = INFLATE_KEPT_LIMIT;
+	private flags = STREAM_FLAGS_KEPT;
+	private readonly deadline = performance.now() + INFLATE_TIME_LIMIT;
+	/** True once a scan had more flags than it or this could keep. */
+	flagsTruncated = false;
+
+	get spent(): boolean {
+		return this.work <= 0 || performance.now() > this.deadline;
+	}
+
+	get streamLimit(): number {
+		return Math.min(STREAM_LIMIT, Math.max(this.work, 0));
+	}
+
+	charge(bytes: number): void {
+		this.work -= Math.max(bytes, STREAM_FLOOR);
+	}
+
+	/** Whether this many more bytes may go to the page. */
+	keep(bytes: number): boolean {
+		if (bytes > this.kept) return false;
+		this.kept -= bytes;
+		return true;
+	}
+
+	/** The flags in a stream, as far as there is room for them. */
+	scan(raw: Uint8Array, flagTags: string): Found[] {
+		const { flags, truncated } = scanFlags(raw, flagTags);
+		const kept = flags.slice(0, Math.max(this.flags, 0));
+		this.flags -= kept.length;
+		this.flagsTruncated ||= truncated || kept.length < flags.length;
+		return kept;
+	}
+}
+
+const NOT_OPENED = 'the whole-file inflate budget had run out';
+
+/** Recursion limits, one per-root context so nested ZIPs and carved files share a budget. */
+const RECURSION_MAX_DEPTH = 8; // below the root file
+const RECURSION_MAX_CHILDREN = 256; // total children analysed across the tree
+const RECURSION_AGGREGATE_LIMIT = 64 << 20; // bytes across the children analysed
+/** What the budgets above count is not what a child costs, since a small file can be built
+ *  to take any detector as long as it is allowed. So the walk has a clock as well. */
+const RECURSION_TIME_LIMIT = 30_000;
+/** Skipped children written out, past which they are counted and no more. */
+const RECURSION_SKIPS_LISTED = 512;
+/** Findings kept from across the tree. A nested file can hold as many as a root can. */
+const RECURSION_FINDINGS_KEPT = 20_000;
+
+const BUDGET_SPENT = 'recursion budget exhausted';
+const CLOCK_SPENT = 'the time budget for nested files ran out';
 
 /** The file someone actually dropped gets far more room than a child inside it: a
  *  1000x1000 RGB image is already 3 MB of pixels. Still bounded, since a tiny PNG can
  *  claim to inflate to anything. */
 const ROOT_PIXEL_LIMIT = 256 << 20;
-const ZIP_TEXT_PREVIEW = 8192;
+const CHILD_PIXEL_LIMIT = 32 << 20;
 
-/** Deterministic fingerprint for dedup: first 64 bytes + last 64 bytes + length. */
-async function inflate(bytes: Uint8Array, limit = RECURSION_PER_CHILD_LIMIT): Promise<Uint8Array> {
-	return boundedInflate('deflate', bytes, limit);
+/** What came out of an inflate, whatever else happened to it. */
+type Opened = { output: Uint8Array; error: string | null; capped: boolean; trailing: number };
+
+function unpackOpened(packed: Uint8Array): Opened {
+	const headerLength = new DataView(packed.buffer, packed.byteOffset, 4).getUint32(0, true);
+	const json = new TextDecoder().decode(packed.subarray(4, 4 + headerLength));
+	return { ...JSON.parse(json), output: packed.subarray(4 + headerLength) };
 }
 
-/** Raw deflate, with no zlib wrapper, which is how a ZIP stores each entry. */
-function inflateRaw(bytes: Uint8Array): Promise<Uint8Array> {
-	return boundedInflate('deflate-raw', bytes, RECURSION_PER_CHILD_LIMIT);
+function inflate(bytes: Uint8Array, wrapper: 'zlib' | 'raw', limit: number): Opened {
+	return unpackOpened(inflate_stream(bytes, wrapper, limit));
 }
 
-/** Bounded gzip decompression — rejects >1 MiB or invalid header. */
-async function inflateGzip(bytes: Uint8Array): Promise<Uint8Array> {
-	if (!isGzip(bytes)) throw new Error('not a gzip stream');
-	return boundedInflate('gzip', bytes, RECURSION_PER_CHILD_LIMIT);
+/** What to say about a stream that did not simply end where it should. */
+function damageOf({ output, error, capped, trailing }: Opened): string | null {
+	const said: string[] = [];
+	if (error) said.push(error);
+	if (capped) said.push(`only the first ${output.length.toLocaleString()} bytes were read`);
+	if (trailing > 0) {
+		said.push(
+			`${trailing.toLocaleString()} ${trailing === 1 ? 'byte follows' : 'bytes follow'} the end of the stream`
+		);
+	}
+	return said.length > 0 ? said.join('; ') : null;
 }
 
-/** Bounded zlib decompression — validates CMF/FLG (mod-31, no preset dict). */
-function inflateZlib(bytes: Uint8Array): Promise<Uint8Array> {
-	assertZlibHeader(bytes);
-	return boundedInflate('deflate', bytes, RECURSION_PER_CHILD_LIMIT);
+/** A stream's start as text, marked when there was more. */
+function preview(raw: Uint8Array, length: number): string {
+	const text = new TextDecoder('utf-8', { fatal: false }).decode(raw.subarray(0, length));
+	return raw.length > length ? `${text}\n…` : text;
+}
+
+function scanFlags(raw: Uint8Array, flagTags: string): { flags: Found[]; truncated: boolean } {
+	return JSON.parse(find_flags_for_tags(raw, flagTags));
 }
 
 function readWall(packed: Uint8Array): PlaneWall {
@@ -157,100 +242,150 @@ function normaliseGifAnalysis(value: unknown): GifAnalysis | null {
 	return gif;
 }
 
-/** Only PNG hands its pixel data to a platform inflate; the rest carry their own. */
-async function pixelInput(
+/**
+ * The inflated pixel data, as much of it as could be read. Only PNG hands its pixel data
+ * to an inflate; the rest carry their own.
+ *
+ * A browser shows the rows it reached when the stream is damaged, so a file can look
+ * whole to a person and carry its flag in those rows. Only a stream with nothing in it
+ * is an error.
+ */
+function pixelInput(
 	bytes: Uint8Array,
 	isPng: boolean,
-	limit = RECURSION_PER_CHILD_LIMIT
-): Promise<Uint8Array> {
-	return isPng ? inflate(png_idat(bytes), limit) : new Uint8Array();
+	limit: number
+): { inflated: Uint8Array; damage: string | null; error: string | null } {
+	if (!isPng) return { inflated: new Uint8Array(), damage: null, error: null };
+
+	const found = inflate(png_idat(bytes), 'zlib', limit);
+	if (found.output.length === 0 && found.error) {
+		return { inflated: found.output, damage: null, error: found.error };
+	}
+	return { inflated: found.output, damage: damageOf(found), error: null };
 }
 
 /**
  * Fills in the text of compressed chunks.
  *
- * Rust locates the zlib stream but does not inflate it, because inflate is a
- * platform call. Reporting "content unread" was honest and useless; a flag can
- * sit in a zTXt chunk indefinitely.
+ * Rust locates the zlib stream without inflating it, because what comes out has to be
+ * budgeted across the whole file. Reporting "content unread" was honest and useless; a
+ * flag can sit in a zTXt chunk indefinitely.
+ *
+ * @return how many chunks were not opened
  */
-async function inflateTextChunks(
+function inflateTextChunks(
 	bytes: Uint8Array,
 	structure: Structure,
-	flagTags: string
-): Promise<void> {
+	flagTags: string,
+	budget: InflateBudget
+): number {
+	let unopened = (structure.textCount ?? structure.text.length) - structure.text.length;
+
 	for (const chunk of structure.text) {
 		if (!chunk.compressed || chunk.payloadLength === 0) continue;
+		if (budget.spent) {
+			chunk.error = NOT_OPENED;
+			unopened += 1;
+			continue;
+		}
 
-		try {
-			const stream = bytes.subarray(chunk.payloadOffset, chunk.payloadOffset + chunk.payloadLength);
-			const raw = await inflate(stream);
-			chunk.text = new TextDecoder('utf-8', { fatal: false }).decode(raw);
-			chunk.compressed = false;
+		const stream = bytes.subarray(chunk.payloadOffset, chunk.payloadOffset + chunk.payloadLength);
+		const found = inflate(stream, 'zlib', budget.streamLimit);
+		budget.charge(found.output.length);
 
-			// The byte-level scan ran before this text existed, so anything hiding
-			// in a compressed chunk is only visible now.
-			for (const found of JSON.parse(find_flags_for_tags(raw, flagTags)) as Found[]) {
-				structure.flags.push({
-					offset: chunk.payloadOffset,
-					text: found.text,
-					region: `inside ${chunk.kind}, after inflating`,
-					credible: true
-				});
-			}
-		} catch (error: unknown) {
-			chunk.error = error instanceof Error ? error.message : String(error);
+		chunk.error = damageOf(found) ?? undefined;
+		if (found.output.length === 0) continue;
+
+		chunk.compressed = false;
+		if (budget.keep(Math.min(found.output.length, TEXT_PREVIEW))) {
+			chunk.text = preview(found.output, TEXT_PREVIEW);
+		}
+
+		// The byte-level scan ran before this text existed, so anything hiding
+		// in a compressed chunk is only visible now.
+		for (const flag of budget.scan(found.output, flagTags)) {
+			structure.flags.push({
+				offset: chunk.payloadOffset,
+				text: flag.text,
+				region: `inside ${chunk.kind}, after inflating`,
+				credible: true
+			});
 		}
 	}
+
+	return unopened;
+}
+
+/** Filters that hold a picture, which a stream is opened for by the magic scan or not at all. */
+const IMAGE_FILTERS = new Set(['DCTDecode', 'JPXDecode', 'CCITTFaxDecode', 'JBIG2Decode']);
+
+/**
+ * Undoes the filter chain on every stream a PDF's objects carry, and flag-scans the
+ * result.
+ *
+ * A flag or a signature living inside a compressed stream is invisible to the raw
+ * byte-level survey, which runs before any of this, so this is the only place it is
+ * ever found.
+ *
+ * @return how many streams were not opened
+ */
+function inflatePdfStreams(
+	bytes: Uint8Array,
+	pdf: PdfStructure,
+	flagTags: string,
+	budget: InflateBudget
+): number {
+	let unopened = 0;
+
+	for (const object of pdf.objects) {
+		const stream = object.stream;
+		if (!stream || !stream.filter || stream.length === 0) continue;
+		if (IMAGE_FILTERS.has(stream.filter.split(' then ')[0])) continue;
+		if (budget.spent) {
+			stream.error = NOT_OPENED;
+			unopened += 1;
+			continue;
+		}
+
+		const packed = bytes.subarray(stream.offset, stream.offset + stream.length);
+		const found = unpackOpened(pdf_stream(packed, stream.filter, budget.streamLimit));
+		budget.charge(found.output.length);
+
+		stream.error = damageOf(found) ?? undefined;
+		if (found.output.length === 0) continue;
+
+		stream.decoded = found.output.length;
+		if (budget.keep(Math.min(found.output.length, TEXT_PREVIEW))) {
+			stream.text = preview(found.output, TEXT_PREVIEW);
+		}
+
+		const flags = budget.scan(found.output, flagTags);
+		if (flags.length > 0) object.flags = flags.map((f) => f.text);
+	}
+
+	return unopened;
 }
 
 /**
- * Inflates every FlateDecode stream a PDF's objects carry, and flag-scans
- * the result.
+ * The flags in a database, with where they were.
  *
- * Rust locates the stream but does not decompress it, for the same reason
- * `inflateTextChunks` does not: inflate is a platform call. A flag or a
- * signature living inside a compressed stream is invisible to the raw
- * byte-level survey, which runs before any of this, so this is the only
- * place it is ever found.
+ * The core searched every live value whole, since what a cell shows stops at 240 bytes.
+ * A deleted row is only ever what could be carved out of a page, so that is what gets
+ * read here, a cell at a time, since the columns of a row sit side by side in the file and
+ * a flag with a word before it stops looking like a flag.
  */
-async function inflatePdfStreams(
-	bytes: Uint8Array,
-	pdf: PdfStructure,
-	flagTags: string
-): Promise<void> {
-	for (const object of pdf.objects) {
-		const stream = object.stream;
-		if (!stream || stream.filter !== 'FlateDecode' || stream.length === 0) continue;
-
-		try {
-			const packed = bytes.subarray(stream.offset, stream.offset + stream.length);
-			const raw = await inflate(packed);
-			stream.text = new TextDecoder('utf-8', { fatal: false }).decode(raw);
-
-			const found = JSON.parse(find_flags_for_tags(raw, flagTags)) as Found[];
-			if (found.length > 0) object.flags = found.map((f) => f.text);
-		} catch (error: unknown) {
-			stream.error = error instanceof Error ? error.message : String(error);
-		}
-	}
-}
-
-/** Scans each cell of a database on its own, since the columns of a row sit side by
- *  side in the file and a flag with a word before it stops looking like a flag. */
 function flagSqliteCells(db: SqliteDatabase, flagTags: string): void {
 	const encoder = new TextEncoder();
 	const flags: NonNullable<SqliteDatabase['flags']> = [];
 
 	for (const table of db.tables) {
-		for (const [rows, deleted] of [
-			[table.rows, false],
-			[table.deleted, true]
-		] as const) {
-			for (const cell of rows.flat()) {
-				const found = JSON.parse(
-					find_flags_for_tags(encoder.encode(cell.text), flagTags)
-				) as Found[];
-				for (const { text } of found) flags.push({ text, table: table.name, deleted });
+		for (const text of table.flags ?? []) {
+			flags.push({ text, table: table.name, deleted: false });
+		}
+		for (const cell of table.deleted.flat()) {
+			if (!cell.text.includes('{')) continue;
+			for (const { text } of scanFlags(encoder.encode(cell.text), flagTags).flags) {
+				flags.push({ text, table: table.name, deleted: true });
 			}
 		}
 	}
@@ -281,21 +416,129 @@ function withInflatedText(bytes: Uint8Array, structure: Structure | null): Uint8
 	return combined;
 }
 
+/** Why an entry cannot be opened whatever the budgets say, if it cannot. */
+function whyNotOpened(entry: ZipEntry, fileLength: number): string | null {
+	if (entry.dataOffset === null) return 'the directory points here, but there is no header';
+	if (entry.encrypted) return 'encrypted';
+	if (!readableMethod(entry.method) && !readableMethod(entry.localMethod)) {
+		return `${entry.method} compression, which Trawl does not read`;
+	}
+	if (entry.dataOffset >= fileLength && (entry.readLength ?? 0) > 0) {
+		return 'its data would start past the end of the file';
+	}
+	return null;
+}
+
+function readableMethod(method: string | null | undefined): boolean {
+	return method === 'stored' || method === 'deflate';
+}
+
+/**
+ * An entry's content, by whichever method was claimed that can be read.
+ *
+ * Where the two descriptions disagree, a deflate stream that reads cleanly settles it,
+ * since stored bytes almost never pass for one, and a reader taking the other's word
+ * would come away with noise.
+ */
+function readEntry(bytes: Uint8Array, entry: ZipEntry, limit: number): Opened {
+	const start = entry.dataOffset ?? bytes.length;
+	const data = bytes.subarray(start, start + (entry.readLength ?? entry.compressed));
+	const said = [entry.method, entry.localMethod];
+
+	if (said.includes('deflate')) {
+		const found = inflate(data, 'raw', limit);
+		if (!found.error || !said.includes('stored')) return found;
+	}
+	return {
+		output: data.subarray(0, limit),
+		error: null,
+		capped: data.length > limit,
+		trailing: 0
+	};
+}
+
+/**
+ * Opens what entries it can, keeps what it can of that for the page, and writes on each
+ * one that was not opened why not.
+ *
+ * @return how many entries the budget left unopened
+ */
+function inflateZipEntries(
+	bytes: Uint8Array,
+	zip: ZipArchive,
+	flagTags: string,
+	budget: InflateBudget
+): number {
+	let unopened = 0;
+
+	for (const entry of zip.entries) {
+		const refused = whyNotOpened(entry, bytes.length);
+		if (refused) {
+			entry.notOpened = refused;
+			continue;
+		}
+		if ((entry.readLength ?? entry.compressed) === 0) continue;
+		if (budget.spent) {
+			entry.notOpened = NOT_OPENED;
+			unopened += 1;
+			continue;
+		}
+
+		const found = readEntry(bytes, entry, budget.streamLimit);
+		const raw = found.output;
+		budget.charge(raw.length);
+
+		entry.readError = damageOf(found) ?? undefined;
+		if (raw.length !== entry.uncompressed && !found.capped && !found.error) {
+			const said = `declares ${entry.uncompressed.toLocaleString()} bytes and holds ${raw.length.toLocaleString()}`;
+			entry.disagreement = entry.disagreement ? `${entry.disagreement}; ${said}` : said;
+		}
+		if (raw.length === 0) continue;
+
+		if (budget.keep(raw.length)) entry.bytes = raw.slice();
+		entry.flags = budget.scan(raw, flagTags).map((f) => f.text);
+		if (printableRatio(raw) >= 0.85 && budget.keep(Math.min(raw.length, ZIP_TEXT_PREVIEW))) {
+			entry.text = preview(raw, ZIP_TEXT_PREVIEW);
+		}
+	}
+
+	return unopened;
+}
+
 /** Context shared by the recursive walk, so budgets are global and dedupe works. */
 class RecursionContext {
-	seen = new Map<string, string>(); // fingerprint -> stable id
+	readonly inflate = new InflateBudget();
+	/** Everything analysed so far, by where it was found. */
+	readonly seen = new SeenBytes<string>();
 	childrenAnalysed = 0;
 	expandedBytes = 0;
 	capped = false;
+	depthReached = false;
+	clockRanOut = false;
+	unlisted = 0;
+	/** Compressed streams inside nested files that the budget left unopened. */
+	unopened = 0;
+	findingsDropped = false;
+	private skipsListed = 0;
+	private findingsLeft = RECURSION_FINDINGS_KEPT;
+	private readonly deadline = performance.now() + RECURSION_TIME_LIMIT;
 
-	/** Reserve budget for a child; returns false if any limit is hit. */
-	tryReserve(childBytes: number): boolean {
-		if (this.capped) return false;
+	/** What stops another child from being opened at all, if anything does. */
+	refusal(): string | null {
+		if (performance.now() > this.deadline) {
+			this.capped = true;
+			this.clockRanOut = true;
+			return CLOCK_SPENT;
+		}
 		if (this.childrenAnalysed >= RECURSION_MAX_CHILDREN) {
 			this.capped = true;
-			return false;
+			return BUDGET_SPENT;
 		}
-		if (childBytes > RECURSION_PER_CHILD_LIMIT) return false;
+		return null;
+	}
+
+	/** Charges a child for the bytes it really turned out to hold. */
+	tryReserve(childBytes: number): boolean {
 		if (this.expandedBytes + childBytes > RECURSION_AGGREGATE_LIMIT) {
 			this.capped = true;
 			return false;
@@ -305,66 +548,254 @@ class RecursionContext {
 		return true;
 	}
 
-	/** Check if already seen; if so return the existing id. Otherwise register and return null. */
-	checkDuplicate(bytes: Uint8Array): string | null {
-		const fp = fingerprint(bytes);
-		const existing = this.seen.get(fp);
-		if (existing) return existing;
-		return null;
+	/** Whether another skipped child gets a line of its own. */
+	listSkip(): boolean {
+		if (this.skipsListed >= RECURSION_SKIPS_LISTED) {
+			this.unlisted += 1;
+			return false;
+		}
+		this.skipsListed += 1;
+		return true;
 	}
 
-	register(bytes: Uint8Array, id: string): void {
-		this.seen.set(fingerprint(bytes), id);
+	keepFindings(findings: DerivedFinding[]): DerivedFinding[] {
+		const kept = findings.slice(0, this.findingsLeft);
+		this.findingsLeft -= kept.length;
+		this.findingsDropped ||= kept.length < findings.length;
+		return kept;
 	}
 }
 
+type ChildSource = { name: string; source: 'zip' | 'carved'; offset: number; size: number };
+
+function childId({ source, offset }: ChildSource, depth: number): string {
+	return `${source}-${offset}-${depth}`;
+}
+
+function skippedChild(
+	child: ChildSource,
+	depth: number,
+	status: 'skipped' | 'error',
+	reason: string,
+	format: string = status
+): NestedArtifact {
+	return {
+		id: childId(child, depth),
+		name: child.name,
+		source: child.source,
+		offset: child.offset,
+		format,
+		size: child.size,
+		depth,
+		status,
+		reason,
+		findings: [],
+		children: []
+	};
+}
+
+function canRecurse(label: string): boolean {
+	return [
+		'PNG image',
+		'BMP image',
+		'GIF image',
+		'RIFF container',
+		'JPEG image',
+		'ZIP archive',
+		'PDF document'
+	].includes(label);
+}
+
 /**
- * Runs the full detector set on a file and returns a compact summary.
+ * Opens everything inside a file, within the walk's budgets, and hangs what it finds on
+ * `artifact`. A file past any of them gets a line saying which, rather than vanishing.
+ */
+function descend(
+	artifact: NestedArtifact,
+	bytes: Uint8Array,
+	zip: ZipArchive | null,
+	survey: Survey,
+	flagTags: string,
+	context: RecursionContext,
+	depth: number,
+	origin: string
+): void {
+	const next = depth + 1;
+	const skip = (
+		child: ChildSource,
+		status: 'skipped' | 'error',
+		reason: string,
+		format?: string
+	) => {
+		if (context.listSkip())
+			artifact.children.push(skippedChild(child, next, status, reason, format));
+	};
+
+	/** The checks every child goes through once its bytes are in hand. */
+	const analyse = (child: ChildSource, raw: Uint8Array, damage: string | null) => {
+		const earlier = context.seen.find(raw);
+		if (earlier !== undefined) {
+			skip({ ...child, size: raw.length }, 'skipped', `duplicate of ${earlier}`, 'duplicate');
+			return;
+		}
+		if (!context.tryReserve(raw.length)) {
+			skip({ ...child, size: raw.length }, 'skipped', BUDGET_SPENT);
+			return;
+		}
+
+		try {
+			const found = analyseInternal(child, raw, flagTags, context, next, origin);
+			if (damage) found.damage = found.damage ? `${damage}; ${found.damage}` : damage;
+			artifact.children.push(found);
+		} catch (error: unknown) {
+			const reason = error instanceof Error ? error.message : String(error);
+			artifact.children.push(skippedChild({ ...child, size: raw.length }, next, 'error', reason));
+		}
+	};
+
+	const atTheBottom = depth >= RECURSION_MAX_DEPTH;
+	const embedded = survey.magic.filter((hit) => hit.embedded && canRecurse(hit.label));
+	if (atTheBottom) {
+		if (embedded.length > 0 || (zip?.entries.length ?? 0) > 0) {
+			context.capped = true;
+			context.depthReached = true;
+		}
+		return;
+	}
+
+	/** The stretches of this file that an entry read to its end, with nothing left over. */
+	const read: (readonly [number, number])[] = [];
+
+	for (const entry of zip?.entries ?? []) {
+		const child: ChildSource = {
+			name: entry.name,
+			source: 'zip',
+			offset: entry.offset,
+			size: entry.uncompressed
+		};
+
+		const refused = whyNotOpened(entry, bytes.length);
+		if (refused) {
+			skip(child, 'skipped', refused);
+			continue;
+		}
+		if ((entry.readLength ?? entry.compressed) === 0) continue;
+
+		const stopped = context.refusal();
+		if (stopped) {
+			skip(child, 'skipped', stopped);
+			continue;
+		}
+
+		// What the root's own pass already opened and kept need not be opened twice.
+		let raw = depth === 0 ? entry.bytes : undefined;
+		let damage = depth === 0 ? (entry.readError ?? null) : null;
+		if (!raw) {
+			if (context.inflate.spent) {
+				context.capped = true;
+				skip(child, 'skipped', NOT_OPENED);
+				continue;
+			}
+			const found = readEntry(bytes, entry, context.inflate.streamLimit);
+			context.inflate.charge(found.output.length);
+			raw = found.output;
+			damage = damageOf(found);
+			if (raw.length === 0) {
+				if (found.error) skip(child, 'error', found.error);
+				continue;
+			}
+		}
+
+		analyse(child, raw, damage);
+		if (!damage && entry.dataOffset !== null) {
+			read.push([entry.dataOffset, entry.dataOffset + (entry.readLength ?? entry.compressed)]);
+		}
+	}
+
+	// A signature inside something this archive already read was read when that was, and the
+	// signature at each of its own headers is only the archive itself again. A span a stream
+	// never reached proves nothing: broken or short deflate can claim to cover any bytes.
+	const headers = new Set(zip?.entries.map((entry) => entry.offset));
+	const inEntry = spansHolding(read);
+
+	for (const hit of embedded) {
+		if (hit.offset + hit.length > bytes.length) continue;
+		if (headers.has(hit.offset) || inEntry(hit.offset, hit.length)) continue;
+
+		const child: ChildSource = {
+			name: hit.label,
+			source: 'carved',
+			offset: hit.offset,
+			size: hit.length
+		};
+
+		const stopped = context.refusal();
+		if (stopped) {
+			skip(child, 'skipped', stopped);
+			continue;
+		}
+
+		analyse(child, bytes.subarray(hit.offset, hit.offset + hit.length), null);
+	}
+}
+
+/** What a nested file's own streams would not give up, in a line. */
+function troubleIn(structure: Structure | null, pdf: PdfStructure | null): string | undefined {
+	const errors = [
+		...(structure?.text ?? []).map((chunk) => chunk.error),
+		...(pdf?.objects ?? []).map((object) => object.stream?.error)
+	].filter((error) => error !== undefined);
+
+	return errors.length > 1 ? `${errors[0]}, and ${errors.length - 1} more like it` : errors[0];
+}
+
+/** Whether a range sits inside one of these stretches of a file. */
+function spansHolding(
+	stretches: (readonly [number, number])[]
+): (offset: number, length: number) => boolean {
+	const spans = [...stretches].sort((a, b) => a[0] - b[0]);
+
+	return (offset, length) => {
+		let low = 0;
+		let high = spans.length;
+		while (low < high) {
+			const middle = (low + high) >> 1;
+			if (spans[middle][0] <= offset) low = middle + 1;
+			else high = middle;
+		}
+		return low > 0 && offset + length <= spans[low - 1][1];
+	};
+}
+
+/**
+ * Runs the full detector set on a file inside another and returns a compact summary.
  * Summary mode skips plane-wall thumbnails and spectrogram pixels.
  */
-async function analyseInternal(
-	id: number,
-	name: string,
+function analyseInternal(
+	child: ChildSource,
 	bytes: Uint8Array,
 	flagTags: string,
 	context: RecursionContext,
 	depth: number,
-	sourceKind: 'zip' | 'carved',
-	sourceOffset: number,
 	parentOrigin: string
-): Promise<NestedArtifact> {
-	const stableId = `${sourceKind}-${sourceOffset}-${depth}`;
+): NestedArtifact {
+	const { name, source: sourceKind, offset: sourceOffset } = child;
 	const origin = parentOrigin ? `${parentOrigin} / ${name}` : name;
+	context.seen.add(bytes, origin);
 
-	// Check duplicate first
-	const existing = context.checkDuplicate(bytes);
-	if (existing) {
-		return {
-			id: stableId,
-			name,
-			source: sourceKind,
-			offset: sourceOffset,
-			format: 'duplicate',
-			size: bytes.length,
-			depth,
-			status: 'skipped',
-			reason: `duplicate of ${existing}`,
-			findings: [],
-			children: []
-		};
-	}
-
-	const survey = JSON.parse(file_survey(bytes)) as Survey;
-	const walked = JSON.parse(png_structure(bytes)) as Structure;
+	const survey = JSON.parse(file_survey(bytes, flagTags)) as Survey;
+	const walked = JSON.parse(png_structure(bytes, flagTags)) as Structure;
 	const structure = walked.signature ? walked : null;
 
-	if (structure) await inflateTextChunks(bytes, structure, flagTags);
+	if (structure) {
+		context.unopened += inflateTextChunks(bytes, structure, flagTags, context.inflate);
+	}
 
 	const wav = JSON.parse(wav_structure(bytes)) as WavStructure | WavError | null;
 	const zip = JSON.parse(zip_structure(bytes)) as ZipArchive | null;
 
-	const aes = JSON.parse(aes_probe(withInflatedText(bytes, structure))) as AesSolved[];
-	const jpeg = JSON.parse(jpeg_stego(bytes, SWEEP_BYTES, CHI_STEPS_JPEG)) as
+	const aes = JSON.parse(aes_probe(withInflatedText(bytes, structure), flagTags)) as AesSolved[];
+	const jpeg = JSON.parse(jpeg_stego(bytes, SWEEP_BYTES, CHI_STEPS_JPEG, flagTags)) as
 		JpegStego | JpegError | null;
 
 	let sweep: Sweep | null = null;
@@ -373,35 +804,33 @@ async function analyseInternal(
 	let paletteStego: PaletteStego | null = null;
 	let audio: AudioSweep | null = null;
 
-	let inflated: Uint8Array = new Uint8Array();
-	let hasPixels = false;
+	const pixels = pixelInput(bytes, structure !== null, CHILD_PIXEL_LIMIT);
 
-	try {
-		inflated = await pixelInput(bytes, structure !== null);
-		hasPixels = true;
-	} catch {
-		// pixelInput errors are not propagated in recursive analysis
-	}
-
-	if (hasPixels) {
+	if (pixels.error === null) {
+		let image: DecodedPixels | null = null;
 		try {
 			if (structure) {
-				structure.palette = JSON.parse(png_palette(bytes, inflated)) as Structure['palette'];
+				structure.palette = JSON.parse(png_palette(bytes, pixels.inflated)) as Structure['palette'];
 			}
 
-			paletteStego = JSON.parse(palette_stego(bytes, inflated, SWEEP_BYTES)) as PaletteStego | null;
+			paletteStego = JSON.parse(
+				palette_stego(bytes, pixels.inflated, SWEEP_BYTES, flagTags)
+			) as PaletteStego | null;
 
-			sweep = JSON.parse(lsb_sweep(bytes, inflated, SWEEP_BYTES)) as Sweep;
-			chi = JSON.parse(chi_square(bytes, inflated, CHI_STEPS)) as ChiSquare;
-			rs = JSON.parse(rs_analysis(bytes, inflated)) as RsAnalysis;
+			image = new DecodedPixels(bytes, pixels.inflated);
+			sweep = JSON.parse(image.lsb_sweep(SWEEP_BYTES, flagTags)) as Sweep;
+			chi = JSON.parse(image.chi_square(CHI_STEPS)) as ChiSquare;
+			rs = JSON.parse(image.rs_analysis()) as RsAnalysis;
 		} catch {
 			// Pixel detectors failed; leave them null
+		} finally {
+			image?.free();
 		}
 	}
 
 	if (wav && !isWavError(wav)) {
 		try {
-			audio = JSON.parse(wav_lsb_sweep(bytes, SWEEP_BYTES)) as AudioSweep;
+			audio = JSON.parse(wav_lsb_sweep(bytes, SWEEP_BYTES, flagTags)) as AudioSweep;
 		} catch {
 			// Audio LSB failed; leave null
 		}
@@ -531,6 +960,43 @@ async function analyseInternal(
 		}
 	}
 
+	// The readers that only find a flag once they have read the format. A capture or a
+	// database in an archive is as common as one on its own.
+	const pdf = JSON.parse(pdf_structure(bytes)) as PdfStructure | null;
+	if (pdf) {
+		context.unopened += inflatePdfStreams(bytes, pdf, flagTags, context.inflate);
+		for (const object of pdf.objects) {
+			for (const text of object.flags ?? []) {
+				findings.push({ text, detector: 'PDF stream', origin, reason: `object ${object.number}` });
+			}
+		}
+	}
+
+	const sqlite = JSON.parse(sqlite_database(bytes, flagTags)) as SqliteDatabase | null;
+	if (sqlite) {
+		flagSqliteCells(sqlite, flagTags);
+		for (const found of sqlite.flags ?? []) {
+			findings.push({
+				text: found.text,
+				detector: 'SQLite cell',
+				origin,
+				reason: `${found.deleted ? 'deleted row' : 'row'} in ${found.table}`
+			});
+		}
+	}
+
+	const pcap = JSON.parse(pcap_capture(bytes, flagTags)) as PcapCapture | null;
+	for (const stream of pcap?.streams ?? []) {
+		for (const text of stream.flags) {
+			findings.push({
+				text,
+				detector: 'TCP stream',
+				origin,
+				reason: `${stream.src} to ${stream.dst}`
+			});
+		}
+	}
+
 	// Structural anomalies
 	if (structure?.trailing) {
 		findings.push({
@@ -612,7 +1078,7 @@ async function analyseInternal(
 	}
 
 	const artifact: NestedArtifact = {
-		id: stableId,
+		id: childId(child, depth),
 		name,
 		source: sourceKind,
 		offset: sourceOffset,
@@ -620,190 +1086,58 @@ async function analyseInternal(
 		size: bytes.length,
 		depth,
 		status: 'analysed',
-		findings: [...findings, ...gifFindings],
+		findings: context.keepFindings([...findings, ...gifFindings]),
+		damage: troubleIn(structure, pdf),
 		children: []
 	};
 
-	context.register(bytes, stableId);
-
-	// Recurse into ZIP entries
-	if (zip && depth < RECURSION_MAX_DEPTH) {
-		for (const entry of zip.entries) {
-			if (entry.dataOffset === null || entry.encrypted || entry.compressed === 0) continue;
-			if (entry.method !== 'stored' && entry.method !== 'deflate') continue;
-			if (entry.uncompressed > RECURSION_PER_CHILD_LIMIT) continue;
-
-			const end = entry.dataOffset + entry.compressed;
-			if (end > bytes.length) continue;
-
-			if (!context.tryReserve(entry.uncompressed)) {
-				artifact.children.push({
-					id: `${sourceKind}-${entry.offset}-${depth + 1}`,
-					name: entry.name,
-					source: 'zip',
-					offset: entry.offset,
-					format: 'skipped',
-					size: entry.uncompressed,
-					depth: depth + 1,
-					status: 'skipped',
-					reason: 'recursion budget exhausted',
-					findings: [],
-					children: []
-				});
-				continue;
-			}
-
-			try {
-				const packed = bytes.subarray(entry.dataOffset, end);
-				const raw = entry.method === 'deflate' ? await inflateRaw(packed) : packed;
-
-				// Validate inflated size
-				if (raw.length > entry.uncompressed) {
-					artifact.children.push({
-						id: `${sourceKind}-${entry.offset}-${depth + 1}`,
-						name: entry.name,
-						source: 'zip',
-						offset: entry.offset,
-						format: 'error',
-						size: raw.length,
-						depth: depth + 1,
-						status: 'error',
-						reason: 'decompressed size exceeds declared',
-						findings: [],
-						children: []
-					});
-					continue;
-				}
-
-				const child = await analyseInternal(
-					id,
-					entry.name,
-					raw,
-					flagTags,
-					context,
-					depth + 1,
-					'zip',
-					entry.offset,
-					origin
-				);
-				artifact.children.push(child);
-			} catch (error: unknown) {
-				artifact.children.push({
-					id: `${sourceKind}-${entry.offset}-${depth + 1}`,
-					name: entry.name,
-					source: 'zip',
-					offset: entry.offset,
-					format: 'error',
-					size: entry.uncompressed,
-					depth: depth + 1,
-					status: 'error',
-					reason: error instanceof Error ? error.message : String(error),
-					findings: [],
-					children: []
-				});
-			}
-		}
-	}
-
-	// Recurse into magic-carved embedded files
-	if (depth < RECURSION_MAX_DEPTH) {
-		for (const hit of survey.magic) {
-			if (!hit.embedded) continue;
-			if (hit.offset + hit.length > bytes.length) continue;
-
-			// Only recurse into formats we can actually decode
-			const slice = bytes.subarray(hit.offset, hit.offset + hit.length);
-			if (!canRecurse(hit.label)) continue;
-
-			if (!context.tryReserve(hit.length)) {
-				artifact.children.push({
-					id: `carved-${hit.offset}-${depth + 1}`,
-					name: hit.label,
-					source: 'carved',
-					offset: hit.offset,
-					format: 'skipped',
-					size: hit.length,
-					depth: depth + 1,
-					status: 'skipped',
-					reason: 'recursion budget exhausted',
-					findings: [],
-					children: []
-				});
-				continue;
-			}
-
-			try {
-				const child = await analyseInternal(
-					id,
-					hit.label,
-					slice,
-					flagTags,
-					context,
-					depth + 1,
-					'carved',
-					hit.offset,
-					origin
-				);
-				artifact.children.push(child);
-			} catch (error: unknown) {
-				artifact.children.push({
-					id: `carved-${hit.offset}-${depth + 1}`,
-					name: hit.label,
-					source: 'carved',
-					offset: hit.offset,
-					format: 'error',
-					size: hit.length,
-					depth: depth + 1,
-					status: 'error',
-					reason: error instanceof Error ? error.message : String(error),
-					findings: [],
-					children: []
-				});
-			}
-		}
-	}
-
-	// Suppress root ZIP magic hit when the same range is already covered by archive parsing
-	if (depth === 0 && zip) {
-		// The magic scan will find the ZIP entries again; suppress them if they're the same ranges
-		artifact.children = artifact.children.filter((child) => {
-			if (child.source !== 'carved') return true;
-			// Check if this carved file overlaps a ZIP entry we already have
-			const zipEntry = zip.entries.find(
-				(e) =>
-					e.dataOffset !== null &&
-					child.offset >= e.dataOffset &&
-					child.offset + child.size <= e.dataOffset + e.compressed
-			);
-			return !zipEntry;
-		});
-	}
+	descend(artifact, bytes, zip, survey, flagTags, context, depth, origin);
 
 	return artifact;
 }
 
-function canRecurse(label: string): boolean {
-	// Only recurse into formats our decoder handles
-	const supported = [
-		'PNG image',
-		'BMP image',
-		'GIF image',
-		'WAV audio',
-		'JPEG image',
-		'ZIP archive'
-	];
-	return supported.some((s) => label.includes(s));
+function countDamaged(artifact: NestedArtifact): number {
+	let count = artifact.damage ? 1 : 0;
+	for (const child of artifact.children) {
+		count += countDamaged(child);
+	}
+	return count;
 }
+
+function countSkipped(artifact: NestedArtifact): number {
+	let count = artifact.status === 'skipped' ? 1 : 0;
+	for (const child of artifact.children) {
+		count += countSkipped(child);
+	}
+	return count;
+}
+
+const NO_SURVEY = (size: number): Survey => ({
+	size,
+	format: null,
+	flags: [],
+	magic: [],
+	exif: null,
+	jpegSegments: [],
+	jpegComments: [],
+	jpegTrailing: null,
+	strings: { total: 0, wide: 0, sample: [] },
+	entropy: { window: 0, values: [] }
+});
+
+const FLAGS_CUT_SHORT =
+	'This file holds more distinct flags than Trawl lists, so the list stops partway. Anything past that point is not shown.';
 
 async function analyseRoot(
 	id: number,
 	name: string,
 	bytes: Uint8Array,
 	flagTags: string
-): Promise<{ response: AnalysisResponse; nested: NestedAnalysis; gif: GifAnalysis | null }> {
+): Promise<AnalysisResponse> {
 	await ready;
 
 	const crashed: string[] = [];
+	const notes: string[] = [];
 
 	/** One reader crashing on a hostile file should not cost the results of the rest. */
 	function attempt<T>(reader: string, read: () => T, fallback: T): T {
@@ -815,18 +1149,32 @@ async function analyseRoot(
 		}
 	}
 
-	const context = new RecursionContext();
+	// The last file's image is in the way of this one, and nothing can ask for it now.
+	cached?.image?.free();
+	cached = null;
 
-	// Run the internal analyzer on the root file
-	const rootArtifact = await analyseInternal(id, name, bytes, flagTags, context, 0, 'zip', 0, '');
+	const budget = new InflateBudget();
+	let unopenedStreams = 0;
 
-	// Now run the FULL analysis for the root (with plane wall, spectrogram, etc.)
-	// This is the original analyse logic but we need to merge findings
-	const survey = JSON.parse(file_survey(bytes)) as Survey;
-	const walked = attempt('PNG', () => JSON.parse(png_structure(bytes)) as Structure, null);
+	const survey = attempt(
+		'byte scan',
+		() => JSON.parse(file_survey(bytes, flagTags)) as Survey,
+		NO_SURVEY(bytes.length)
+	);
+	const walked = attempt(
+		'PNG',
+		() => JSON.parse(png_structure(bytes, flagTags)) as Structure,
+		null
+	);
 	const structure = walked?.signature ? walked : null;
 
-	if (structure) await inflateTextChunks(bytes, structure, flagTags);
+	if (structure) {
+		unopenedStreams += attempt(
+			'PNG text',
+			() => inflateTextChunks(bytes, structure, flagTags, budget),
+			0
+		);
+	}
 
 	const wav = attempt(
 		'WAV',
@@ -834,10 +1182,22 @@ async function analyseRoot(
 		null
 	);
 	const zip = attempt('ZIP', () => JSON.parse(zip_structure(bytes)) as ZipArchive | null, null);
-	if (zip) await inflateZipEntries(bytes, zip, flagTags);
+	if (zip) {
+		unopenedStreams += attempt(
+			'ZIP entry',
+			() => inflateZipEntries(bytes, zip, flagTags, budget),
+			0
+		);
+	}
 
 	const pdf = attempt('PDF', () => JSON.parse(pdf_structure(bytes)) as PdfStructure | null, null);
-	if (pdf) await inflatePdfStreams(bytes, pdf, flagTags);
+	if (pdf) {
+		unopenedStreams += attempt(
+			'PDF stream',
+			() => inflatePdfStreams(bytes, pdf, flagTags, budget),
+			0
+		);
+	}
 
 	const binary = attempt(
 		'binary',
@@ -851,7 +1211,7 @@ async function analyseRoot(
 	);
 	const sqlite = attempt(
 		'SQLite',
-		() => JSON.parse(sqlite_database(bytes)) as SqliteDatabase | null,
+		() => JSON.parse(sqlite_database(bytes, flagTags)) as SqliteDatabase | null,
 		null
 	);
 	if (sqlite) attempt('SQLite', () => flagSqliteCells(sqlite, flagTags), undefined);
@@ -863,13 +1223,14 @@ async function analyseRoot(
 
 	const aes = attempt(
 		'AES',
-		() => JSON.parse(aes_probe(withInflatedText(bytes, structure))) as AesSolved[],
+		() => JSON.parse(aes_probe(withInflatedText(bytes, structure), flagTags)) as AesSolved[],
 		[]
 	);
 	const jpeg = attempt(
 		'JPEG',
 		() =>
-			JSON.parse(jpeg_stego(bytes, SWEEP_BYTES, CHI_STEPS_JPEG)) as JpegStego | JpegError | null,
+			JSON.parse(jpeg_stego(bytes, SWEEP_BYTES, CHI_STEPS_JPEG, flagTags)) as
+				JpegStego | JpegError | null,
 		null
 	);
 
@@ -880,31 +1241,52 @@ async function analyseRoot(
 	let paletteStego: PaletteStego | null = null;
 	let audio: AudioSweep | null = null;
 	let spectrogram: Spectrogram | null = null;
-	let pixelError: string | null = null;
 	let audioError: string | null = null;
 
-	let inflated: Uint8Array = new Uint8Array();
-	try {
-		inflated = await pixelInput(bytes, structure !== null, ROOT_PIXEL_LIMIT);
-	} catch (error: unknown) {
-		pixelError = error instanceof Error ? error.message : String(error);
-	}
+	const pixels = attempt(
+		'pixel data',
+		() => pixelInput(bytes, structure !== null, ROOT_PIXEL_LIMIT),
+		{
+			inflated: new Uint8Array(),
+			damage: null,
+			error: null
+		}
+	);
+	let pixelError = pixels.error;
 
 	// Held whatever happened above
-	cached = { bytes, inflated };
+	const held = { bytes, inflated: pixels.inflated, image: null as DecodedPixels | null };
+	cached = held;
 
 	if (pixelError === null) {
 		try {
 			if (structure) {
-				structure.palette = JSON.parse(png_palette(bytes, inflated)) as Structure['palette'];
+				structure.palette = JSON.parse(png_palette(bytes, pixels.inflated)) as Structure['palette'];
 			}
 
-			paletteStego = JSON.parse(palette_stego(bytes, inflated, SWEEP_BYTES)) as PaletteStego | null;
+			paletteStego = JSON.parse(
+				palette_stego(bytes, pixels.inflated, SWEEP_BYTES, flagTags)
+			) as PaletteStego | null;
 
-			sweep = JSON.parse(lsb_sweep(bytes, inflated, SWEEP_BYTES)) as Sweep;
-			wall = readWall(plane_wall(bytes, inflated, THUMB_WIDTH));
-			chi = JSON.parse(chi_square(bytes, inflated, CHI_STEPS)) as ChiSquare;
-			rs = JSON.parse(rs_analysis(bytes, inflated)) as RsAnalysis;
+			const image = new DecodedPixels(bytes, pixels.inflated);
+			held.image = image;
+
+			sweep = JSON.parse(image.lsb_sweep(SWEEP_BYTES, flagTags)) as Sweep;
+			wall = readWall(image.plane_wall(THUMB_WIDTH));
+			chi = JSON.parse(image.chi_square(CHI_STEPS)) as ChiSquare;
+			rs = JSON.parse(image.rs_analysis()) as RsAnalysis;
+
+			const rows = image.rows();
+			const declared = image.declared_rows();
+			if (rows < declared) {
+				notes.push(
+					`The image data stops short${pixels.damage ? ` (${pixels.damage})` : ''}. Trawl read ${rows.toLocaleString()} of ${declared.toLocaleString()} rows, as a browser would, and ran the pixel tools on those.`
+				);
+			} else if (pixels.damage) {
+				notes.push(
+					`The image data is damaged (${pixels.damage}). Every row could still be read, so the pixel tools ran on all of them.`
+				);
+			}
 		} catch (error: unknown) {
 			pixelError = error instanceof Error ? error.message : String(error);
 		}
@@ -912,7 +1294,7 @@ async function analyseRoot(
 
 	if (wav && !isWavError(wav)) {
 		try {
-			audio = JSON.parse(wav_lsb_sweep(bytes, SWEEP_BYTES)) as AudioSweep;
+			audio = JSON.parse(wav_lsb_sweep(bytes, SWEEP_BYTES, flagTags)) as AudioSweep;
 		} catch (error: unknown) {
 			audioError = error instanceof Error ? error.message : String(error);
 		}
@@ -935,19 +1317,95 @@ async function analyseRoot(
 		}
 	}
 
-	// Build nested analysis envelope from the root artifact
-	const nested: NestedAnalysis = {
-		roots: rootArtifact.children,
-		analysed: context.childrenAnalysed,
-		skipped: countSkipped(rootArtifact),
-		expandedBytes: context.expandedBytes,
-		capped: context.capped
+	// The walk comes last and is held apart: what it opens can be built to take as long as
+	// it is given, and a failure part way through costs what it had not reached yet.
+	const context = new RecursionContext();
+	context.seen.add(bytes, name);
+	const top: NestedArtifact = {
+		id: 'root',
+		name,
+		source: 'zip',
+		offset: 0,
+		format: survey.format,
+		size: bytes.length,
+		depth: 0,
+		status: 'analysed',
+		findings: [],
+		children: []
 	};
+	attempt(
+		'nested file',
+		() => descend(top, bytes, zip, survey, flagTags, context, 0, ''),
+		undefined
+	);
 
-	const response: AnalysisResponse = {
+	const unopened = unopenedStreams + context.unopened;
+	if (unopened > 0) {
+		notes.push(
+			`This file asks for more decompression than Trawl will do, so ${unopened.toLocaleString()} compressed ${unopened === 1 ? 'stream was' : 'streams were'} not opened. A flag inside one would not show here.`
+		);
+	}
+	const damaged = countDamaged(top);
+	if (damaged > 0) {
+		notes.push(
+			`${damaged.toLocaleString()} nested ${damaged === 1 ? 'file' : 'files'} could not be read in full, so a flag in what went unread would not show here. The writeup lists which.`
+		);
+	}
+	if (sqlite?.flagsTruncated) {
+		notes.push(
+			'Trawl could not read every long database cell to its end, so a flag in what it did not reach would not show here.'
+		);
+	}
+	if (zip?.capped) {
+		notes.push(
+			`Trawl stopped reading local headers at ${zip.entries.length.toLocaleString()}. Entries the directory lists were still opened, and any others past that point were not found.`
+		);
+	}
+	if (context.clockRanOut) {
+		notes.push(
+			'The time budget for nested files ran out, so the ones marked skipped were not analysed.'
+		);
+	} else if (context.capped) {
+		notes.push(
+			context.depthReached
+				? `Trawl opens files inside files down to ${RECURSION_MAX_DEPTH} levels, and this goes further. Analyse an entry on its own to carry on from there.`
+				: 'This file holds more nested files than Trawl analyses, so the ones marked skipped were not. Analyse an entry on its own to read it in full.'
+		);
+	}
+	if (
+		survey.flagsTruncated ||
+		structure?.flagsTruncated ||
+		pcap?.flagsTruncated ||
+		budget.flagsTruncated ||
+		context.inflate.flagsTruncated ||
+		context.findingsDropped
+	) {
+		notes.push(FLAGS_CUT_SHORT);
+	}
+	if (survey.magicOmitted) {
+		notes.push(
+			`${survey.magicOmitted.toLocaleString()} more file signatures were left out, past the first 4,096 of their kind.`
+		);
+	}
+	if (pcap?.packetsCapped) {
+		notes.push(
+			`Trawl read the first ${pcap.packetCount.toLocaleString()} packets of this capture and stopped. Anything sent after that was not reassembled.`
+		);
+	}
+	if (binary?.symbolsCapped) {
+		notes.push(
+			'Trawl stopped reading the symbol tables at its budget, so the counts and the stack guard check cover what it reached.'
+		);
+	}
+	if (gif?.stopped) {
+		notes.push(`GIF frames stop short: ${gif.stopped}. The frames before that were analysed.`);
+	}
+
+	return {
 		id,
 		status: 'ok',
 		crashed,
+		notes,
 		name,
 		size: bytes.length,
 		survey,
@@ -970,66 +1428,28 @@ async function analyseRoot(
 		spectrogram,
 		pixelError,
 		audioError,
-		nested,
+		nested: {
+			roots: top.children,
+			analysed: context.childrenAnalysed,
+			skipped: countSkipped(top) + context.unlisted,
+			expandedBytes: context.expandedBytes,
+			capped: context.capped,
+			unlisted: context.unlisted
+		},
 		gif
 	};
-
-	return { response, nested, gif };
-}
-
-function countSkipped(artifact: NestedArtifact): number {
-	let count = artifact.status === 'skipped' ? 1 : 0;
-	for (const child of artifact.children) {
-		count += countSkipped(child);
-	}
-	return count;
-}
-
-/** ZIP entry loop (non-recursive, keeps the old behavior for root-level display) */
-async function inflateZipEntries(
-	bytes: Uint8Array,
-	zip: ZipArchive,
-	flagTags: string
-): Promise<void> {
-	let opened = 0;
-	for (const entry of zip.entries) {
-		if (opened >= 40) break;
-		if (entry.dataOffset === null || entry.encrypted || entry.compressed === 0) continue;
-		if (entry.method !== 'stored' && entry.method !== 'deflate') continue;
-		if (entry.uncompressed > 1 << 20) continue;
-
-		const end = entry.dataOffset + entry.compressed;
-		if (end > bytes.length) continue;
-		opened += 1;
-
-		try {
-			const packed = bytes.subarray(entry.dataOffset, end);
-			const raw = entry.method === 'deflate' ? await inflateRaw(packed) : packed;
-
-			entry.bytes = raw.slice();
-			entry.flags = (JSON.parse(find_flags_for_tags(raw, flagTags)) as Found[]).map((f) => f.text);
-			if (printableRatio(raw) >= 0.85) {
-				const text = new TextDecoder('utf-8', { fatal: false }).decode(
-					raw.subarray(0, ZIP_TEXT_PREVIEW)
-				);
-				entry.text = raw.length > ZIP_TEXT_PREVIEW ? `${text}\n…` : text;
-			}
-		} catch (error: unknown) {
-			entry.readError = error instanceof Error ? error.message : String(error);
-		}
-	}
 }
 
 async function requestPlane(id: number, channel: number, bit: number): Promise<AnalysisResponse> {
 	await ready;
-	if (!cached) throw new Error('No decoded image is loaded.');
+	if (!cached?.image) throw new Error('No decoded image is loaded.');
 
 	return {
 		id,
 		status: 'plane',
 		channel,
 		bit,
-		pixels: plane(cached.bytes, cached.inflated, channel, bit)
+		pixels: cached.image.plane(channel, bit)
 	};
 }
 
@@ -1040,20 +1460,20 @@ async function extract(
 	id: number,
 	channels: string,
 	bit: number,
-	msbFirst: boolean
+	msbFirst: boolean,
+	columnMajor: boolean
 ): Promise<AnalysisResponse> {
 	await ready;
-	if (!cached) throw new Error('No decoded image is loaded.');
+	if (!cached?.image) throw new Error('No decoded image is loaded.');
 
 	return {
 		id,
 		status: 'extract',
-		label: `${channels} · bit ${bit} · ${msbFirst ? 'msb' : 'lsb'} first`,
-		bytes: lsb_extract(cached.bytes, cached.inflated, channels, bit, msbFirst, EXTRACT_LIMIT)
+		label: `${channels} · bit ${bit} · ${msbFirst ? 'msb' : 'lsb'} first${columnMajor ? ' · by column' : ''}`,
+		bytes: cached.image.lsb_extract(channels, bit, msbFirst, columnMajor, EXTRACT_LIMIT)
 	};
 }
 
-/** Mantis. The only request that carries no file: a string is the whole subject. */
 /** The held file with a repaired IHDR, handed back to be analysed like any other. */
 async function patchIhdr(
 	id: number,
@@ -1066,6 +1486,7 @@ async function patchIhdr(
 	return { id, status: 'patched', name, bytes: png_patch_ihdr(cached.bytes, width, height) };
 }
 
+/** Mantis. The only request that carries no file: a string is the whole subject. */
 async function peelText(id: number, text: string, flagTags: string): Promise<AnalysisResponse> {
 	await ready;
 
@@ -1076,7 +1497,8 @@ async function peelText(id: number, text: string, flagTags: string): Promise<Ana
 		id,
 		status: 'peel',
 		input: text,
-		peel
+		peel,
+		rsa: looksLikeRsa(text) ? attack(text) : null
 	};
 }
 
@@ -1162,6 +1584,18 @@ async function mantisPackedPass(
 	return { json, tail };
 }
 
+/** Bounded gzip decompression of a paste, which rejects >1 MiB or an invalid header. */
+async function inflateGzip(bytes: Uint8Array): Promise<Uint8Array> {
+	if (!isGzip(bytes)) throw new Error('not a gzip stream');
+	return boundedInflate('gzip', bytes);
+}
+
+/** Bounded zlib decompression of a paste, which validates CMF/FLG (mod-31, no preset dict). */
+function inflateZlib(bytes: Uint8Array): Promise<Uint8Array> {
+	assertZlibHeader(bytes);
+	return boundedInflate('deflate', bytes);
+}
+
 /**
  * Alternating loop: Rust text peel -> platform decompress (gzip/zlib) -> repeat.
  * Shares the six-layer budget between text codecs and compression.
@@ -1185,20 +1619,16 @@ async function peelWithCompression(
 	flagTags: string
 ): Promise<PeelResult> {
 	const MAX_LAYERS = 6;
-	const seen = new Set<string>();
+	const seen = new SeenBytes<true>();
 
 	let currentBytes = initialBytes;
 	let remainingDepth = MAX_LAYERS;
 	const allSteps: PeelStep[] = [];
 
 	while (remainingDepth > 0) {
-		// Fingerprint to detect cycles
-		const fp = fingerprint(currentBytes);
-		if (seen.has(fp)) {
-			// Cycle detected — stop and return what we have
-			break;
-		}
-		seen.add(fp);
+		// A layer that decodes to itself is a cycle, so stop and return what we have.
+		if (seen.find(currentBytes)) break;
+		seen.add(currentBytes, true);
 
 		// Run packed Rust text peel with remaining depth
 		const { json, tail } = await mantisPackedPass(currentBytes, flagTags, remainingDepth);
@@ -1238,7 +1668,7 @@ async function peelWithCompression(
 			break;
 		}
 
-		const flags = JSON.parse(find_flags_for_tags(decompressed, flagTags)) as Found[];
+		const { flags } = scanFlags(decompressed, flagTags);
 		allSteps.push({
 			encoding: compressionEncoding,
 			reason:
@@ -1267,12 +1697,7 @@ async function peelWithCompression(
 function handle(request: AnalysisRequest): Promise<AnalysisResponse> {
 	switch (request.kind) {
 		case 'analyse':
-			return analyseRoot(
-				request.id,
-				request.name,
-				new Uint8Array(request.bytes),
-				request.flagTags
-			).then((r) => r.response);
+			return analyseRoot(request.id, request.name, new Uint8Array(request.bytes), request.flagTags);
 		case 'peel':
 			return peelText(request.id, request.text, request.flagTags);
 		case 'withKey':
@@ -1280,7 +1705,13 @@ function handle(request: AnalysisRequest): Promise<AnalysisResponse> {
 		case 'plane':
 			return requestPlane(request.id, request.channel, request.bit);
 		case 'extract':
-			return extract(request.id, request.channels, request.bit, request.msbFirst);
+			return extract(
+				request.id,
+				request.channels,
+				request.bit,
+				request.msbFirst,
+				request.columnMajor
+			);
 		case 'extractPalette':
 			return extractPalette(request.id, request.msbFirst);
 		case 'extractJpeg':

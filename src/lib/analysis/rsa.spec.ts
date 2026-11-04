@@ -20,6 +20,16 @@ import {
 const toNumber = (text: string) =>
 	BigInt(`0x${[...text].map((c) => c.charCodeAt(0).toString(16).padStart(2, '0')).join('')}`);
 
+describe('a key built to waste time', () => {
+	it('gives up on Fermat within its budget', { timeout: 30_000 }, () => {
+		// Every round is a square root of this. Unbudgeted, the rounds take half a minute.
+		const started = Date.now();
+
+		expect(fermat({ n: (1n << 2048n) + 1n, e: 65537n })).toBeNull();
+		expect(Date.now() - started).toBeLessThan(10_000);
+	});
+});
+
 describe('arithmetic', () => {
 	it('takes an integer square root', () => {
 		expect(isqrt(0n)).toBe(0n);

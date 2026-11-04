@@ -95,6 +95,12 @@ Every detector is tested against files with a known answer, and against clean fi
 too, so it stays quiet when there is nothing there. A tool that reports something
 on every file is no better than one that reports nothing.
 
+It does tell you where it stopped. A file can ask for more than a browser tab can
+give, so decompression, nesting and the flag list all have limits, and a file that
+reaches one gets a note on the page and in the writeup saying what went unread. The
+LSB sweeps read the first 4 KB of each combination, so a message that starts further
+in won't show up in a sweep.
+
 ## Why not just upload it to an AI
 
 Because the model never receives your file. Before the network sees an image, the
@@ -116,8 +122,10 @@ also settles a rules question: most competitions forbid passing challenge files 
 outside services, and Trawl has nowhere to send yours.
 
 Web exploration is the one part that touches the network, because reaching a site is
-the whole job. Remora still runs on your own machine and talks only to the target you
-named and to your own browser.
+the whole job. Remora still runs on your own machine and talks only to the target you named, any
+site that target redirects it to, and your own browser. A redirect to another site is read like any page and noted in the results, and Remora
+won't guess file names there. The active checks run only if the target stays at the
+address you named.
 
 ## How it works
 
@@ -127,9 +135,9 @@ small calculations, so speed matters.
 
 Almost nothing is borrowed. `package.json` lists no runtime dependencies, and the
 Rust core's only dependency is `wasm-bindgen`, the bridge to JavaScript. Every parser,
-detector and attack was written for this project, including the PNG, BMP, GIF, WAV
-and JPEG decoders and the Fourier transform behind the spectrogram. Inflating
-compressed data is left to the browser's own decompressor.
+detector and attack was written for this project, including the PNG, BMP, GIF, WAV and JPEG decoders, the inflate that opens a file's
+compressed streams, and the Fourier transform behind the spectrogram. Only gzip and
+zlib in pasted text go through the browser's own decompressor.
 
 One thing worth knowing: the browser's own image decoder can't be trusted here. Ask a
 canvas for pixel values on an image with any transparency and it alters the lowest

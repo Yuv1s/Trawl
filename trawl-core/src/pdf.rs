@@ -21,6 +21,7 @@
 //! reports where the bytes are so the caller can make it.
 
 use crate::bytes;
+use crate::inflate::{Inflated, Wrapper, inflate};
 use std::collections::{HashMap, HashSet};
 
 /// Most objects one reading reports. An object header is seven bytes, so a file of
@@ -131,61 +132,231 @@ fn ends_name(byte: u8) -> bool {
     byte.is_ascii_whitespace() || b"()<>[]{}/%".contains(&byte)
 }
 
-/// What follows `/Key` at a dictionary's own level.
-///
-/// A key is a whole name, or `/Length` finds `/Length1`, and it is a key of this
-/// dictionary rather than of one nested inside it, or `/Length` finds the one in a
-/// `/DecodeParms`. Strings are stepped over, since one can hold anything.
-fn field<'a>(dict: &'a str, key: &str) -> Option<&'a str> {
-    let bytes = dict.as_bytes();
-    let mut depth = 0usize;
-    let mut arrays = 0usize;
-    let mut at = 0usize;
-    let mut strings = true;
+/// What the format counts as whitespace, which is wider than ASCII's by a NUL.
+fn pdf_space(byte: u8) -> bool {
+    matches!(byte, 0 | b'\t' | b'\n' | 0x0c | b'\r' | b' ')
+}
 
-    while let Some(&byte) = bytes.get(at) {
-        match byte {
-            b'<' if bytes.get(at + 1) == Some(&b'<') => {
-                depth += 1;
-                at += 2;
+/// A name with its `#xx` escapes undone. `/Fl#61teDecode` is `/FlateDecode` to any reader.
+fn unescape_name(raw: &str) -> String {
+    if !raw.contains('#') {
+        return raw.to_string();
+    }
+
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let digit = |i: usize| bytes.get(i).and_then(|&b| (b as char).to_digit(16));
+        match (bytes[at], digit(at + 1), digit(at + 2)) {
+            (b'#', Some(high), Some(low)) => {
+                out.push((high * 16 + low) as u8);
+                at += 3;
             }
-            b'>' if bytes.get(at + 1) == Some(&b'>') => {
-                depth = depth.saturating_sub(1);
-                at += 2;
-            }
-            b'[' => {
-                arrays += 1;
+            (byte, ..) => {
+                out.push(byte);
                 at += 1;
             }
-            b']' => {
-                arrays = arrays.saturating_sub(1);
-                at += 1;
-            }
-            // An unmatched parenthesis must not hide the keys after it, and searching
-            // from every one that follows would make a dictionary of them quadratic.
-            b'(' if strings => match literal_string_end(bytes, at) {
-                Some(end) => at = end,
-                None => {
-                    strings = false;
-                    at += 1;
-                }
-            },
-            b'/' => {
-                let start = at + 1;
-                let end = bytes[start..]
+        }
+    }
+    crate::json::latin1(&out)
+}
+
+/// Steps through a dictionary's text one object at a time, the way a reader does.
+struct Tokens<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    /// Cleared by an opening that never closes, since searching again from every one that
+    /// follows would make a dictionary of them quadratic.
+    strings: bool,
+    hex: bool,
+}
+
+impl Tokens<'_> {
+    /// Moves past whitespace and comments.
+    fn blank(&mut self) {
+        while let Some(&byte) = self.bytes.get(self.at) {
+            if byte == b'%' {
+                self.at += self.bytes[self.at..]
                     .iter()
-                    .position(|&b| ends_name(b))
-                    .map_or(bytes.len(), |length| start + length);
-                if depth == 1 && arrays == 0 && dict.get(start..end) == Some(key) {
-                    return dict.get(end..);
-                }
-                at = end;
+                    .position(|&b| b == b'\n' || b == b'\r')
+                    .unwrap_or(self.bytes.len() - self.at);
+            } else if pdf_space(byte) {
+                self.at += 1;
+            } else {
+                break;
             }
-            _ => at += 1,
         }
     }
 
-    None
+    fn at_pair(&self, pair: &[u8; 2]) -> bool {
+        self.bytes.get(self.at..self.at + 2) == Some(pair)
+    }
+
+    /// Moves past the name that `at` is on, and says where its text ends.
+    fn name(&mut self) -> usize {
+        let from = self.at + 1;
+        self.at = self.bytes[from..]
+            .iter()
+            .position(|&b| ends_name(b))
+            .map_or(self.bytes.len(), |length| from + length);
+        self.at
+    }
+
+    /// Moves past a string, or past just its opening if it never closes, and an unmatched
+    /// parenthesis must not hide the keys after it.
+    fn string(&mut self) {
+        let open = self.at;
+        self.at += 1;
+        if self.strings {
+            match literal_string_end(self.bytes, open) {
+                Some(end) => self.at = end,
+                None => self.strings = false,
+            }
+        }
+    }
+
+    fn hex_string(&mut self) {
+        let open = self.at;
+        self.at += 1;
+        if self.hex {
+            match self.bytes[open..].iter().position(|&b| b == b'>') {
+                Some(length) => self.at = open + length + 1,
+                None => self.hex = false,
+            }
+        }
+    }
+
+    /// Moves past an array or a dictionary, with no recursion, since a file can nest them
+    /// as deep as it has bytes.
+    fn container(&mut self) {
+        let mut depth = 0usize;
+        loop {
+            self.blank();
+            match self.bytes.get(self.at) {
+                None => return,
+                Some(b'[') => {
+                    depth += 1;
+                    self.at += 1;
+                }
+                Some(b']') => {
+                    depth = depth.saturating_sub(1);
+                    self.at += 1;
+                }
+                Some(b'<') if self.at_pair(b"<<") => {
+                    depth += 1;
+                    self.at += 2;
+                }
+                Some(b'>') if self.at_pair(b">>") => {
+                    depth = depth.saturating_sub(1);
+                    self.at += 2;
+                }
+                Some(b'<') => self.hex_string(),
+                Some(b'(') => self.string(),
+                Some(b'/') => {
+                    self.name();
+                }
+                Some(_) => self.at += 1,
+            }
+            if depth == 0 {
+                return;
+            }
+        }
+    }
+
+    /// Moves past one object: a key's value, or whatever is sitting where a key should be.
+    /// A dictionary's closing is left where it is, for a key that has no value.
+    fn object(&mut self) {
+        self.blank();
+        match self.bytes.get(self.at) {
+            None => {}
+            Some(b'>') if self.at_pair(b">>") => {}
+            Some(b'[') => self.container(),
+            Some(b'<') if self.at_pair(b"<<") => self.container(),
+            Some(b'<') => self.hex_string(),
+            Some(b'(') => self.string(),
+            Some(b'/') => {
+                self.name();
+            }
+            Some(byte) if byte.is_ascii_digit() => self.number(),
+            Some(_) => {
+                let from = self.at;
+                self.at += 1 + self.bytes[from + 1..]
+                    .iter()
+                    .position(|&b| ends_name(b))
+                    .unwrap_or(self.bytes.len() - from - 1);
+            }
+        }
+    }
+
+    /// Moves past a number, and past ` G R` if that follows, which makes it a reference.
+    fn number(&mut self) {
+        let bytes = self.bytes;
+        let digits = |from: usize| {
+            bytes[from.min(bytes.len())..]
+                .iter()
+                .position(|b| !b.is_ascii_digit())
+                .map_or(bytes.len(), |length| from + length)
+        };
+        let spaces = |from: usize| {
+            bytes[from.min(bytes.len())..]
+                .iter()
+                .position(|&b| !pdf_space(b))
+                .map_or(bytes.len(), |length| from + length)
+        };
+
+        self.at = digits(self.at);
+
+        let generation = spaces(self.at);
+        let after = digits(generation);
+        if after > generation {
+            let keyword = spaces(after);
+            let ends = bytes.get(keyword + 1).is_none_or(|&b| ends_name(b));
+            if bytes.get(keyword) == Some(&b'R') && ends {
+                self.at = keyword + 1;
+            }
+        }
+    }
+}
+
+/// What follows `/Key` at a dictionary's own level.
+///
+/// A dictionary is pairs, so a name is a key only where a key belongs, and one sitting where
+/// a value belongs is that value whatever it spells. A key is a whole name, or `/Length`
+/// finds `/Length1`, and it is one of this dictionary's own, or `/Length` finds the one in
+/// a `/DecodeParms`. A reader keeps the last of a repeated key, so that is the one taken,
+/// or a dictionary could name one filter for whoever stops at the first and another for
+/// everyone else.
+fn field<'a>(dict: &'a str, key: &str) -> Option<&'a str> {
+    let mut tokens = Tokens {
+        bytes: dict.as_bytes(),
+        at: dict.find("<<")? + 2,
+        strings: true,
+        hex: true,
+    };
+    let mut found = None;
+
+    loop {
+        tokens.blank();
+        match tokens.bytes.get(tokens.at) {
+            None => return found,
+            Some(b'>') if tokens.at_pair(b">>") => return found,
+            Some(b'/') => {
+                let start = tokens.at + 1;
+                let end = tokens.name();
+                if dict.get(start..end).is_some_and(|name| unescape_name(name) == key) {
+                    found = dict.get(end..).or(found);
+                }
+                tokens.object();
+            }
+            // Not a key, so it is stepped over, with something always consumed.
+            Some(_) => {
+                let before = tokens.at;
+                tokens.object();
+                tokens.at = tokens.at.max(before + 1);
+            }
+        }
+    }
 }
 
 /// The value of `/Key (literal string)` inside a dictionary's text, if it is
@@ -216,25 +387,190 @@ fn leading_name(text: &str) -> Option<&str> {
 /// them optional: most real PDF writers put one there, and the format
 /// permits either.
 fn name_field(dict: &str, key: &str) -> Option<String> {
-    leading_name(field(dict, key)?.trim_start()).map(str::to_string)
+    leading_name(field(dict, key)?.trim_start()).map(unescape_name)
 }
 
-/// The value of `/Filter`, which is a single name or an array of them applied in
-/// order. Names joined with " then ", so a one-item array reads as that one name.
-fn filter_field(dict: &str) -> Option<String> {
-    let after = field(dict, "Filter")?.trim_start();
-    let Some(items) = after.strip_prefix('[') else {
-        return leading_name(after).map(str::to_string);
+/// A filter by the name the format gives it in a stream. The short forms are for inline
+/// images, and a reader takes them anywhere.
+fn filter_name(raw: &str) -> String {
+    match unescape_name(raw).as_str() {
+        "Fl" => "FlateDecode".to_string(),
+        "AHx" => "ASCIIHexDecode".to_string(),
+        "A85" => "ASCII85Decode".to_string(),
+        "LZW" => "LZWDecode".to_string(),
+        "RL" => "RunLengthDecode".to_string(),
+        "DCT" => "DCTDecode".to_string(),
+        "CCF" => "CCITTFaxDecode".to_string(),
+        name => name.to_string(),
+    }
+}
+
+/// A dictionary's text with its comments taken out, which a reader skips wherever they
+/// fall, between a key and its value as readily as between two keys. A percent sign in a
+/// string is only a percent sign. A NUL becomes a space, being whitespace to a reader and
+/// the one kind that nothing downstream of this would otherwise step over.
+fn without_comments(dict: &str) -> String {
+    let mut out = String::with_capacity(dict.len());
+    let mut chars = dict.chars();
+    let mut in_string = 0usize;
+
+    while let Some(c) = chars.next() {
+        match c {
+            '%' if in_string == 0 => {
+                if let Some(end) = chars.find(|&skipped| skipped == '\n' || skipped == '\r') {
+                    out.push(end);
+                }
+            }
+            '\\' if in_string > 0 => {
+                out.push(c);
+                out.extend(chars.next());
+            }
+            _ => {
+                match c {
+                    '(' => in_string += 1,
+                    ')' => in_string = in_string.saturating_sub(1),
+                    _ => {}
+                }
+                out.push(if c == '\0' && in_string == 0 { ' ' } else { c });
+            }
+        }
+    }
+    out
+}
+
+/// What stands in for an element of a filter array that could not be read, which
+/// [`decode_stream`] refuses by name, so that it is reported and not skipped.
+const UNRESOLVED_FILTER: &str = "UnresolvedFilter";
+
+/// Filter names out of whatever `/Filter` holds: one name, or an array of names and
+/// references to names, applied in order. Joined with " then ", so a one-item array reads
+/// as that one name.
+///
+/// @param lookup the filter an object holds, for an element that is a reference to one
+fn filter_names(value: &str, lookup: &dyn Fn(u32) -> Option<String>) -> Option<String> {
+    let value = value.trim_start();
+    let Some(items) = value.strip_prefix('[') else {
+        return match parse_number_or_reference(value) {
+            Some(Number::Reference(object)) => lookup(object),
+            _ => leading_name(value).map(filter_name),
+        };
     };
 
-    let items = items.get(..items.find(']')?)?;
-    let names: Vec<&str> = items
-        .split('/')
-        .skip(1)
-        .map(|name| name.trim_end())
-        .filter(|name| !name.is_empty())
-        .collect();
+    let items = items.get(..items.find(']')?)?.replace('/', " /");
+    let mut tokens = items
+        .split(|c: char| u8::try_from(c).is_ok_and(pdf_space))
+        .filter(|token| !token.is_empty());
+
+    let mut names = Vec::new();
+    while let Some(token) = tokens.next() {
+        if let Some(name) = token.strip_prefix('/') {
+            names.push(filter_name(name.trim_end()));
+            continue;
+        }
+        let resolved = token
+            .parse::<u32>()
+            .ok()
+            .filter(|_| tokens.next().is_some() && tokens.next() == Some("R"))
+            .and_then(lookup);
+        names.push(resolved.unwrap_or_else(|| UNRESOLVED_FILTER.to_string()));
+    }
     Some(names.join(" then "))
+}
+
+/// The value of `/Filter`, under either of the names a reader takes it by, with the last
+/// of a repeated key being the one that counts.
+fn filter_of(dict: &str, lookup: &dyn Fn(u32) -> Option<String>) -> Option<String> {
+    filter_names(field(dict, "Filter").or_else(|| field(dict, "F"))?, lookup)
+}
+
+
+
+/// The dictionaries `/DecodeParms` holds, one place per filter, either written there or
+/// in another object.
+fn decode_parms(dict: &str, lookup: &dyn Fn(u32) -> Option<String>) -> Vec<Option<String>> {
+    let Some(value) = field(dict, "DecodeParms").or_else(|| field(dict, "DP")) else {
+        return Vec::new();
+    };
+    let value = value.trim_start();
+    if !value.starts_with(|c: char| c == '[' || c == '<' || c == 'n' || c.is_ascii_digit()) {
+        return Vec::new();
+    }
+
+    // One item, or an array of them with a null for a filter that takes none.
+    let (items, single) = match value.strip_prefix('[') {
+        Some(items) => (items, false),
+        None => (value, true),
+    };
+    let bytes = items.as_bytes();
+
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while let Some(&byte) = bytes.get(at) {
+        match byte {
+            b']' if !single => break,
+            b'<' if bytes.get(at + 1) == Some(&b'<') => {
+                let Some(end) = dict_end(bytes, at) else {
+                    break;
+                };
+                out.push(items.get(at..end).map(str::to_string));
+                at = end;
+            }
+            b'n' => {
+                out.push(None);
+                at += 4;
+            }
+            byte if byte.is_ascii_digit() => {
+                let rest = items.get(at..).unwrap_or("");
+                let mut parts = rest.split_ascii_whitespace();
+                let number = parts.next().and_then(|n| n.parse::<u32>().ok());
+                let reference = parts.next().is_some() && parts.next().is_some_and(|r| r.starts_with('R'));
+                out.push(number.filter(|_| reference).and_then(lookup));
+                at += rest.find('R').filter(|_| reference).map_or(1, |r| r + 1);
+            }
+            _ => at += 1,
+        }
+        if single && !out.is_empty() {
+            break;
+        }
+    }
+    out
+}
+
+/// Filter names with what their parameters say written after each, which is what reaches
+/// [`decode_stream`], and what a person reads next to a stream.
+fn with_parms(
+    filter: String,
+    parms: &[Option<String>],
+    integer: &dyn Fn(u32) -> Option<usize>,
+) -> String {
+    if parms.iter().all(Option::is_none) {
+        return filter;
+    }
+
+    let named = filter.split(" then ").enumerate().map(|(index, name)| {
+        let mut out = name.to_string();
+        let dict = parms.get(index).and_then(Option::as_ref);
+        if let Some(dict) = dict.filter(|_| matches!(name, "FlateDecode" | "LZWDecode")) {
+            for (label, key) in [
+                ("predictor", "Predictor"),
+                ("colors", "Colors"),
+                ("bits", "BitsPerComponent"),
+                ("columns", "Columns"),
+                ("early", "EarlyChange"),
+            ] {
+                let value = match number_or_reference(dict, key) {
+                    Some(Number::Direct(number)) => Some(number),
+                    Some(Number::Reference(object)) => integer(object).map(|n| n as u64),
+                    None => None,
+                };
+                if let Some(value) = value {
+                    out.push_str(&format!(" {label}={value}"));
+                }
+            }
+        }
+        out
+    });
+    named.collect::<Vec<_>>().join(" then ")
 }
 
 /// An integer written directly, or the object an indirect reference names.
@@ -248,7 +584,11 @@ enum Number {
 /// two apart is the whole point: read as a plain number, `/Length 5 0 R` is a stream
 /// five bytes long.
 fn number_or_reference(dict: &str, key: &str) -> Option<Number> {
-    let after = field(dict, key)?.trim_start();
+    parse_number_or_reference(field(dict, key)?.trim_start())
+}
+
+/// A value that starts with an integer, and whether what follows makes it a reference.
+fn parse_number_or_reference(after: &str) -> Option<Number> {
     let digits = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
     let number: u64 = after.get(..digits)?.parse().ok()?;
 
@@ -344,6 +684,9 @@ pub struct Document {
     /// decode: it is itself a compressed, filter-encoded stream, and
     /// [`Object::orphaned`] is left false throughout rather than guessed at.
     pub uses_xref_stream: bool,
+    /// True when the file has a classic table, or should, that could not be read, so no
+    /// object was checked against it.
+    pub xref_unread: bool,
 }
 
 fn digits_at(data: &[u8], at: usize) -> Option<(u32, usize)> {
@@ -364,22 +707,49 @@ fn digits_at(data: &[u8], at: usize) -> Option<(u32, usize)> {
 
 /// Finds the matching `>>` for a `<<` already known to start at `open`,
 /// respecting nested dictionaries.
+///
+/// Strings and comments are stepped over, since either can hold a `>>` that closes
+/// nothing. One that never ends is taken as ordinary bytes, and no later one is looked
+/// for, or a dictionary full of them would search the rest of the file from each.
 fn dict_end(data: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut at = open;
+    let (mut strings, mut hex) = (true, true);
 
     while at + 1 < data.len() {
-        if &data[at..at + 2] == b"<<" {
-            depth += 1;
-            at += 2;
-        } else if &data[at..at + 2] == b">>" {
-            depth -= 1;
-            at += 2;
-            if depth == 0 {
-                return Some(at);
+        match (data[at], data[at + 1]) {
+            (b'<', b'<') => {
+                depth += 1;
+                at += 2;
             }
-        } else {
-            at += 1;
+            (b'>', b'>') => {
+                depth -= 1;
+                at += 2;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            (b'(', _) if strings => match literal_string_end(data, at) {
+                Some(end) => at = end,
+                None => {
+                    strings = false;
+                    at += 1;
+                }
+            },
+            (b'<', _) if hex => match data[at + 1..].iter().position(|&b| b == b'>') {
+                Some(length) => at += length + 2,
+                None => {
+                    hex = false;
+                    at += 1;
+                }
+            },
+            (b'%', _) => {
+                at += data[at..]
+                    .iter()
+                    .position(|&b| b == b'\n' || b == b'\r')
+                    .unwrap_or(data.len() - at);
+            }
+            _ => at += 1,
         }
     }
 
@@ -400,24 +770,36 @@ fn headers(data: &[u8]) -> Vec<Header> {
     let mut at = 0usize;
 
     while out.len() < MAX_OBJECTS
-        && let Some(found) = bytes::find(data, at, b" obj")
+        && let Some(found) = bytes::find(data, at, b"obj")
     {
-        at = found + 4;
+        at = found + 3;
+
+        // The keyword on its own, so neither `endobj` nor a word like `object`.
+        if data.get(at).is_some_and(|&b| !ends_name(b) && !pdf_space(b)) {
+            continue;
+        }
 
         // Walk backwards over the generation and object number that must
-        // precede " obj", rather than forward from a match: the signature is
-        // the keyword, and what makes this a real object header is what sits
-        // in front of it.
-        let gen_end = found;
+        // precede the keyword, rather than forward from a match: the signature
+        // is the keyword, and what makes this a real object header is what sits
+        // in front of it. Any whitespace can separate the three, and a line break
+        // or a tab is as good as a space to every reader.
+        let mut gen_end = found;
+        while gen_end > 0 && pdf_space(data[gen_end - 1]) {
+            gen_end -= 1;
+        }
         let mut gen_start = gen_end;
         while gen_start > 0 && data[gen_start - 1].is_ascii_digit() {
             gen_start -= 1;
         }
-        if gen_start == gen_end || gen_start == 0 || data[gen_start - 1] != b' ' {
+        if gen_start == gen_end || gen_start == 0 || !pdf_space(data[gen_start - 1]) {
             continue;
         }
 
-        let num_end = gen_start - 1;
+        let mut num_end = gen_start;
+        while num_end > 0 && pdf_space(data[num_end - 1]) {
+            num_end -= 1;
+        }
         let mut num_start = num_end;
         while num_start > 0 && data[num_start - 1].is_ascii_digit() {
             num_start -= 1;
@@ -462,6 +844,13 @@ fn integer_object(data: &[u8], body_at: usize) -> Option<usize> {
     let offset = rest.iter().take(64).position(|b| !b.is_ascii_whitespace())?;
     let (number, _) = digits_at(rest, offset)?;
     Some(number as usize)
+}
+
+/// The filter names an object holds, for a `/Filter` that points at one.
+fn filter_object(data: &[u8], body_at: usize) -> Option<String> {
+    let rest = data.get(body_at..)?;
+    let text = without_comments(&crate::json::latin1(&rest[..rest.len().min(4096)]));
+    filter_names(&text, &|_| None)
 }
 
 /// Bytes a stream holds, given where it starts and what its dictionary claims.
@@ -548,9 +937,11 @@ fn objects(data: &[u8]) -> Vec<Object> {
             let next = stream_ends.partition_point(|&end| end < start);
             let first_end = *stream_ends.get(next)?;
 
+            let parsed = without_comments(&dict_text);
+
             // Either a number here or a number in another object, which may not
             // come until later in the file.
-            let claimed = match number_or_reference(&dict_text, "Length") {
+            let claimed = match number_or_reference(&parsed, "Length") {
                 Some(Number::Direct(length)) => usize::try_from(length).ok(),
                 Some(Number::Reference(object)) => {
                     bodies.get(&object).and_then(|&at| integer_object(data, at))
@@ -558,10 +949,19 @@ fn objects(data: &[u8]) -> Vec<Object> {
                 None => None,
             };
 
+            // The filter can live in another object too, and reading that as no filter
+            // at all is how a compressed stream gets called uncompressed.
+            let lookup = |object: u32| filter_object(data, *bodies.get(&object)?);
+            let filter = filter_of(&parsed, &lookup);
+            let parms = decode_parms(&parsed, &|object| {
+                dict_after(data, *bodies.get(&object)?).map(|dict| without_comments(&dict))
+            });
+            let integer = |object: u32| integer_object(data, *bodies.get(&object)?);
+
             Some(Stream {
                 offset: start,
                 length: stream_length(data, start, claimed, first_end),
-                filter: filter_field(&dict_text).unwrap_or_default(),
+                filter: with_parms(filter.unwrap_or_default(), &parms, &integer),
             })
         });
 
@@ -632,7 +1032,10 @@ fn classic_xref(data: &[u8], at: usize) -> Option<(XrefEntries, usize)> {
         for index in 0..count {
             let entry = data.get(cursor..cursor + 20)?;
             let text = core::str::from_utf8(entry).ok()?;
-            let offset: usize = text.get(0..10)?.trim().parse().ok()?;
+            // Ten digits run past what 32 bits hold, and an offset that big is one that points
+            // nowhere, not a table that cannot be read.
+            let offset: u64 = text.get(0..10)?.trim().parse().ok()?;
+            let offset = usize::try_from(offset).unwrap_or(usize::MAX);
             let live = text.as_bytes().get(17) == Some(&b'n');
             entries.push((start.wrapping_add(index), live.then_some(offset)));
             cursor += 20;
@@ -749,6 +1152,322 @@ fn last_trailers(data: &[u8]) -> Vec<String> {
     out
 }
 
+/// Most filters in one stream's chain. A real chain has two.
+const MAX_FILTERS: usize = 8;
+
+/// Undoes a stream's filter chain, as far as it can be undone.
+///
+/// Stops at the first filter that fails or that this cannot read, keeping what came
+/// out of the one before, so a chain ending in an image format still gets scanned as
+/// far as its text wrappers go.
+///
+/// @param filter the names as [`Stream::filter`] joins them
+pub fn decode_stream(data: &[u8], filter: &str, limit: usize) -> Inflated {
+    let names: Vec<&str> = filter.split(" then ").collect();
+    let mut found: Option<Inflated> = None;
+
+    for &step in names.iter().take(MAX_FILTERS) {
+        let (name, parms) = step.split_once(' ').unwrap_or((step, ""));
+        let input = found.as_ref().map_or(data, |so_far| &so_far.output);
+        let mut next = match name {
+            "FlateDecode" => inflate(input, Wrapper::Zlib, limit),
+            "ASCIIHexDecode" => ascii_hex(input, limit),
+            "ASCII85Decode" => ascii85(input, limit),
+            "RunLengthDecode" => run_length(input, limit),
+            "LZWDecode" => lzw(input, limit, parm(parms, "early") != Some(0)),
+            other => {
+                let mut kept = found.unwrap_or_default();
+                kept.error = Some(format!("Trawl does not read {other}, so the chain stopped there"));
+                return kept;
+            }
+        };
+
+        undo_predictor(&mut next, parms);
+        next.capped |= found.is_some_and(|so_far| so_far.capped);
+        if next.error.is_some() {
+            return next;
+        }
+        found = Some(next);
+    }
+
+    let mut found = found.unwrap_or_default();
+    if names.len() > MAX_FILTERS {
+        found.error = Some(format!(
+            "the stream has {} filters, and Trawl undoes the first {MAX_FILTERS}",
+            names.len()
+        ));
+    }
+    found
+}
+
+/// A number from the parameters [`with_parms`] wrote after a filter's name.
+fn parm(parms: &str, key: &str) -> Option<usize> {
+    parms.split(' ').find_map(|part| {
+        let value: u64 = part.strip_prefix(key)?.strip_prefix('=')?.parse().ok()?;
+        Some(usize::try_from(value).unwrap_or(usize::MAX))
+    })
+}
+
+/// Undoes what `/Predictor` did to the data before it was compressed, which leaves bytes
+/// that read as nothing until it is undone. A predictor that cannot be undone leaves the
+/// data as it was, and says so.
+fn undo_predictor(found: &mut Inflated, parms: &str) {
+    let predictor = parm(parms, "predictor").unwrap_or(1);
+    if predictor <= 1 || found.output.is_empty() {
+        return;
+    }
+
+    let colors = parm(parms, "colors").unwrap_or(1);
+    let bits = parm(parms, "bits").unwrap_or(8);
+    let columns = parm(parms, "columns").unwrap_or(1);
+
+    let stride = columns
+        .checked_mul(colors)
+        .and_then(|samples| samples.checked_mul(bits))
+        .map(|width| width.div_ceil(8))
+        .filter(|&stride| stride > 0 && stride <= found.output.len());
+
+    let undone = stride.and_then(|stride| match predictor {
+        2 if bits == 8 => {
+            let mut output = core::mem::take(&mut found.output);
+            for row in output.chunks_mut(stride) {
+                for at in colors..row.len() {
+                    row[at] = row[at].wrapping_add(row[at - colors]);
+                }
+            }
+            Some(output)
+        }
+        10..=15 => {
+            let row = stride + 1;
+            let rows = found.output.len().div_ceil(row);
+            let mut padded = found.output.clone();
+            padded.resize(rows * row, 0);
+            let bpp = (colors * bits / 8).max(1);
+            crate::png::unfilter(&padded, stride, bpp, rows).ok()
+        }
+        _ => None,
+    });
+
+    match undone {
+        Some(output) => found.output = output,
+        None if found.error.is_none() => {
+            found.error = Some(format!(
+                "Trawl could not undo predictor {predictor} here, so this is the data before that step"
+            ));
+        }
+        None => {}
+    }
+}
+
+fn ascii_hex(data: &[u8], limit: usize) -> Inflated {
+    let mut found = Inflated::default();
+    let mut high = None;
+
+    for &byte in data {
+        if byte == b'>' {
+            break;
+        }
+        if pdf_space(byte) {
+            continue;
+        }
+        let Some(digit) = (byte as char).to_digit(16) else {
+            found.error = Some("the hex data holds something that is not a hex digit".to_string());
+            return found;
+        };
+        match high.take() {
+            None => high = Some(digit),
+            Some(top) => {
+                if found.output.len() >= limit {
+                    found.capped = true;
+                    return found;
+                }
+                found.output.push((top * 16 + digit) as u8);
+            }
+        }
+    }
+
+    // A last digit on its own is the high half of a byte, by the format's own rule.
+    if let Some(top) = high
+        && found.output.len() < limit
+    {
+        found.output.push((top * 16) as u8);
+    }
+    found
+}
+
+fn ascii85(data: &[u8], limit: usize) -> Inflated {
+    // The opening an Adobe encoder writes, which is no part of the data.
+    let data = data.trim_ascii_start();
+    let data = data.strip_prefix(b"<~").unwrap_or(data);
+
+    let mut found = Inflated::default();
+    let mut group = [0u8; 5];
+    let mut filled = 0usize;
+
+    for &byte in data {
+        match byte {
+            b'~' => break,
+            b'z' if filled == 0 => {
+                if found.output.len() + 4 > limit {
+                    found.capped = true;
+                    return found;
+                }
+                found.output.extend_from_slice(&[0; 4]);
+            }
+            b'!'..=b'u' => {
+                group[filled] = byte - b'!';
+                filled += 1;
+                if filled == 5 {
+                    if found.output.len() + 4 > limit {
+                        found.capped = true;
+                        return found;
+                    }
+                    let value = group.iter().fold(0u32, |acc, &d| acc.wrapping_mul(85).wrapping_add(d as u32));
+                    found.output.extend_from_slice(&value.to_be_bytes());
+                    filled = 0;
+                }
+            }
+            _ if pdf_space(byte) => {}
+            _ => {
+                found.error = Some("the ASCII85 data holds a byte outside its alphabet".to_string());
+                return found;
+            }
+        }
+    }
+
+    // A short last group stands for that many bytes less one, padded out with the
+    // highest digit to round the way an encoder truncated.
+    if filled >= 2 {
+        group[filled..].fill(84);
+        let value = group.iter().fold(0u32, |acc, &d| acc.wrapping_mul(85).wrapping_add(d as u32));
+        let take = (filled - 1).min(limit.saturating_sub(found.output.len()));
+        found.output.extend_from_slice(&value.to_be_bytes()[..take]);
+    }
+    found
+}
+
+fn run_length(data: &[u8], limit: usize) -> Inflated {
+    let mut found = Inflated::default();
+    let mut at = 0usize;
+
+    while let Some(&length) = data.get(at) {
+        at += 1;
+        let room = limit - found.output.len();
+        match length {
+            128 => return found,
+            0..=127 => {
+                let wanted = length as usize + 1;
+                let available = data.get(at..).map_or(0, <[u8]>::len).min(wanted);
+                let taken = available.min(room);
+                found.output.extend_from_slice(&data[at..at + taken]);
+                at += wanted;
+                if taken < available {
+                    found.capped = true;
+                    return found;
+                }
+                if available < wanted {
+                    found.error = Some("the stream is cut short".to_string());
+                    return found;
+                }
+            }
+            _ => {
+                let Some(&byte) = data.get(at) else {
+                    found.error = Some("the stream is cut short".to_string());
+                    return found;
+                };
+                at += 1;
+                let wanted = 257 - length as usize;
+                let taken = wanted.min(room);
+                found.output.resize(found.output.len() + taken, byte);
+                if taken < wanted {
+                    found.capped = true;
+                    return found;
+                }
+            }
+        }
+    }
+    found
+}
+
+/// PDF's LZW: codes packed most significant bit first, widening one code earlier than
+/// GIF's does unless a stream's parameters say otherwise, which none in the wild do.
+fn lzw(data: &[u8], limit: usize, early_change: bool) -> Inflated {
+    const CLEAR: usize = 256;
+    const END: usize = 257;
+
+    let mut found = Inflated::default();
+    // Each entry beyond the single bytes is where in the output it was last written.
+    let mut table: Vec<(usize, usize)> = Vec::with_capacity(4096);
+    let (mut width, mut hold, mut bits) = (9u32, 0u32, 0u32);
+    let mut previous: Option<(usize, usize)> = None;
+
+    for &byte in data {
+        hold = (hold << 8) | byte as u32;
+        bits += 8;
+
+        while bits >= width {
+            bits -= width;
+            let code = ((hold >> bits) & ((1 << width) - 1)) as usize;
+
+            match code {
+                CLEAR => {
+                    table.clear();
+                    width = 9;
+                    previous = None;
+                    continue;
+                }
+                END => return found,
+                _ => {}
+            }
+
+            let at = found.output.len();
+            let length = if code < 256 {
+                found.output.push(code as u8);
+                1
+            } else if let Some(&(from, length)) = table.get(code - 258) {
+                if at + length > limit {
+                    found.capped = true;
+                    return found;
+                }
+                found.output.extend_from_within(from..from + length);
+                length
+            } else if let (Some((from, length)), true) = (previous, code - 258 == table.len()) {
+                // The one code an encoder can send in the same step it defines it.
+                if at + length + 1 > limit {
+                    found.capped = true;
+                    return found;
+                }
+                found.output.extend_from_within(from..from + length);
+                let first = found.output[from];
+                found.output.push(first);
+                length + 1
+            } else {
+                found.error = Some("the LZW data holds a code that means nothing yet".to_string());
+                return found;
+            };
+
+            if found.output.len() >= limit {
+                found.capped = true;
+                return found;
+            }
+
+            if let Some((from, previous_length)) = previous
+                && table.len() < 4096 - 258
+            {
+                table.push((from, previous_length + 1));
+                width = match table.len() + 258 + usize::from(early_change) {
+                    size if size >= 2048 => 12,
+                    size if size >= 1024 => 11,
+                    size if size >= 512 => 10,
+                    _ => 9,
+                };
+            }
+            previous = Some((at, length));
+        }
+    }
+    found
+}
+
 /// Reads a PDF, or returns nothing when the file does not open with `%PDF-`.
 pub fn read(data: &[u8]) -> Option<Document> {
     if !data.starts_with(b"%PDF-") {
@@ -793,9 +1512,15 @@ pub fn read(data: &[u8]) -> Option<Document> {
     // the second.
     let uses_xref_stream = objects.iter().any(|o| o.kind.as_deref() == Some("XRef"));
 
-    if !uses_xref_stream && let Some(live) = live_offsets(data, MAX_XREF_ENTRIES) {
-        for object in &mut objects {
-            object.orphaned = !live.contains(&object.offset);
+    let mut xref_unread = false;
+    if !uses_xref_stream {
+        match live_offsets(data, MAX_XREF_ENTRIES) {
+            Some(live) => {
+                for object in &mut objects {
+                    object.orphaned = !live.contains(&object.offset);
+                }
+            }
+            None => xref_unread = true,
         }
     }
 
@@ -836,8 +1561,17 @@ pub fn read(data: &[u8]) -> Option<Document> {
         embedded_files,
         trailing,
         uses_xref_stream,
+        xref_unread,
+
     })
 }
+
+/// Objects that say nothing past the first few thousand, which is what reaches the
+/// caller. Seven bytes of file make one and each is a line of JSON twenty times that. A
+/// stream is what the caller has to open and an orphan is a finding, so those are not
+/// held to it, up to the second limit. The true count is reported alongside.
+const MAX_PLAIN_OBJECTS_LISTED: usize = 4096;
+const MAX_OBJECTS_LISTED: usize = 1 << 16;
 
 pub fn json(data: &[u8]) -> String {
     use crate::json::{push_bool, push_field, push_number, push_string};
@@ -846,14 +1580,33 @@ pub fn json(data: &[u8]) -> String {
         return "null".to_string();
     };
 
+    let mut plain_left = MAX_PLAIN_OBJECTS_LISTED;
+    let listed: Vec<&Object> = doc
+        .objects
+        .iter()
+        .filter(|object| {
+            let say_something = object.stream.is_some() || object.orphaned;
+            if !say_something && plain_left == 0 {
+                return false;
+            }
+            plain_left = plain_left.saturating_sub(usize::from(!say_something));
+            true
+        })
+        .take(MAX_OBJECTS_LISTED)
+        .collect();
+
     let mut out = String::from("{");
     push_field(&mut out, "version", &doc.version);
+    out.push(',');
+    push_number(&mut out, "objectCount", doc.objects.len());
     out.push(',');
     push_number(&mut out, "trailing", doc.trailing);
     out.push(',');
     push_bool(&mut out, "encrypted", doc.encrypted);
     out.push(',');
     push_bool(&mut out, "usesXrefStream", doc.uses_xref_stream);
+    out.push(',');
+    push_bool(&mut out, "xrefUnread", doc.xref_unread);
     out.push(',');
     push_number(&mut out, "revisions", doc.revisions.len());
     out.push(',');
@@ -884,7 +1637,7 @@ pub fn json(data: &[u8]) -> String {
 
     push_string(&mut out, "objects");
     out.push_str(":[");
-    for (i, object) in doc.objects.iter().enumerate() {
+    for (i, object) in listed.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }

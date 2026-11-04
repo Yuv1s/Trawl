@@ -3,9 +3,15 @@
 
 	let { cap }: { cap: PcapCapture } = $props();
 
+	/** Streams drawn in full, and lines of finding above them. Each stream carries a block of
+	 *  text, and a capture can list a thousand that held something. */
+	const STREAMS_SHOWN = 48;
+	const FINDINGS_SHOWN = 50;
+
 	const findings = $derived(
 		cap.streams.filter((s) => s.flags.length > 0 || s.embeddedFile !== null)
 	);
+	const arguing = $derived(cap.streams.filter((s) => (s.conflicting ?? 0) > 0));
 
 	function bytes(n: number): string {
 		if (n < 1024) return `${n} B`;
@@ -29,9 +35,22 @@
 </script>
 
 <div class="pcap">
+	{#if arguing.length > 0}
+		<ul class="findings">
+			{#each arguing.slice(0, FINDINGS_SHOWN) as stream, i (i)}
+				<li class="flagged">
+					Segments of <span class="mono">{stream.src} → {stream.dst}</span> disagree about
+					{(stream.conflicting ?? 0).toLocaleString()} byte{stream.conflicting === 1 ? '' : 's'}, so
+					the capture tells two stories. Flags from every reading are listed below, and nothing here
+					says which one the connection really carried.
+				</li>
+			{/each}
+		</ul>
+	{/if}
+
 	{#if findings.length > 0}
 		<ul class="findings">
-			{#each findings as stream, i (i)}
+			{#each findings.slice(0, FINDINGS_SHOWN) as stream, i (i)}
 				<li class="flagged">
 					{#if stream.flags.length > 0}
 						{stream.flags.length === 1 ? 'A flag' : `${stream.flags.length} flags`} reassembled from the
@@ -43,6 +62,11 @@
 					{/if}
 				</li>
 			{/each}
+			{#if findings.length > FINDINGS_SHOWN}
+				<li>
+					Showing the first {FINDINGS_SHOWN} of {findings.length.toLocaleString()} streams with a find.
+				</li>
+			{/if}
 		</ul>
 	{:else}
 		<p class="clear">
@@ -135,18 +159,27 @@
 		<section>
 			<h3 class="label">
 				Reassembled streams
-				{#if cap.streamCount > cap.streams.length}
-					<span class="count">{cap.streams.length} of {cap.streamCount}</span>
+				{#if cap.streamCount > STREAMS_SHOWN}
+					<span class="count"
+						>{Math.min(cap.streams.length, STREAMS_SHOWN)} of {cap.streamCount.toLocaleString()}</span
+					>
 				{/if}
 			</h3>
+			{#if cap.streamCount > cap.streams.length && !cap.flagsTruncated}
+				<p class="clear">The streams not listed were searched for flags as well, and held none.</p>
+			{/if}
 			<div class="streams">
-				{#each cap.streams as stream, i (i)}
+				{#each cap.streams.slice(0, STREAMS_SHOWN) as stream, i (i)}
 					<article class="stream" class:hit={finding(stream)}>
 						<header>
 							<span class="mono flow" class:flagged={finding(stream)}
 								>{stream.src} → {stream.dst}</span
 							>
-							<span class="mono muted">{bytes(stream.bytes)}</span>
+							<span class="mono muted">
+								{bytes(stream.bytes)}{(stream.carried ?? 0) > stream.bytes
+									? ` shown of ${bytes(stream.carried ?? 0)} carried`
+									: ''}
+							</span>
 							{#if stream.embeddedFile}
 								<span class="mono chip">{stream.embeddedFile}</span>
 							{/if}

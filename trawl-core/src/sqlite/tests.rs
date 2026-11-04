@@ -532,6 +532,111 @@ fn a_row_that_spills_to_overflow_pages_comes_back() {
     assert_eq!(spilled.values[2].text, "after the long one", "a column past the overflow");
 }
 
+/// A database of one table, with its rows on the page after the schema, which is where
+/// [`overflowing`] expects its chain to follow from.
+fn spilled_database(rows: Vec<u8>, chain: Vec<Vec<u8>>) -> Vec<u8> {
+    let schema = Leaf::new(PAGE, 100)
+        .live(&schema_cell("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, tail TEXT)"))
+        .build();
+    let mut pages = vec![schema, rows];
+    pages.extend(chain);
+    file_of(PAGE, 1, pages)
+}
+
+/// Flags one after another, so that some of them sit across the pages of a chain.
+fn run_of_flags() -> (String, Vec<String>) {
+    let flags: Vec<String> = (0..1000).map(|i| format!("flag{{piece_{i:04}}}")).collect();
+    (flags.join(" "), flags)
+}
+
+#[test]
+fn a_flag_in_pieces_across_overflow_pages_is_found() {
+    let (body, flags) = run_of_flags();
+    let (cell, chain) = overflowing(&body, body.len(), "t");
+    let file = spilled_database(Leaf::new(PAGE, 0).live(&cell).build(), chain);
+
+    let db = read(&file).unwrap();
+    assert_eq!(db.tables[0].flags, flags);
+    assert!(!db.flags_truncated);
+    assert!(
+        bytes::flag_candidates(&file).len() < flags.len(),
+        "at least one of them really is in pieces in the file"
+    );
+}
+
+#[test]
+fn a_flag_in_pieces_past_the_rows_shown_is_found() {
+    let (body, flags) = run_of_flags();
+    // A length that leaves little on the page, so all the rows before it fit there too.
+    let (cell, chain) = (body.len()..)
+        .map(|length| overflowing(&body, length, "t"))
+        .find(|(cell, _)| cell.len() < 1000)
+        .unwrap();
+
+    let mut rows = Leaf::new(PAGE, 0);
+    for rowid in 1..=MAX_ROWS as u64 {
+        rows = rows.live(&leaf_cell(rowid, &[Cell::Null, Cell::Text("s"), Cell::Text("t")]));
+    }
+    let file = spilled_database(rows.live(&cell).build(), chain);
+
+    let db = read(&file).unwrap();
+    assert_eq!(db.tables[0].rows.len(), MAX_ROWS);
+    assert_eq!(db.tables[0].row_count, MAX_ROWS + 1);
+    assert_eq!(db.tables[0].flags, flags);
+}
+
+/// A record of one value, with the serial type given.
+fn record_of(serial: u64, value: &[u8]) -> Vec<u8> {
+    let types = varint_of(serial);
+    let mut payload = varint_of(1 + types.len() as u64);
+    payload.extend_from_slice(&types);
+    payload.extend_from_slice(value);
+    payload
+}
+
+fn flags_in(payload: &[u8], encoding: Encoding) -> Vec<String> {
+    let mut found = CellFlags::default();
+    record_flags(payload, encoding, &[], &mut Budget::new(), &mut found);
+    found.list
+}
+
+#[test]
+fn a_cell_that_could_not_be_read_to_its_end_says_so() {
+    let (cell, mut chain) = overflowing("flag{at_the_start}", 9000, "tail");
+    chain.truncate(1);
+    chain[0][..4].copy_from_slice(&0u32.to_be_bytes());
+
+    let db = read(&spilled_database(Leaf::new(PAGE, 0).live(&cell).build(), chain)).unwrap();
+
+    assert!(db.flags_truncated);
+    assert_eq!(db.tables[0].flags, ["flag{at_the_start}"]);
+}
+
+#[test]
+fn each_value_is_searched_as_what_it_is() {
+    let wide: Vec<u8> = "flag{wide_text}".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let text = record_of(wide.len() as u64 * 2 + 13, &wide);
+    assert_eq!(flags_in(&text, Encoding::Utf16Le), ["flag{wide_text}"]);
+
+    let blob = b"\x00\x01flag{in_a_blob}\xff";
+    let record = record_of(blob.len() as u64 * 2 + 12, blob);
+    assert_eq!(flags_in(&record, Encoding::Utf8), ["flag{in_a_blob}"]);
+}
+
+#[test]
+fn a_search_out_of_budget_says_so() {
+    let (cell, _) = overflowing("flag{long}", 9000, "t");
+    let mut budget = Budget::new();
+    let (_, payload, _) = reader(&[]).record(&cell, 0, &mut budget).unwrap();
+
+    budget.scanned = 1;
+    let mut found = CellFlags::default();
+    record_flags(&payload, Encoding::Utf8, &[], &mut budget, &mut found);
+
+    assert!(found.truncated);
+    assert!(found.list.is_empty());
+}
+
 #[test]
 fn the_local_part_of_a_payload_follows_the_format() {
     let db = Db {

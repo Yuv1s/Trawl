@@ -3,6 +3,12 @@
 
 	let { db }: { db: SqliteDatabase } = $props();
 
+	/** What gets drawn. A database can name 32,767 columns and read them into every row of
+	 *  every table, and a page only has so many cells in it. */
+	const TABLES_SHOWN = 16;
+	const ROWS_SHOWN = 100;
+	const COLUMNS_SHOWN = 32;
+
 	const deletedTotal = $derived(db.tables.reduce((n, t) => n + t.deleted.length, 0));
 
 	const summary = $derived([
@@ -59,15 +65,17 @@
 		</dl>
 	</div>
 
-	{#each db.tables as table, t (t)}
+	{#each db.tables.slice(0, TABLES_SHOWN) as table, t (t)}
 		{@const width = Math.max(
 			table.columns.length,
 			table.rows[0]?.length ?? 0,
 			table.deleted[0]?.length ?? 0,
 			1
 		)}
-		{@const cols = heads(table.columns, width)}
-		{@const cells = [...Array(width).keys()]}
+		{@const cols = heads(table.columns, width).slice(0, COLUMNS_SHOWN)}
+		{@const cells = [...Array(Math.min(width, COLUMNS_SHOWN)).keys()]}
+		{@const rows = table.rows.slice(0, ROWS_SHOWN)}
+		{@const deletedRows = table.deleted.slice(0, ROWS_SHOWN)}
 		<div class="table">
 			<div class="table-scroll">
 				<table>
@@ -88,7 +96,7 @@
 						</tr>
 					</thead>
 					<tbody>
-						{#each table.rows as row, r (r)}
+						{#each rows as row, r (r)}
 							<tr>
 								{#each cells as c (c)}
 									{@const value = row[c]}
@@ -98,7 +106,7 @@
 								{/each}
 							</tr>
 						{/each}
-						{#each table.deleted as row, r (`d${r}`)}
+						{#each deletedRows as row, r (`d${r}`)}
 							{@const lostColumns = width - row.length}
 							<tr class="deleted">
 								{#each cells as c (c)}
@@ -112,13 +120,30 @@
 					</tbody>
 				</table>
 			</div>
-			{#if table.rowCount > table.rows.length}
+			{#if table.rowCount > rows.length}
 				<p class="capped label">
-					Showing the first {table.rows.length} of {table.rowCount.toLocaleString()} rows.
+					Showing the first {rows.length} of {table.rowCount.toLocaleString()} rows.
+				</p>
+			{/if}
+			{#if table.deleted.length > deletedRows.length}
+				<p class="capped label">
+					Showing the first {deletedRows.length} of {table.deleted.length.toLocaleString()} deleted rows.
+				</p>
+			{/if}
+			{#if width > cells.length}
+				<p class="capped label">
+					Showing the first {cells.length} of {width.toLocaleString()} columns.
 				</p>
 			{/if}
 		</div>
 	{/each}
+
+	{#if db.tables.length > TABLES_SHOWN || db.tableCount > db.tables.length}
+		<p class="capped label">
+			Showing the first {Math.min(db.tables.length, TABLES_SHOWN)} of {db.tableCount.toLocaleString()}
+			tables.
+		</p>
+	{/if}
 
 	<p class="footnote">
 		A row in the accent colour was deleted but is still in the file. SQLite unlinks a deleted row

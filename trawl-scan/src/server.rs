@@ -23,6 +23,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tower_http::cors::CorsLayer;
 
@@ -64,6 +65,9 @@ pub struct Config {
     token: String,
     allowed_origin: HeaderValue,
     port: u16,
+    /// Hosts and ports a scan found to be local, which is the only thing that lets a
+    /// proxied fetch reach a local address.
+    local_origins: Arc<Mutex<HashSet<(String, u16)>>>,
 }
 
 impl Config {
@@ -76,6 +80,25 @@ impl Config {
             token,
             allowed_origin,
             port: DEFAULT_PORT,
+            local_origins: Arc::default(),
+        })
+    }
+
+    fn remember_local(&self, url: &str) {
+        if let Some(origin) = host_and_port(url) {
+            self.local_origins
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(origin);
+        }
+    }
+
+    fn scanned_as_local(&self, url: &str) -> bool {
+        host_and_port(url).is_some_and(|origin| {
+            self.local_origins
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&origin)
         })
     }
 
@@ -130,12 +153,7 @@ async fn require_local_host(
     request: Request,
     next: Next,
 ) -> Response {
-    let host = request
-        .headers()
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok());
-
-    if host.is_some_and(|host| host_is_allowed(host, config.port)) {
+    if only_host(request.headers()).is_some_and(|host| host_is_allowed(host, config.port)) {
         next.run(request).await
     } else {
         (
@@ -146,27 +164,41 @@ async fn require_local_host(
     }
 }
 
+/// The request's `Host`, if it has exactly one. With two, what this reads and what
+/// something later reads can differ.
+fn only_host(headers: &HeaderMap) -> Option<&str> {
+    let mut hosts = headers.get_all(header::HOST).iter();
+    match (hosts.next(), hosts.next()) {
+        (Some(value), None) => value.to_str().ok(),
+        _ => None,
+    }
+}
+
 /// Whether a `Host` header names this loopback service: one of `127.0.0.1`,
 /// `localhost` or `[::1]`, and, if it carries a port, the one the scanner binds.
 fn host_is_allowed(host_header: &str, port: u16) -> bool {
-    let (host, host_port) = split_host_port(host_header);
+    let Some((host, host_port)) = split_host_port(host_header) else {
+        return false;
+    };
     let host_ok = matches!(host, "127.0.0.1" | "localhost" | "::1");
     let port_ok = host_port.is_none_or(|given| given == port);
     host_ok && port_ok
 }
 
 /// Splits a `Host` header into its host and optional port, understanding the
-/// bracketed `[::1]:port` form an IPv6 literal takes.
-fn split_host_port(host_header: &str) -> (&str, Option<u16>) {
+/// bracketed `[::1]:port` form an IPv6 literal takes. Nothing at all for a port that
+/// is there but is not a number, which no browser sends.
+fn split_host_port(host_header: &str) -> Option<(&str, Option<u16>)> {
     if let Some(rest) = host_header.strip_prefix('[') {
-        return match rest.split_once(']') {
-            Some((inside, after)) => (inside, after.strip_prefix(':').and_then(|p| p.parse().ok())),
-            None => (host_header, None),
+        let (inside, after) = rest.split_once(']')?;
+        return match after.strip_prefix(':') {
+            Some(port) => Some((inside, Some(port.parse().ok()?))),
+            None => after.is_empty().then_some((inside, None)),
         };
     }
     match host_header.rsplit_once(':') {
-        Some((host, port)) => (host, port.parse().ok()),
-        None => (host_header, None),
+        Some((host, port)) => Some((host, Some(port.parse().ok()?))),
+        None => Some((host_header, None)),
     }
 }
 
@@ -484,6 +516,37 @@ async fn entry_allows_local(url: &str, config: &Config) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a proxied fetch may reach local or private addresses: only for an origin a
+/// scan already found local, and still local now. Without the first half, a public site
+/// could point its own name at a private address once the crawl was done, and the image
+/// it listed would be fetched from there.
+async fn fetch_allows_local(url: &str, config: &Config) -> bool {
+    config.scanned_as_local(url) && entry_allows_local(url, config).await
+}
+
+/// Where an entry's redirects left it, against the address the person named.
+struct Landed {
+    /// Still what was named, which is as far as local access and active checks go.
+    same_service: bool,
+    /// Still that site, if perhaps moved to https, which is as far as guessing names goes.
+    same_site: bool,
+}
+
+fn landed(requested: &str, entry: &reqwest::Url) -> Landed {
+    let requested = reqwest::Url::parse(requested).ok();
+    let same_service = requested
+        .as_ref()
+        .is_some_and(|url| crate::fetch::same_service(url, entry));
+    let same_site = requested
+        .as_ref()
+        .is_some_and(|url| url.host_str() == entry.host_str() && url.port() == entry.port());
+
+    Landed {
+        same_service,
+        same_site: same_service || same_site,
+    }
+}
+
 /// Sorts a page's references into the buckets they belong in, and hands back the
 /// same-host pages it linked. What the caller does with those links is what sets
 /// the crawl depth: the entry follows them, a page one level down does not.
@@ -755,6 +818,28 @@ async fn scan(
         return Err((StatusCode::BAD_REQUEST, "entry URL did not parse".into()));
     };
 
+    // A redirect is read like any page, and the person is told. What goes further than
+    // reading is for the site they named, which is the only one they vouched for.
+    let arrived = landed(&request.url, &entry_parsed);
+
+    // A local page sending the crawl to a public site does not make that site local, or its
+    // name could turn to a private address part way through what follows.
+    let allow_local = allow_local && arrived.same_service;
+    if allow_local {
+        config.remember_local(&entry_url);
+    }
+
+    if !arrived.same_service {
+        result.notices.push(format!(
+            "The target redirected from {} to {}, so this is what that address holds.{}",
+            request.url,
+            entry_url,
+            if arrived.same_site { "" } else {
+                " File names were not tried on it, since it is not the site you named."
+            }
+        ));
+    }
+
     // The whole passive crawl shares one deadline, checked between fetches, so a
     // site that answers slowly cannot hold the request open indefinitely.
     let deadline = Instant::now() + PASSIVE_DEADLINE;
@@ -855,21 +940,22 @@ async fn scan(
     // place, a dotfile served by mistake, a flag dropped at the root. The
     // server's own not-found answer is learned first so a soft-404 site does
     // not turn every guess into a find. Each hit still runs the guard.
-    if Instant::now() < deadline {
-        probe_by_name(
-            allow_local,
-            deadline,
-            &entry_parsed,
-            &mut visited,
-            &mut result,
-            &mut images,
-            &mut scripts,
-            &mut assets,
-            &mut external,
-        )
-        .await;
-    } else {
-        time_limit_hit = true;
+    if arrived.same_site { if Instant::now() < deadline {
+            probe_by_name(
+                allow_local,
+                deadline,
+                &entry_parsed,
+                &mut visited,
+                &mut result,
+                &mut images,
+                &mut scripts,
+                &mut assets,
+                &mut external,
+            )
+            .await;
+        } else {
+            time_limit_hit = true;
+        }
     }
 
     // Scripts and stylesheets the crawl linked but did not open, read for the
@@ -890,12 +976,7 @@ async fn scan(
     // the entry redirected to another origin: the person authorised the target
     // they named, not wherever it pointed.
     if request.active {
-        let requested_origin = reqwest::Url::parse(&request.url).map(|u| u.origin());
-        let stayed_on_origin = requested_origin
-            .map(|origin| origin == entry_parsed.origin())
-            .unwrap_or(false);
-        if stayed_on_origin {
-            for hit in crate::active::run(&entry_url, allow_local, &bodies, &request.hints).await {
+        if arrived.same_service { for hit in crate::active::run(&entry_url, allow_local, &bodies, &request.hints).await {
                 result
                     .flags
                     .push(located(hit.value, &hit.source, &hit.note));
@@ -1023,9 +1104,7 @@ async fn raw(
 ) -> Result<impl IntoResponse, ApiError> {
     authorize_bearer(&headers, &config)?;
 
-    // The same entry classification a scan uses: local access only when the host
-    // the person named resolves there and the scanner is in local mode.
-    let allow_local = entry_allows_local(&query.url, &config).await;
+    let allow_local = fetch_allows_local(&query.url, &config).await;
 
     let request = crate::fetch::Request {
         max_body: Some(FETCH_MAX_BODY),
@@ -1200,9 +1279,77 @@ mod tests {
             "127.0.0.1:9000", // right host, wrong port
             "127.0.0.1.evil.example:8099",
             "10.0.0.1:8099",
+            // Shapes that read as loopback to one parser and as a stranger to another.
+            "127.0.0.1:8099@evil.example",
+            "localhost:8099:8099",
+            "127.0.0.1:",
+            "127.0.0.1:not-a-port",
+            "[::1]evil.example:8099",
+            "[::1]:not-a-port",
+            "::1",
         ] {
             assert!(!host_is_allowed(host, 8099), "{host} should be refused");
         }
+    }
+
+    #[test]
+    fn a_request_must_carry_exactly_one_host() {
+        let host = |value: &'static str| HeaderValue::from_static(value);
+
+        let mut headers = HeaderMap::new();
+        assert_eq!(only_host(&headers), None);
+
+        headers.append(header::HOST, host("127.0.0.1:8099"));
+        assert_eq!(only_host(&headers), Some("127.0.0.1:8099"));
+
+        headers.append(header::HOST, host("evil.example"));
+        assert_eq!(only_host(&headers), None);
+    }
+
+    #[test]
+    fn a_redirect_is_measured_against_the_address_named() {
+        let at = |url: &str| {
+            let entry = reqwest::Url::parse(url).unwrap();
+            let arrived = landed("http://target.example/", &entry);
+            (arrived.same_service, arrived.same_site)
+        };
+
+        assert_eq!(at("http://target.example/home"), (true, true));
+        assert_eq!(at("https://target.example/"), (false, true));
+        assert_eq!(at("http://target.example:8080/"), (false, false));
+        assert_eq!(at("http://www.target.example/"), (false, false));
+        assert_eq!(at("https://elsewhere.example/"), (false, false));
+
+        let entry = reqwest::Url::parse("http://127.0.0.1:5000/home").unwrap();
+        let arrived = landed("http://localhost:5000/", &entry);
+        assert!(arrived.same_service && arrived.same_site, "one machine, one port");
+    }
+
+    #[tokio::test]
+    async fn a_fetch_reaches_local_only_for_an_origin_a_scan_found_local() {
+        let config =
+            Config::new(true, TOKEN.to_string(), "https://trawl.example".to_string()).unwrap();
+        let image = "http://127.0.0.1:5000/shot.png";
+
+        assert!(!fetch_allows_local(image, &config).await, "nothing scanned yet");
+
+        config.remember_local("http://127.0.0.1:5000/");
+        assert!(fetch_allows_local(image, &config).await);
+
+        let shared = config.clone();
+        assert!(fetch_allows_local(image, &shared).await, "every handler sees it");
+
+        for other in ["http://127.0.0.1:5001/shot.png", "http://localhost:5000/shot.png"] {
+            assert!(!fetch_allows_local(other, &config).await, "{other} was never scanned");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_scanner_outside_local_mode_reaches_nothing_local_whatever_it_remembers() {
+        let config = self::config();
+        config.remember_local("http://127.0.0.1:5000/");
+
+        assert!(!fetch_allows_local("http://127.0.0.1:5000/shot.png", &config).await);
     }
 
     #[test]

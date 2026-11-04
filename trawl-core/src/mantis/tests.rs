@@ -24,6 +24,100 @@ fn a_run_past_the_size_limit_is_not_attacked() {
     assert!(reading.vigenere.is_none() && reading.shortlist.is_empty());
 }
 
+/// A paste built to branch: three encodings that each undo one layer of themselves, six
+/// deep, so every order of peeling them is a different string on the way to the same end.
+fn nested_paste(length: usize) -> Vec<u8> {
+    let depth = 6;
+    let piece = format!(
+        "qw fp gj lu %{}41&{}#65;={}41 ",
+        "25".repeat(depth),
+        "#38;".repeat(depth),
+        "3D".repeat(depth)
+    );
+    piece.repeat(length / piece.len()).into_bytes()
+}
+
+#[test]
+fn a_paste_with_a_great_many_readings_does_not_take_all_day() {
+    // Two hundred seconds in a browser: 262 KB, hundreds of distinct readings, and every
+    // route to each one searched all over again from there.
+    let paste = nested_paste(MAX_INPUT - 1024);
+
+    let started = std::time::Instant::now();
+    let found = peel_with_depth(&paste, &[], MAX_DEPTH);
+    assert!(started.elapsed().as_secs() < 60, "took {:?}", started.elapsed());
+    assert!(found.steps.len() <= MAX_DEPTH);
+}
+
+#[test]
+fn a_reading_reached_twice_is_worked_out_once() {
+    // Small enough that the budget never comes into it, so what is measured is the memo.
+    let paste = nested_paste(2048);
+    let mut search = Search {
+        tags: &[],
+        memo: HashMap::new(),
+        budget: SEARCH_BUDGET,
+        cut: false,
+    };
+    let mut seen = vec![paste.clone()];
+    explore(&paste, &mut seen, &mut search, MAX_DEPTH);
+
+    assert!(search.memo.len() > 20, "only {} readings to work with", search.memo.len());
+    assert!(search.budget > 0, "a paste this size has to be searched in full");
+    assert!(!search.cut);
+
+    // Searched from each distinct reading once per number of layers left, at most.
+    let spent = SEARCH_BUDGET - search.budget;
+    let readings: usize = search.memo.keys().map(Vec::len).sum();
+    assert!(
+        spent <= readings * MAX_DEPTH,
+        "spent {spent} on {readings} bytes of distinct readings"
+    );
+}
+
+#[test]
+fn a_search_out_of_budget_still_answers_with_what_it_reached() {
+    let paste = b"NTY2ZDZjNjE2NzdiNmU2NTczNzQ2NTY0NWY3MjY1NjE2NDY5NmU2NzdkMA==".to_vec();
+    let mut search = Search {
+        tags: &[],
+        memo: HashMap::new(),
+        budget: 0,
+        cut: false,
+    };
+    let mut seen = vec![paste.clone()];
+    let (score, steps) = explore(&paste, &mut seen, &mut search, MAX_DEPTH);
+    assert!(steps.is_empty());
+    assert_eq!(score, rate(&paste, &[]));
+    assert!(search.cut, "whoever reads this has to be told it stopped");
+}
+
+#[test]
+fn a_paste_with_more_readings_than_the_budget_says_so() {
+    let token = format!(
+        "%{}41&{}#65;={}41 ",
+        "25".repeat(6),
+        "#38;".repeat(6),
+        "3D".repeat(6)
+    );
+    let paste = token.repeat((256 << 10) / token.len());
+
+    let wide = peel_with_depth(paste.as_bytes(), &[], MAX_DEPTH);
+    assert!(wide.search_cut);
+    assert!(json_from_peel(&wide).contains("\"searchCut\":true"));
+
+    let ordinary = peeled("ZmxhZ3tub3RoaW5nX3Vuc2Vlbn0=");
+    assert!(!ordinary.search_cut);
+    assert!(json_from_peel(&ordinary).contains("\"searchCut\":false"));
+}
+
+#[test]
+fn the_memo_does_not_change_what_an_ordinary_chain_comes_to() {
+    let hex = "5a6d78685a3374745a57317658324e6f5957356e5a584e66626d393061476c755a33303d";
+    let found = peeled(hex);
+    assert_eq!(names(&found), vec!["hex", "base64"], "{:?}", found.steps);
+    assert_eq!(text(&found), "flag{memo_changes_nothing}");
+}
+
 #[test]
 fn readable_capitals_are_not_rotated_into_a_file_signature() {
     // Rotated, these open with BM, and a bare two-byte match on that called the rotation

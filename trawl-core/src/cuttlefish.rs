@@ -517,19 +517,19 @@ fn stats_json(
 /// value holding every count would dominate the histogram and drown the channels
 /// that carry the picture.
 pub fn traversal_samples(rgba: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rgba.len() / 4 * 3);
-    for pixel in rgba.as_chunks::<4>().0 {
-        out.extend_from_slice(&pixel[..3]);
-    }
-    out
+    traversal(rgba).collect()
+}
+
+fn traversal(rgba: &[u8]) -> impl Iterator<Item = u8> + '_ {
+    rgba.as_chunks::<4>().0.iter().flat_map(|pixel| pixel[..3].iter().copied())
 }
 
 /// The chi-square sweep as JSON, ready to leave the worker.
 pub fn chi_square_json(rgba: &[u8], steps: usize) -> String {
     use crate::json::{push_bool, push_number, push_string};
 
-    let samples = traversal_samples(rgba);
-    let points = chi::sweep(&samples, steps);
+    let samples = rgba.len() / 4 * 3;
+    let points = chi::sweep_over(traversal(rgba), samples, steps);
     let result = chi::verdict(&points);
 
     let mut out = String::from("{");
@@ -543,7 +543,7 @@ pub fn chi_square_json(rgba: &[u8], steps: usize) -> String {
     out.push(':');
     out.push_str(&format!("{:.4}", result.peak_probability));
     out.push(',');
-    push_number(&mut out, "samples", samples.len());
+    push_number(&mut out, "samples", samples);
     out.push(',');
     push_string(&mut out, "points");
     out.push_str(":[");
@@ -582,6 +582,19 @@ pub fn extract_named(
     max_bytes: usize,
 ) -> Option<Vec<u8>> {
     channel_indices(channels).map(|idx| extract(rgba, idx, bit, msb_first, max_bytes))
+}
+
+/// [`extract_named`], read a column at a time, for a combination the sweep found that way.
+pub fn extract_named_columns(
+    rgba: &[u8],
+    (width, height): (usize, usize),
+    channels: &str,
+    bit: u8,
+    msb_first: bool,
+    max_bytes: usize,
+) -> Option<Vec<u8>> {
+    channel_indices(channels)
+        .map(|idx| extract_columns(rgba, width, height, idx, bit, msb_first, max_bytes))
 }
 
 #[cfg(test)]

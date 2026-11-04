@@ -60,6 +60,28 @@ fn a_bitmap_error_is_passed_through_rather_than_swallowed() {
 }
 
 #[test]
+fn a_png_cut_short_is_as_tall_as_the_rows_it_has() {
+    let mut ihdr = 2u32.to_be_bytes().to_vec();
+    ihdr.extend_from_slice(&3u32.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+
+    let mut body = b"IHDR".to_vec();
+    body.extend_from_slice(&ihdr);
+    let mut file = png::SIGNATURE.to_vec();
+    file.extend_from_slice(&13u32.to_be_bytes());
+    file.extend_from_slice(&body);
+    file.extend_from_slice(&png::crc_of(&body).to_be_bytes());
+
+    let raster = decode(&file, &[0, 1, 2, 3, 4, 5, 6]).unwrap();
+    assert_eq!(raster.height, 1);
+    assert_eq!(raster.declared_height, 3);
+    assert_eq!(raster.rgba.len(), 2 * 4);
+
+    let error = decode(&file, &[]).unwrap_err();
+    assert!(error.contains("expected"), "{error}");
+}
+
+#[test]
 fn alpha_is_only_claimed_when_the_format_carries_it() {
     assert!(!decode(&bmp_file(), &[]).unwrap().has_alpha, "24-bit BMP has none");
 }

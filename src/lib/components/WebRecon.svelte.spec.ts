@@ -45,6 +45,81 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 });
 
+describe('WebRecon pairing token', () => {
+	it('replaces a stored token that is not one this page generated', async () => {
+		localStorage.setItem(SCANNER_TOKEN_KEY, "x'; echo INJECTED; echo '");
+		vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('no scanner'));
+
+		const view = await render(WebRecon, { onreset: vi.fn() });
+		unmount = view.unmount;
+
+		const command = page.getByRole('textbox', { name: /scanner install command/i });
+		await expect.element(command).toBeVisible();
+		const value = (command.element() as HTMLInputElement).value;
+		expect(value).not.toContain('INJECTED');
+		expect(localStorage.getItem(SCANNER_TOKEN_KEY)).toMatch(/^[0-9a-f]{64}$/);
+	});
+});
+
+describe('WebRecon scanner version', () => {
+	const healthAnswering = (version: string) =>
+		vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+			return Response.json({ allow_local: false, version });
+		});
+
+	it('warns about a scanner older than this page', async () => {
+		healthAnswering('0.1.1');
+		const view = await render(WebRecon, { onreset: vi.fn() });
+		unmount = view.unmount;
+
+		await expect.element(page.getByText(/missing security fixes/)).toBeVisible();
+	});
+
+	it('says nothing about a current scanner', async () => {
+		healthAnswering('0.1.2');
+		const view = await render(WebRecon, { onreset: vi.fn() });
+		unmount = view.unmount;
+
+		await expect.element(page.getByRole('heading', { name: 'Scanner connected' })).toBeVisible();
+		expect(document.body.textContent).not.toContain('missing security fixes');
+	});
+});
+
+describe('WebRecon scan results', () => {
+	it('links only to web addresses, whatever the scanner answers', async () => {
+		const hostile = 'javascript:alert(1)';
+		const safe = 'https://example.test/page';
+		vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+			const url = new URL(input instanceof Request ? input.url : input.toString());
+			if (url.pathname === '/health')
+				return Response.json({ allow_local: false, version: '0.1.2' });
+			return Response.json({
+				target: TARGET,
+				pages: [],
+				images: [],
+				scripts: [],
+				assets: [],
+				external: [hostile, safe],
+				found: [],
+				flags: [],
+				comments: []
+			});
+		});
+
+		await renderAndScan();
+
+		const opened = () => document.querySelector('.preview a.open');
+
+		await page.getByRole('button', { name: hostile }).click();
+		await expect.element(page.getByText('Open', { exact: true })).toBeVisible();
+		expect(opened()?.hasAttribute('href')).toBe(false);
+
+		await page.getByRole('button', { name: safe }).click();
+		await expect.element(page.getByRole('link', { name: 'Open' })).toBeVisible();
+		expect(opened()?.getAttribute('href')).toBe(safe);
+	});
+});
+
 describe('WebRecon local restart', () => {
 	it('copies a complete local-mode restart command after a loopback refusal', async () => {
 		scannerFetch('refused: loopback (::1)');

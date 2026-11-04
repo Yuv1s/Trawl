@@ -244,6 +244,10 @@ fn cloud_metadata_reason(ip: IpAddr) -> Option<Reason> {
             if v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254) {
                 return Some("link-local, includes cloud metadata (fd00:ec2::254)");
             }
+            // fd20:ce::254, the same thing on Google Cloud.
+            if v6 == Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254) {
+                return Some("link-local, includes cloud metadata (fd20:ce::254)");
+            }
             None
         }
     }

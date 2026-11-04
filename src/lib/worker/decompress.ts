@@ -1,9 +1,13 @@
 /**
- * Compression framing and bounded decompression shared by the analysis worker
- * and its tests. The platform's DecompressionStream does the inflate; this
- * module decides which wrapper a buffer carries, validates its header, and
+ * Compression framing and bounded decompression for what a person pastes in, shared by
+ * the analysis worker and its tests. The platform's DecompressionStream does the inflate
+ * here; this module decides which wrapper a buffer carries, validates its header, and
  * stops a stream once its output crosses a budget instead of materializing a
  * decompression bomb in memory.
+ *
+ * It is all or nothing, because the platform is: an errored stream discards whatever it
+ * had not yet handed over. A file's own streams go through trawl-core's inflate instead,
+ * which keeps what came before the damage.
  */
 
 export const DECOMPRESS_LIMIT = 1 << 20; // 1 MiB per stream by default
@@ -88,9 +92,9 @@ export async function boundedInflate(
 }
 
 /**
- * Deterministic fingerprint for dedup: first 64 bytes, last 64 bytes, and the
- * length. No hashing dependency is needed for a dedup set that also confirms
- * equality on collision.
+ * Deterministic fingerprint: first 64 bytes, last 64 bytes, and the length. It says where
+ * to look and proves nothing, since two files can share all three and differ in between.
+ * `SeenBytes` compares what is behind it before calling anything a duplicate.
  */
 export function fingerprint(bytes: Uint8Array): string {
 	const len = bytes.length;
@@ -101,4 +105,35 @@ export function fingerprint(bytes: Uint8Array): string {
 	for (const b of tail) h = (h * 1315423911) ^ b;
 	h = (h * 1315423911) ^ len;
 	return `${len}:${h >>> 0}`;
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i += 1) {
+		if (a[i] !== b[i]) return false;
+	}
+	return true;
+}
+
+/**
+ * Files already seen, each with a label to report it by.
+ *
+ * The bytes are held by reference and compared in full on a matching fingerprint. A
+ * fingerprint alone lets a decoy with the right head, tail and length stand in for the
+ * real file and get that one thrown away as a duplicate of it.
+ */
+export class SeenBytes<T> {
+	private readonly byFingerprint = new Map<string, { bytes: Uint8Array; label: T }[]>();
+
+	find(bytes: Uint8Array): T | undefined {
+		return this.byFingerprint.get(fingerprint(bytes))?.find((seen) => sameBytes(seen.bytes, bytes))
+			?.label;
+	}
+
+	add(bytes: Uint8Array, label: T): void {
+		const key = fingerprint(bytes);
+		const bucket = this.byFingerprint.get(key);
+		if (bucket) bucket.push({ bytes, label });
+		else this.byFingerprint.set(key, [{ bytes, label }]);
+	}
 }

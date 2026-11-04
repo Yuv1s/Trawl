@@ -1,3 +1,5 @@
+import type { Report } from '$lib/analysis/rsa';
+
 export type Chunk = {
 	kind: string;
 	offset: number;
@@ -15,7 +17,8 @@ export type TextChunk = {
 	/** Where the zlib stream sits, so the worker can inflate it. */
 	payloadOffset: number;
 	payloadLength: number;
-	/** Set when inflation was attempted and failed. */
+	/** What went wrong inflating this, or why it was not opened. `text` holds whatever
+	 *  came out before it did. */
 	error?: string;
 };
 
@@ -66,7 +69,11 @@ export type Survey = {
 	size: number;
 	format: string | null;
 	flags: FlagHit[];
+	/** True when more flags turned up than the scan lists. */
+	flagsTruncated?: boolean;
 	magic: MagicHit[];
+	/** Signatures left out because their kind's allowance ran out. */
+	magicOmitted?: number;
 	/** Null when the file carries no metadata block at all. */
 	exif: ExifEntry[] | null;
 	jpegSegments: JpegSegment[];
@@ -85,6 +92,8 @@ export type SweepCandidate = {
 	channels: string;
 	bit: number;
 	msbFirst: boolean;
+	/** Read a column at a time rather than a row at a time. */
+	columnMajor?: boolean;
 	reason: string;
 	preview: string;
 	/** Length of the readable run, which exceeds the preview when it clipped. */
@@ -114,8 +123,13 @@ export type Structure = {
 	header: Header;
 	ihdrRepair?: IhdrRepair | null;
 	chunks: Chunk[];
+	/** True counts, which `chunks` and `text` are capped copies of. */
+	chunkCount?: number;
 	text: TextChunk[];
+	textCount?: number;
 	flags: FlagHit[];
+	/** True when more flags turned up than the scan lists. */
+	flagsTruncated?: boolean;
 	trailing: { offset: number; length: number } | null;
 	/** Filled in by the worker for indexed images. */
 	palette?: Palette | null;
@@ -167,11 +181,16 @@ export function isJpegError(jpeg: JpegStego | JpegError): jpeg is JpegError {
 export type ZipEntry = {
 	name: string;
 	method: string;
+	/** What the local header called the method, when the directory calls it otherwise. */
+	localMethod?: string | null;
+	/** The directory's numbers when it lists this entry, which is what every reader goes by. */
 	compressed: number;
 	uncompressed: number;
 	offset: number;
 	/** Where the compressed data begins. Null for a phantom the directory points at with no header. */
 	dataOffset: number | null;
+	/** How many bytes from `dataOffset` to read: the longest either description makes possible. */
+	readLength?: number;
 	crc: string;
 	/** The archive's own password flag. Trawl does not crack these. */
 	encrypted: boolean;
@@ -186,8 +205,11 @@ export type ZipEntry = {
 	flags?: string[];
 	/** Filled in by the worker when the entry is small enough for in-memory re-analysis. */
 	bytes?: Uint8Array;
-	/** Set when the worker tried to decompress this entry and could not. */
+	/** What went wrong decompressing this entry. `text`, `flags` and `bytes` hold whatever
+	 *  came out before it did. */
 	readError?: string;
+	/** Why the worker did not open this entry at all. */
+	notOpened?: string;
 };
 
 /** One AES-CBC decryption that read as text, and where its key and IV came from. */
@@ -209,6 +231,8 @@ export type ZipArchive = {
 	trailing: number;
 	/** How many files the directory claims, against how many it lists. */
 	declared: number;
+	/** True when the walk stopped at its limit with more of the file to go. */
+	capped?: boolean;
 };
 
 /** A stream's raw bytes inside a PDF object, wherever compression leaves them. */
@@ -218,9 +242,12 @@ export type PdfStream = {
 	/** The filter chain named in `/Filter`, joined with " then ". Empty when
 	 *  the stream carries its bytes uncompressed. */
 	filter: string;
-	/** Filled in once the worker has inflated a FlateDecode stream. Rust
-	 *  locates the bytes; inflate is a platform call. */
+	/** Filled in once the worker has undone the filter chain, and cut to a preview. */
 	text?: string;
+	/** Bytes the chain gave, of which `text` is the start. */
+	decoded?: number;
+	/** What went wrong undoing the chain, or why the stream was not opened. `text` holds
+	 *  whatever came out before it did. */
 	error?: string;
 };
 
@@ -245,6 +272,11 @@ export type PdfObject = {
 export type PdfStructure = {
 	/** The version named in the file's own `%PDF-` header. */
 	version: string;
+	/** The true object count, which `objects` is a capped copy of. */
+	objectCount?: number;
+	/** True when the classic cross-reference table could not be read, so no object was
+	 *  checked against it. */
+	xrefUnread?: boolean;
 	/** Bytes after the last `%%EOF`, appended by something other than
 	 *  whatever wrote the document. */
 	trailing: number;
@@ -329,14 +361,19 @@ export type SqliteTable = {
 	rowCount: number;
 	/** Rows recovered from this table's free space: deleted, and still there. */
 	deleted: SqliteValue[][];
+	/** Flags in the live rows, every value searched whole however little of it is shown. */
+	flags?: string[];
 };
 
 /** What a SQLite database holds, read from the file rather than queried: its
  *  tables and rows, and the rows that were deleted but never left the file. */
 export type SqliteDatabase = {
 	/** Flags read cell by cell, filled in by the worker. A scan of the raw file can
-	 *  miss them, because neighbouring columns run together there. */
+	 *  miss them, because neighbouring columns run together there and a long value is
+	 *  in pieces. */
 	flags?: { text: string; table: string; deleted: boolean }[];
+	/** True when a live cell could not be searched to its end. */
+	flagsTruncated?: boolean;
 	pageSize: number;
 	pageCount: number;
 	encoding: string;
@@ -364,7 +401,12 @@ export type PcapConversation = {
 export type PcapStream = {
 	src: string;
 	dst: string;
+	/** Bytes laid out for showing, a window around the longest unbroken run. */
 	bytes: number;
+	/** Payload the direction carried, all of it searched for flags. */
+	carried?: number;
+	/** Bytes two segments gave different values for. `flags` holds what every reading said. */
+	conflicting?: number;
 	/** The reassembled bytes as printable text, control characters as dots. */
 	text: string;
 	/** How much of the stream is printable, to tell a transcript from a file. */
@@ -403,6 +445,10 @@ export type PcapCapture = {
 	/** True count of reassembled streams that carried payload. */
 	streamCount: number;
 	dns: PcapDnsQuery[];
+	/** True when the reader stopped at its packet limit with more of the file to go. */
+	packetsCapped?: boolean;
+	/** True when the streams held more flags than are reported. */
+	flagsTruncated?: boolean;
 };
 
 export type BinarySection = {
@@ -484,6 +530,11 @@ export type BinaryStructure = {
 	/** True totals, which `imports` and `exports` are capped copies of. */
 	importCount: number;
 	exportCount: number;
+	/** True when a budget ended the symbol walk, so those totals stop where it did. */
+	symbolsCapped?: boolean;
+	/** True totals, which `sections` and `segments` are capped copies of. */
+	sectionCount?: number;
+	segmentCount?: number;
 	/** Libraries named by `DT_NEEDED`, in the order the dynamic table lists them. */
 	needed: string[];
 	sections: BinarySection[];
@@ -529,6 +580,8 @@ export type HashMatch = {
 
 export type PeelResult = {
 	depth: number;
+	/** True when the search ran out of budget, so there may be more layers than `steps`. */
+	searchCut?: boolean;
 	/** How much the final answer reads like ordinary text, 0 to 1. */
 	score: number;
 	result: string;
@@ -853,6 +906,8 @@ export type GifAnalysis = {
 	capped: boolean;
 	/** Why no frame could be read, when the file is a GIF this reader refuses. */
 	error: string | null;
+	/** What stopped the walk short, when frames had already been read. */
+	stopped?: string | null;
 	sources: GifSource[];
 };
 
@@ -882,6 +937,8 @@ export type NestedArtifact = {
 	status: 'analysed' | 'skipped' | 'error';
 	/** Set when status is not `analysed`: what stopped the walk. */
 	reason?: string;
+	/** Set on an analysed child read from a damaged or cut-off stream. */
+	damage?: string;
 	/** This child's findings and everything below it. */
 	findings: DerivedFinding[];
 	children: NestedArtifact[];
@@ -898,12 +955,21 @@ export type NestedAnalysis = {
 	expandedBytes: number;
 	/** True when a depth, count, per-file, or aggregate budget stopped the walk. */
 	capped: boolean;
+	/** Skipped files past the number listed in `roots`, and counted in `skipped`. */
+	unlisted?: number;
 };
 
 export type AnalysisRequest =
 	| { kind: 'analyse'; id: number; name: string; bytes: ArrayBuffer; flagTags: string }
 	| { kind: 'plane'; id: number; channel: number; bit: number }
-	| { kind: 'extract'; id: number; channels: string; bit: number; msbFirst: boolean }
+	| {
+			kind: 'extract';
+			id: number;
+			channels: string;
+			bit: number;
+			msbFirst: boolean;
+			columnMajor: boolean;
+	  }
 	| { kind: 'peel'; id: number; text: string; flagTags: string }
 	| { kind: 'extractPalette'; id: number; msbFirst: boolean }
 	| {
@@ -929,6 +995,9 @@ export type AnalysisResponse =
 			status: 'ok';
 			/** Readers that crashed on this file, so their results are missing. */
 			crashed: string[];
+			/** What Trawl stopped short of or read damaged, in a sentence each, so a capped
+			 *  result never passes for a complete one. */
+			notes?: string[];
 			name: string;
 			size: number;
 			survey: Survey;
@@ -967,7 +1036,7 @@ export type AnalysisResponse =
 			/** Automatic per-frame and per-difference analysis for GIF files. */
 			gif: GifAnalysis | null;
 	  }
-	| { id: number; status: 'peel'; input: string; peel: PeelResult }
+	| { id: number; status: 'peel'; input: string; peel: PeelResult; rsa: Report | null }
 	| { id: number; status: 'keyed'; key: string; attempts: KeyAttempt[] }
 	| { id: number; status: 'plane'; channel: number; bit: number; pixels: Uint8Array }
 	| { id: number; status: 'extract'; label: string; bytes: Uint8Array }

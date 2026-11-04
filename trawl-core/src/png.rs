@@ -333,11 +333,22 @@ pub fn chunk_payload<'a>(file: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
         .map(|c| chunk_data(file, c))
 }
 
-/// Concatenated IDAT payloads, ready to hand to `DecompressionStream('deflate')`.
+/// Concatenated IDAT payloads, ready to inflate.
+///
+/// A file cut off part way through its last IDAT still gives what it holds, since the
+/// rows before the cut are there and a browser will show them.
 pub fn idat(file: &[u8]) -> Vec<u8> {
+    let chunks = chunks(file);
     let mut out = Vec::new();
-    for chunk in chunks(file).into_iter().filter(|c| c.is(b"IDAT")) {
-        out.extend_from_slice(chunk_data(file, chunk));
+    for chunk in chunks.iter().filter(|c| c.is(b"IDAT")) {
+        out.extend_from_slice(chunk_data(file, *chunk));
+    }
+
+    let walked_to = chunks
+        .last()
+        .map_or(SIGNATURE.len(), |last| last.data_offset + last.length + 4);
+    if file.get(walked_to + 4..walked_to + 8) == Some(b"IDAT") {
+        out.extend_from_slice(&file[walked_to + 8..]);
     }
     out
 }
@@ -648,6 +659,98 @@ pub fn decode(file: &[u8], inflated: &[u8]) -> Result<Vec<u8>, PngError> {
     expand(&samples, &header, palette, transparency)
 }
 
+/// Longest row filled out with zeroes when the data stops part way along it. A header
+/// can claim a row of a gigabyte, and no image has one.
+const MAX_PADDED_ROW: usize = 16 << 20;
+
+/// [`decode`], for pixels that are damaged or cut short, the way a browser reads them:
+/// as many rows as make sense, and the height that leaves.
+///
+/// Whatever stopped it, the rows before that are real, and they are where a sweep looks
+/// first. Returns the pixels and how many rows they cover. An interlaced image has no
+/// rows to stop at, since its passes are scattered across the whole canvas, so one short
+/// of data is still refused.
+pub fn decode_available(file: &[u8], inflated: &[u8]) -> Result<(Vec<u8>, usize), PngError> {
+    let header = header(file)?;
+    if header.interlace > 1 {
+        return Err(PngError::Interlaced);
+    }
+
+    let chunks = chunks(file);
+    let find = |kind: &[u8; 4]| {
+        chunks
+            .iter()
+            .find(|c| c.is(kind))
+            .map(|c| chunk_data(file, *c))
+            .unwrap_or(&[])
+    };
+
+    let plte = find(b"PLTE");
+    let transparency = find(b"tRNS");
+    if header.color_type == 3 && plte.is_empty() {
+        return Err(PngError::MissingPalette);
+    }
+    header.pixels()?;
+
+    // An index past the end of the palette is black to a browser, and one such pixel must
+    // not cost every other pixel in the image.
+    let mut palette = plte.to_vec();
+    if header.color_type == 3 && palette.len() < 768 {
+        palette.resize(768, 0);
+    }
+
+    if header.interlace == 1 {
+        let rgba = decode_interlaced(inflated, &header, &palette, transparency)?;
+        return Ok((rgba, header.height as usize));
+    }
+
+    let stride = header.stride()?;
+    let row = stride.checked_add(1).ok_or(PngError::TooLarge)?;
+    let expected = row
+        .checked_mul(header.height as usize)
+        .ok_or(PngError::TooLarge)?;
+
+    // The last row can be cut part way through, and the part that arrived still counts,
+    // unless the header makes a row so long that finishing it is the attack.
+    let rows = if row <= MAX_PADDED_ROW {
+        inflated.len().div_ceil(row)
+    } else {
+        inflated.len() / row
+    };
+    let rows = rows.min(header.height as usize);
+
+    let good = (0..rows)
+        .position(|y| inflated[y * row] > 4)
+        .unwrap_or(rows);
+    if good == 0 {
+        return match rows {
+            0 => Err(PngError::ShortPixelData {
+                expected,
+                actual: inflated.len(),
+            }),
+            _ => Err(PngError::BadFilterType(inflated[0])),
+        };
+    }
+
+    let needed = good * row;
+    let padded;
+    let filtered = if inflated.len() < needed {
+        let mut copy = inflated.to_vec();
+        copy.resize(needed, 0);
+        padded = copy;
+        &padded[..]
+    } else {
+        &inflated[..needed]
+    };
+
+    let samples = unfilter(filtered, stride, header.filter_bpp()?, good)?;
+    let cropped = Header {
+        height: good as u32,
+        ..header
+    };
+    Ok((expand(&samples, &cropped, &palette, transparency)?, good))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextChunk {
     pub kind: [u8; 4],
@@ -771,21 +874,39 @@ fn region_of(file: &[u8], chunks: &[Chunk], trailing: Option<usize>, offset: usi
 
 /// Flag-shaped matches with the region they came from attached.
 pub fn located_flags(file: &[u8]) -> Vec<FlagHit> {
+    locate(file, &[], false).0
+}
+
+/// [`located_flags`], for a caller that has said which tags it is looking for. A tag
+/// somebody named does not turn up in a deflate stream by chance, so finding one there
+/// means it was put there, and the region rule has nothing to say about it.
+///
+/// @return the matches, and whether the scan ran out of room before the end of the file
+pub fn located_flags_for_tags(file: &[u8], tags: &[String]) -> (Vec<FlagHit>, bool) {
+    locate(file, tags, true)
+}
+
+fn locate(file: &[u8], tags: &[String], trust_tags: bool) -> (Vec<FlagHit>, bool) {
     let chunks = chunks(file);
     let trailing = trailing_of(file, &chunks).map(|(start, _)| start);
+    let scan = crate::bytes::scan_flags(file, tags, false);
 
-    crate::bytes::flag_candidates(file)
+    let hits = scan
+        .found
         .into_iter()
         .map(|found| {
             let (region, credible) = region_of(file, &chunks, trailing, found.offset);
+            let named = trust_tags && crate::bytes::tag_is_named(&found.text, tags);
             FlagHit {
                 offset: found.offset,
                 text: found.text,
                 region,
-                credible,
+                credible: credible || named,
             }
         })
-        .collect()
+        .collect();
+
+    (hits, scan.truncated)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -848,21 +969,29 @@ pub fn palette(file: &[u8], indices: Option<&[u8]>) -> Option<Palette> {
     })
 }
 
-/// Raw palette indices, one per pixel, for an indexed image.
+/// Raw palette indices, one per pixel, for an indexed image, across however many whole
+/// rows the data holds.
 pub fn palette_indices(file: &[u8], inflated: &[u8]) -> Option<Vec<u8>> {
     let header = header(file).ok()?;
     if header.color_type != 3 || header.interlace != 0 {
         return None;
     }
 
-    let pixels = header.pixels().ok()?;
+    header.pixels().ok()?;
     let stride = header.stride().ok()?;
-    let samples = unfilter(inflated, stride, header.filter_bpp().ok()?, header.height as usize).ok()?;
+    let row = stride.checked_add(1)?;
+    let rows = (inflated.len() / row).min(header.height as usize);
+    let good = (0..rows).position(|y| inflated[y * row] > 4).unwrap_or(rows);
+    if good == 0 {
+        return None;
+    }
+
+    let samples = unfilter(&inflated[..good * row], stride, header.filter_bpp().ok()?, good).ok()?;
     let width = header.width as usize;
     let per_byte = 8 / header.bit_depth as usize;
 
-    let mut out = Vec::with_capacity(pixels);
-    for y in 0..header.height as usize {
+    let mut out = Vec::with_capacity(width * good);
+    for y in 0..good {
         let row = &samples[y * stride..(y + 1) * stride];
         for x in 0..width {
             out.push(if header.bit_depth == 8 {
@@ -896,8 +1025,23 @@ pub fn is_ancillary(kind: &[u8; 4]) -> bool {
     kind[0].is_ascii_lowercase()
 }
 
+/// Most chunks and text chunks one walk lists. A chunk is twelve bytes of file and a
+/// line of JSON ten times that, and the true counts are reported alongside.
+const MAX_CHUNKS_LISTED: usize = 1 << 14;
+const MAX_TEXT_LISTED: usize = 1 << 12;
+
 /// The whole container walk as JSON, ready to leave the worker.
 pub fn structure_json(file: &[u8]) -> String {
+    structure(file, located_flags(file), false)
+}
+
+/// [`structure_json`], for a caller that has said which tags it is looking for.
+pub fn structure_json_for_tags(file: &[u8], tags: &[String]) -> String {
+    let (flags, truncated) = located_flags_for_tags(file, tags);
+    structure(file, flags, truncated)
+}
+
+fn structure(file: &[u8], flags: Vec<FlagHit>, flags_truncated: bool) -> String {
     use crate::json::{push_bool, push_field, push_number, push_string};
 
     let mut out = String::from("{");
@@ -955,10 +1099,13 @@ pub fn structure_json(file: &[u8]) -> String {
         None => out.push_str("null"),
     }
 
+    let walked = chunks(file);
+    out.push(',');
+    push_number(&mut out, "chunkCount", walked.len());
     out.push(',');
     push_string(&mut out, "chunks");
     out.push_str(":[");
-    for (i, chunk) in chunks(file).iter().enumerate() {
+    for (i, chunk) in walked.iter().take(MAX_CHUNKS_LISTED).enumerate() {
         if i > 0 {
             out.push(',');
         }
@@ -978,10 +1125,13 @@ pub fn structure_json(file: &[u8]) -> String {
     }
     out.push(']');
 
+    let texts = text_chunks(file);
+    out.push(',');
+    push_number(&mut out, "textCount", texts.len());
     out.push(',');
     push_string(&mut out, "text");
     out.push_str(":[");
-    for (i, text) in text_chunks(file).iter().enumerate() {
+    for (i, text) in texts.iter().take(MAX_TEXT_LISTED).enumerate() {
         if i > 0 {
             out.push(',');
         }
@@ -1002,9 +1152,11 @@ pub fn structure_json(file: &[u8]) -> String {
     out.push(']');
 
     out.push(',');
+    push_bool(&mut out, "flagsTruncated", flags_truncated);
+    out.push(',');
     push_string(&mut out, "flags");
     out.push_str(":[");
-    for (i, found) in located_flags(file).iter().enumerate() {
+    for (i, found) in flags.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }

@@ -16,6 +16,8 @@
 //! [`crate::pdf`] finds in an orphaned object and [`crate::regf`] finds in a
 //! freed cell.
 
+use crate::bytes;
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 const HEADER: &[u8] = b"SQLite format 3\0";
@@ -57,6 +59,8 @@ struct Budget {
     carve: usize,
     /// Bytes of live cells read to tell a deleted row from a stale copy of a live one.
     compared: usize,
+    /// Bytes of live text and blobs searched for flags.
+    scanned: usize,
     /// Pages visited.
     pages: usize,
 }
@@ -72,6 +76,7 @@ impl Budget {
             overflow: 256 << 20,
             carve: 1 << 26,
             compared: 256 << 20,
+            scanned: 256 << 20,
             pages: 1 << 22,
         }
     }
@@ -103,6 +108,9 @@ pub struct Table {
     /// Rows recovered from the free space of this table's own pages: deleted,
     /// and still there.
     pub deleted: Vec<Row>,
+    /// Flags in the live rows, each value searched whole. A value only shows its first
+    /// 240 bytes, and one that spills across pages does not sit together in the file.
+    pub flags: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +124,9 @@ pub struct Database {
     pub tables: Vec<Table>,
     /// The true table count, which `tables` is a capped copy of.
     pub table_count: usize,
+    /// True when a live cell could not be searched to its end, because a budget ran out,
+    /// or its overflow chain was cut or ran past what one record is given.
+    pub flags_truncated: bool,
 }
 
 /// A SQLite varint: one to nine big-endian bytes, each but the ninth giving
@@ -462,9 +473,25 @@ impl Db<'_> {
         }
     }
 
-    /// Reads a table-leaf cell at `at`: a payload length, a rowid, then the record,
-    /// with whatever does not fit on the page fetched from its overflow chain.
-    fn read_cell(&self, page: &[u8], at: usize, text: Text, budget: &mut Budget) -> Option<Cell> {
+    /// Whether the record of the cell at `at` runs on through an overflow chain, which
+    /// is what leaves a value in pieces around the file.
+    fn spills(&self, page: &[u8], at: usize) -> bool {
+        varint(page, at).is_some_and(|(length, _)| {
+            let length = usize::try_from(length.max(0)).unwrap_or(usize::MAX);
+            length > self.local_size(length)
+        })
+    }
+
+    /// The record of the table-leaf cell at `at`: a payload length, a rowid, then the
+    /// record, with whatever does not fit on the page fetched from its overflow chain.
+    ///
+    /// @return the rowid, the record, and whether that is all of it
+    fn record<'p>(
+        &self,
+        page: &'p [u8],
+        at: usize,
+        budget: &mut Budget,
+    ) -> Option<(i64, Cow<'p, [u8]>, bool)> {
         let (payload_len, n1) = varint(page, at)?;
         let (rowid, n2) = varint(page, at + n1)?;
         let body_at = at + n1 + n2;
@@ -474,10 +501,11 @@ impl Db<'_> {
         let on_page = self.usable.saturating_sub(body_at).min(local);
         let held = page.get(body_at..body_at + on_page)?;
 
-        let values = if payload_len <= on_page {
-            decode_record(held, true, text, &mut budget.values)?
-        } else {
-            budget.overflow = budget.overflow.checked_sub(on_page)?;
+        if payload_len <= on_page {
+            return Some((rowid, Cow::Borrowed(held), true));
+        }
+
+        budget.overflow = budget.overflow.checked_sub(on_page)?;
             let mut payload = held.to_vec();
             if on_page == local
                 && let Some(first) = be_u32(page, body_at + local)
@@ -486,9 +514,13 @@ impl Db<'_> {
                 self.chain(first, wanted, budget, &mut payload);
             }
             let whole = payload.len() == payload_len;
-            decode_record(&payload, whole, text, &mut budget.values)?
-        };
+        Some((rowid, Cow::Owned(payload), whole))
+    }
 
+    /// Reads a table-leaf cell at `at`, to the values it shows.
+    fn read_cell(&self, page: &[u8], at: usize, text: Text, budget: &mut Budget) -> Option<Cell> {
+        let (rowid, payload, whole) = self.record(page, at, budget)?;
+        let values = decode_record(&payload, whole, text, &mut budget.values)?;
         Some(Cell { rowid, values })
     }
 
@@ -1127,8 +1159,72 @@ fn read_schema(db: &Db, budget: &mut Budget) -> (Vec<SchemaRow>, usize) {
     (rows, table_count)
 }
 
+/// Flags found in a table's live cells.
+#[derive(Default)]
+struct CellFlags {
+    seen: HashSet<String>,
+    list: Vec<String>,
+    truncated: bool,
+}
+
+/// Searches each text and blob in a record for flags, whole and one at a time, since the
+/// columns of a row sit side by side and a flag with a word in front of it stops looking
+/// like one.
+fn record_flags(
+    payload: &[u8],
+    encoding: Encoding,
+    tags: &[String],
+    budget: &mut Budget,
+    into: &mut CellFlags,
+) {
+    let Some((header_len, mut at)) = varint(payload, 0) else {
+        return;
+    };
+    let Ok(header_len) = usize::try_from(header_len) else {
+        return;
+    };
+
+    let mut body = header_len;
+    while at < header_len && body < payload.len() {
+        let Some((serial, used)) = varint(payload, at) else {
+            return;
+        };
+        at += used;
+        let Some(size) = serial_len(serial) else {
+            return;
+        };
+
+        if serial >= 12 && size > 0 {
+            let value = &payload[body..body.saturating_add(size).min(payload.len())];
+            if budget.scanned < value.len() {
+                into.truncated = true;
+                return;
+            }
+            budget.scanned -= value.len();
+
+            let scan = if serial % 2 == 1 && encoding != Encoding::Utf8 {
+                bytes::scan_flags(encoding.decode(value).as_bytes(), tags, true)
+            } else {
+                bytes::scan_flags(value, tags, true)
+            };
+            into.truncated |= scan.truncated;
+
+            for flag in scan.found {
+                if into.list.len() >= bytes::MAX_FLAGS {
+                    into.truncated = true;
+                    return;
+                }
+                if into.seen.insert(flag.text.clone()) {
+                    into.list.push(flag.text);
+                }
+            }
+        }
+        body = body.saturating_add(size);
+    }
+}
+
 /// One table's rows, walked out of its b-tree.
-fn read_table(db: &Db, row: SchemaRow, budget: &mut Budget) -> Table {
+fn read_table(db: &Db, row: SchemaRow, tags: &[String], budget: &mut Budget) -> (Table, bool) {
     let columns = columns_from_sql(&row.sql);
     let alias = rowid_alias(&row.sql);
     let width = columns.len().max(1);
@@ -1140,6 +1236,7 @@ fn read_table(db: &Db, row: SchemaRow, budget: &mut Budget) -> Table {
     let mut rows = Vec::new();
     let mut deleted = Vec::new();
     let mut row_count = 0;
+    let mut flags = CellFlags::default();
 
     if row.rootpage != 0 {
         let mut seen = HashSet::new();
@@ -1147,29 +1244,41 @@ fn read_table(db: &Db, row: SchemaRow, budget: &mut Budget) -> Table {
         let walked = pages;
         db.walk_leaves(row.rootpage, 0, &mut seen, &mut pages, &mut |page, head| {
             // Every cell the page lists is a row, whatever else about it can be read.
-            // Past the cap nothing is decoded, so counting a large table stays cheap.
+            // Past the cap nothing is decoded, so counting a large table stays cheap, and
+            // only a record in pieces is read, which no scan of the raw file can see whole.
             let listed = be_u16(page, head + 3).unwrap_or(0) as usize;
             row_count += listed;
 
-            if rows.len() < MAX_ROWS {
-                for off in live_cell_offsets(page, head) {
-                    if rows.len() >= MAX_ROWS {
-                        break;
-                    }
-                    let Some(cell) = db.read_cell(page, off, text, budget) else {
-                        continue;
-                    };
-                    let mut values = cell.values;
-                    if let Some(value) = alias.and_then(|at| values.get_mut(at))
-                        && value.kind == "null"
-                    {
-                        *value = Value {
-                            kind: "integer",
-                            text: cell.rowid.to_string(),
-                        };
-                    }
-                    rows.push(Row { values });
+            for off in live_cell_offsets(page, head) {
+                let shown = rows.len() < MAX_ROWS;
+                let spills = db.spills(page, off);
+                if !shown && !spills {
+                    continue;
                 }
+
+                let Some((rowid, payload, whole)) = db.record(page, off, budget) else {
+                    flags.truncated |= spills;
+                    continue;
+                };
+                record_flags(&payload, db.encoding, tags, budget, &mut flags);
+                flags.truncated |= !whole;
+                if !shown {
+                    continue;
+                }
+
+                let Some(mut values) = decode_record(&payload, whole, text, &mut budget.values)
+                else {
+                    continue;
+                };
+                if let Some(value) = alias.and_then(|at| values.get_mut(at))
+                    && value.kind == "null"
+                {
+                    *value = Value {
+                        kind: "integer",
+                        text: rowid.to_string(),
+                    };
+                }
+                rows.push(Row { values });
             }
 
             if deleted.len() < MAX_DELETED {
@@ -1179,17 +1288,24 @@ fn read_table(db: &Db, row: SchemaRow, budget: &mut Budget) -> Table {
         budget.pages -= walked - pages;
     }
 
-    Table {
+    let table = Table {
         name: row.name,
         columns,
         sql: row.sql,
         rows,
         row_count,
         deleted,
-    }
+        flags: flags.list,
+    };
+    (table, flags.truncated)
 }
 
 pub fn read(data: &[u8]) -> Option<Database> {
+    read_for_tags(data, &[])
+}
+
+/// [`read`], for a caller that has said which flag tags it is looking for.
+pub fn read_for_tags(data: &[u8], tags: &[String]) -> Option<Database> {
     if !data.starts_with(HEADER) || data.len() < 100 {
         return None;
     }
@@ -1231,9 +1347,14 @@ pub fn read(data: &[u8]) -> Option<Database> {
     let mut budget = Budget::new();
 
     let (schema, table_count) = read_schema(&db, &mut budget);
+    let mut flags_truncated = false;
     let tables = schema
         .into_iter()
-        .map(|row| read_table(&db, row, &mut budget))
+        .map(|row| {
+            let (table, truncated) = read_table(&db, row, tags, &mut budget);
+            flags_truncated |= truncated;
+            table
+        })
         .collect();
 
     Some(Database {
@@ -1241,15 +1362,17 @@ pub fn read(data: &[u8]) -> Option<Database> {
         page_count,
         encoding: encoding.label(),
         freelist_pages,
-        tables,
-        table_count,
-    })
-}
+        tables, table_count, flags_truncated, }) }
 
 pub fn json(data: &[u8]) -> String {
-    use crate::json::{push_field, push_number, push_string};
+    json_for_tags(data, &[])
+}
 
-    let Some(db) = read(data) else {
+/// [`json`], for a caller that has said which flag tags it is looking for.
+pub fn json_for_tags(data: &[u8], tags: &[String]) -> String {
+    use crate::json::{push_bool, push_field, push_number, push_string};
+
+    let Some(db) = read_for_tags(data, tags) else {
         return "null".to_string();
     };
 
@@ -1263,6 +1386,8 @@ pub fn json(data: &[u8]) -> String {
     push_number(&mut out, "freelistPages", db.freelist_pages);
     out.push(',');
     push_number(&mut out, "tableCount", db.table_count);
+    out.push(',');
+    push_bool(&mut out, "flagsTruncated", db.flags_truncated);
     out.push(',');
 
     push_string(&mut out, "tables");
@@ -1292,6 +1417,16 @@ pub fn json(data: &[u8]) -> String {
         write_rows(&mut out, "rows", &table.rows);
         out.push(',');
         write_rows(&mut out, "deleted", &table.deleted);
+        out.push(',');
+        push_string(&mut out, "flags");
+        out.push_str(":[");
+        for (j, flag) in table.flags.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            push_string(&mut out, flag);
+        }
+        out.push(']');
         out.push('}');
     }
     out.push_str("]}");

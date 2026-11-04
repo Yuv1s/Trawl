@@ -3,6 +3,11 @@
 
 	let { hive }: { hive: RegistryHive } = $props();
 
+	/** Rows drawn. A hive can list thousands of devices and tens of thousands of keys. */
+	const ROWS_SHOWN = 500;
+	/** Devices named again as findings above the tables. */
+	const FINDINGS_SHOWN = 50;
+
 	const devices = $derived(hive.devices);
 
 	/** A device's model in one line, from whichever of the parts the key
@@ -23,7 +28,7 @@
 <div class="hive">
 	{#if devices.length > 0}
 		<ul class="findings">
-			{#each devices as device, index (index)}
+			{#each devices.slice(0, FINDINGS_SHOWN) as device, index (index)}
 				<li class="flagged">
 					<span class="mono big">{model(device)}</span>
 					<span class="muted">
@@ -32,6 +37,9 @@
 					</span>
 				</li>
 			{/each}
+			{#if devices.length > FINDINGS_SHOWN}
+				<li>Showing the first {FINDINGS_SHOWN} of {devices.length.toLocaleString()} devices.</li>
+			{/if}
 		</ul>
 	{:else}
 		<div class="clear">
@@ -46,7 +54,7 @@
 			</p>
 			{#if hive.searched.length > 0}
 				<ul class="paths">
-					{#each hive.searched as path (path)}
+					{#each hive.searched as path, i (i)}
 						<li class="mono">{path}</li>
 					{/each}
 				</ul>
@@ -81,7 +89,7 @@
 				</tr>
 			</thead>
 			<tbody>
-				{#each devices as device, index (index)}
+				{#each devices.slice(0, ROWS_SHOWN) as device, index (index)}
 					<tr class="odd">
 						<td>
 							<span class="mono name">{model(device)}</span>
@@ -106,12 +114,17 @@
 				{/each}
 			</tbody>
 		</table>
+		{#if devices.length > ROWS_SHOWN}
+			<p class="capped label">
+				Showing the first {ROWS_SHOWN} of {devices.length.toLocaleString()} devices.
+			</p>
+		{/if}
 	{/if}
 
 	{#if hive.top.length > 0}
 		<table>
 			<caption class="label">
-				{hive.top.length} key{hive.top.length === 1 ? '' : 's'} at the root
+				{hive.top.length.toLocaleString()} key{hive.top.length === 1 ? '' : 's'} at the root
 			</caption>
 			<thead>
 				<tr>
@@ -122,7 +135,7 @@
 				</tr>
 			</thead>
 			<tbody>
-				{#each hive.top as key, i (i)}
+				{#each hive.top.slice(0, ROWS_SHOWN) as key, i (i)}
 					<tr>
 						<td><span class="mono name">{key.name}</span></td>
 						<td class="mono num">{key.subkeys.toLocaleString()}</td>
@@ -132,6 +145,11 @@
 				{/each}
 			</tbody>
 		</table>
+		{#if hive.top.length > ROWS_SHOWN}
+			<p class="capped label">
+				Showing the first {ROWS_SHOWN} of {hive.top.length.toLocaleString()} keys.
+			</p>
+		{/if}
 	{/if}
 
 	<p class="footnote">
@@ -279,6 +297,11 @@
 	}
 
 	.muted {
+		color: var(--muted);
+	}
+
+	.capped {
+		margin: 0;
 		color: var(--muted);
 	}
 

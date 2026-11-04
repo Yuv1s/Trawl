@@ -48,6 +48,9 @@ pub struct Reference {
     pub same_host: bool,
 }
 
+/// Longest attribute value read. Past this it is not a link anyone could follow.
+const MAX_ATTRIBUTE_VALUE: usize = 4096;
+
 /// Pulls the value out of every `href`, `src` and `action` attribute.
 ///
 /// Boundary-checked so `datasrc` is not mistaken for `src`, and it reads both
@@ -55,6 +58,7 @@ pub struct Reference {
 fn attribute_values(html: &str) -> Vec<String> {
     let bytes = html.as_bytes();
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
 
     for attr in ["href", "src", "action"] {
         let mut from = 0;
@@ -84,25 +88,39 @@ fn attribute_values(html: &str) -> Vec<String> {
                 break;
             }
 
-            let value = if bytes[i] == b'"' || bytes[i] == b'\'' {
-                let quote = bytes[i];
+            let quote = matches!(bytes[i], b'"' | b'\'').then(|| bytes[i]);
+            if quote.is_some() {
                 i += 1;
-                let start = i;
-                while i < bytes.len() && bytes[i] != quote {
-                    i += 1;
+            }
+            let start = i;
+            let limit = bytes.len().min(start + MAX_ATTRIBUTE_VALUE);
+            while i < limit
+                && match quote {
+                    Some(quote) => bytes[i] != quote,
+                    None => !bytes[i].is_ascii_whitespace() && bytes[i] != b'>',
                 }
-                &html[start..i]
-            } else {
-                let start = i;
-                while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
-                    i += 1;
-                }
-                &html[start..i]
-            };
+            {
+                i += 1;
+            }
 
-            let value = value.trim();
-            if !value.is_empty() {
+            // Picked up from past the value, so `href=href=href=` cannot have each one
+            // read, and copy, the rest of the page. A bare value runs to the next space,
+            // which on a hostile page is gigabytes of copies from two megabytes of body.
+            if i == limit && i < bytes.len() {
+                while !html.is_char_boundary(i) {
+                    i += 1;
+                }
+                from = i;
+                continue;
+            }
+            from = i;
+
+            let value = html[start..i].trim();
+            if !value.is_empty() && seen.insert(value) {
                 out.push(value.to_string());
+                if out.len() >= MAX_REFERENCES {
+                    return out;
+                }
             }
         }
     }

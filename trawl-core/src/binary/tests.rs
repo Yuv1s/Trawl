@@ -52,6 +52,25 @@ fn json_from_both_formats_is_well_formed_and_shares_a_shape() {
 }
 
 #[test]
+fn a_table_of_one_header_read_sixty_five_thousand_times_is_listed_once_over() {
+    // 128 bytes of file, a header size of zero, and a count at the top of its range.
+    let mut file = vec![0u8; 128];
+    file[..4].copy_from_slice(b"\x7fELF");
+    file[4] = 2;
+    file[5] = 1;
+    file[16..18].copy_from_slice(&3u16.to_le_bytes());
+    file[18..20].copy_from_slice(&62u16.to_le_bytes());
+    file[40..48].copy_from_slice(&64u64.to_le_bytes());
+    file[60..62].copy_from_slice(&u16::MAX.to_le_bytes());
+
+    let text = json(&file);
+    assert!(crate::json::is_well_formed(&text));
+    assert!(text.contains("\"sectionCount\":65535"), "the true count is still reported");
+    assert_eq!(text.matches("\"flags\":").count(), MAX_TABLE_ROWS);
+    assert!(text.contains("\"symbolsCapped\":false"));
+}
+
+#[test]
 fn a_guard_names_its_three_states_apart() {
     assert_eq!(Guard::On.label(), "on");
     assert_eq!(Guard::Off.label(), "off");

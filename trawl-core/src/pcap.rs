@@ -20,22 +20,33 @@
 //! the payload, and the connections are put back together.
 
 use crate::bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Ceilings on what one reading carries, so a large capture cannot ask the
 /// browser to hold all of it. The true counts are reported alongside the capped
 /// lists.
 const MAX_PACKETS: usize = 500_000;
-const MAX_SEGMENTS: usize = 200_000;
 const MAX_STREAMS: usize = 48;
 const MAX_STREAM_BYTES: usize = 256 * 1024;
-/// Reassembled bytes across every stream. A two-packet connection can claim a whole
-/// stream's worth of gap between its segments, so a capture of many such connections
-/// would otherwise ask for far more than it holds.
+/// Bytes laid out for showing a stream, across every stream. A two-packet connection can
+/// claim a whole stream's worth of gap between its segments, so a capture of many such
+/// connections would otherwise ask for far more than it holds.
 const MAX_REASSEMBLED: usize = 64 << 20;
+/// What a stream gets to show however little of that is left, so the biggest flows cannot
+/// use it all up. Searching a stream for flags costs what it carries and takes none of it.
+const FLOW_ALLOWANCE: usize = 16 * 1024;
 const MAX_CONVERSATIONS: usize = 40;
 const MAX_DNS: usize = 120;
 const PREVIEW_BYTES: usize = 4096;
+/// Streams carrying a flag or a file, which are not held to [`MAX_STREAMS`], since those
+/// are the ones a person came for. They get a shorter preview past it.
+const MAX_FINDING_STREAMS: usize = 1024;
+const SHORT_PREVIEW_BYTES: usize = 256;
+/// Bytes either side of a disagreeing segment searched for a flag it completes. A body
+/// runs to 256 bytes, and a tag somebody named a little past that.
+const OVERLAY_MARGIN: usize = 512;
+/// Disagreeing segments read against their surroundings, across the whole capture.
+const MAX_OVERLAYS: usize = 1 << 16;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Protocol {
@@ -61,6 +72,13 @@ pub struct Stream {
     pub src: String,
     pub dst: String,
     pub bytes: usize,
+    /// Payload bytes the direction carried, counting a retransmission once, of which
+    /// `bytes` is the window laid out. All of them were searched for flags.
+    pub carried: usize,
+    /// Bytes two segments of this stream gave different values for. A retransmission
+    /// repeats itself, so this is a capture telling two stories about one stream, and
+    /// `flags` holds what each reading of it said.
+    pub conflicting: usize,
     /// A printable rendering of the reassembled bytes, control characters shown
     /// as dots, capped for display.
     pub text: String,
@@ -103,6 +121,10 @@ pub struct Capture {
     /// True number of reassembled streams that carried payload.
     pub stream_count: usize,
     pub dns: Vec<DnsQuery>,
+    /// True when the reader stopped at [`MAX_PACKETS`] with more of the file to go.
+    pub packets_capped: bool,
+    /// True when the streams held more flags than are reported.
+    pub flags_truncated: bool,
 }
 
 // Big-endian network-order readers, for the protocol fields inside a frame.
@@ -157,7 +179,7 @@ fn link_name(link_type: u16) -> &'static str {
 
 /// Reads the frames out of a classic libpcap file: a 24-byte global header, then
 /// records of a 16-byte header and that many captured bytes.
-fn parse_pcap(data: &[u8]) -> Option<(Vec<Frame>, u16, usize, bool)> {
+fn parse_pcap(data: &[u8]) -> Option<(Vec<Frame>, u16, usize, bool, bool)> {
     let magic = data.get(0..4)?;
     let (le, nanos) = match magic {
         [0xd4, 0xc3, 0xb2, 0xa1] => (true, false),
@@ -198,7 +220,8 @@ fn parse_pcap(data: &[u8]) -> Option<(Vec<Frame>, u16, usize, bool)> {
         at = body + incl;
     }
 
-    Some((frames, link_type, capture_bytes, truncated))
+    let capped = frames.len() >= MAX_PACKETS && at + 16 <= data.len();
+    Some((frames, link_type, capture_bytes, truncated, capped))
 }
 
 /// How many timestamp ticks an interface counts per second.
@@ -269,7 +292,7 @@ fn enhanced_packet(
 /// Reads the frames out of a pcapng file: a chain of typed blocks, each a type,
 /// a total length, a body, and the total length again. Only the interface and
 /// packet blocks carry frames; the rest are skipped by their length.
-fn parse_pcapng(data: &[u8]) -> Option<(Vec<Frame>, u16, usize, bool)> {
+fn parse_pcapng(data: &[u8]) -> Option<(Vec<Frame>, u16, usize, bool, bool)> {
     if data.get(0..4)? != [0x0a, 0x0d, 0x0d, 0x0a] {
         return None;
     }
@@ -348,7 +371,8 @@ fn parse_pcapng(data: &[u8]) -> Option<(Vec<Frame>, u16, usize, bool)> {
     }
 
     let link_type = interfaces.first().map_or(1, |&(link_type, _)| link_type);
-    Some((frames, link_type, capture_bytes, truncated))
+    let capped = frames.len() >= MAX_PACKETS && at + 12 <= data.len();
+    Some((frames, link_type, capture_bytes, truncated, capped))
 }
 
 /// What one frame decoded to: its endpoints, the highest layer named, and where
@@ -602,9 +626,9 @@ struct Segments {
 /// Renders reassembled bytes to a short printable preview, control characters
 /// shown as dots so a binary payload reads as a shape rather than filling the
 /// pane with noise.
-fn preview(data: &[u8]) -> String {
+fn preview(data: &[u8], length: usize) -> String {
     data.iter()
-        .take(PREVIEW_BYTES)
+        .take(length)
         .map(|&b| match b {
             b'\n' | b'\t' => b as char,
             0x20..=0x7e => b as char,
@@ -624,35 +648,98 @@ fn printable_fraction(data: &[u8]) -> f32 {
     readable as f32 / data.len() as f32
 }
 
-/// Lays one direction's segments back down in sequence order.
+/// One stretch of a direction with no hole in it, by distance from the first segment seen.
+struct Run {
+    start: i64,
+    end: i64,
+    /// Indices into the segments, in the order they arrived.
+    parts: Vec<usize>,
+}
+
+/// A direction's segments, sorted out into the runs they join up into.
 ///
 /// Sequence numbers are modular, so "lowest" is only meaningful as a signed distance:
 /// a stream that crosses zero has its start at 0xfffffff8 and its end at 16, and the
 /// plain minimum would call the end the start and drop everything before it. So each
-/// is measured from the first segment seen, either way round, and the earliest of
-/// those is where the direction's data starts.
-///
-/// Every segment is then placed at its distance from that start, so an out-of-order
-/// segment lands where it belongs. The first copy of a byte is the one kept: a
-/// retransmission carries the same bytes anyway, and a keep-alive probe carries one
-/// junk byte a position behind the data it follows, which must not overwrite it.
-/// Anything beyond the limit is dropped.
-fn reassemble(file: &[u8], segments: &Segments, limit: usize) -> Vec<u8> {
+/// is measured from the first segment seen, either way round.
+fn runs(segments: &Segments) -> Vec<Run> {
     let Some(&(first, _, _)) = segments.parts.first() else {
         return Vec::new();
     };
-    let earliest = segments
+
+    let mut spans: Vec<(i64, i64, usize)> = segments
         .parts
         .iter()
-        .map(|&(seq, _, _)| seq.wrapping_sub(first) as i32)
-        .min()
-        .unwrap_or(0);
-    let base = first.wrapping_add(earliest as u32);
+        .enumerate()
+        .map(|(index, &(seq, _, len))| {
+            let start = seq.wrapping_sub(first) as i32 as i64;
+            (start, start + len as i64, index)
+        })
+        .collect();
+    spans.sort_unstable();
+
+    let mut out: Vec<Run> = Vec::new();
+    for (start, end, index) in spans {
+        match out.last_mut() {
+            Some(run) if start <= run.end => {
+                run.end = run.end.max(end);
+                run.parts.push(index);
+            }
+            _ => out.push(Run {
+                start,
+                end,
+                parts: vec![index],
+            }),
+        }
+    }
+    for run in &mut out {
+        run.parts.sort_unstable();
+    }
+    out
+}
+
+/// Where a window of `limit` bytes should start.
+///
+/// On the longest run, which is the conversation: anything a single stray segment says
+/// about where a stream starts is one byte's word against all of the rest. Earlier runs
+/// come in with it when they fit, so a stream with one lost packet reads as one stream.
+fn window_start(runs: &[Run], limit: usize) -> Option<i64> {
+    let anchor = runs
+        .iter()
+        .enumerate()
+        .max_by_key(|&(index, run)| (run.end - run.start, std::cmp::Reverse(index)))
+        .map(|(_, run)| run)?;
+
+    let earliest = runs
+        .iter()
+        .find(|run| anchor.end - run.start <= limit as i64)
+        .map_or(anchor.start, |run| run.start.min(anchor.start));
+    Some(earliest)
+}
+
+/// Lays one direction's segments back down in sequence order, in a window around its
+/// longest run.
+///
+/// Every segment is placed at its distance from the start of the window, so an
+/// out-of-order segment lands where it belongs. The first copy of a byte is the one
+/// shown: a retransmission carries the same bytes anyway, and a keep-alive probe carries
+/// one junk byte a position behind the data it follows, which must not overwrite it.
+/// Anything outside the window is dropped from this, and not from the search for flags.
+fn reassemble(file: &[u8], segments: &Segments, limit: usize) -> Vec<u8> {
+    let Some(base) = window_start(&runs(segments), limit) else {
+        return Vec::new();
+    };
+    let Some(&(first, _, _)) = segments.parts.first() else {
+        return Vec::new();
+    };
 
     let mut buf: Vec<u8> = Vec::new();
     let mut written: Vec<bool> = Vec::new();
     for &(seq, at, len) in &segments.parts {
-        let offset = seq.wrapping_sub(base) as usize;
+        let start = seq.wrapping_sub(first) as i32 as i64 - base;
+        let Ok(offset) = usize::try_from(start) else {
+            continue;
+        };
         if offset >= limit {
             continue;
         }
@@ -672,6 +759,132 @@ fn reassemble(file: &[u8], segments: &Segments, limit: usize) -> Vec<u8> {
         }
     }
     buf
+}
+
+/// What a search of one direction for flags turned up, across every run it has.
+struct FlowFlags {
+    flags: Vec<String>,
+    truncated: bool,
+    /// Bytes of payload, counting each position once.
+    carried: usize,
+    /// Bytes two segments gave different values for.
+    conflicting: usize,
+}
+
+/// Searches every run of a direction for flags, each reading of it where segments disagree.
+///
+/// Nothing in TCP says which of two copies of a byte is the true one. A stack keeps the
+/// first and a capture tool can be made to show either, so an author who wants a flag
+/// missed sends a forged copy first and lets the real one lose. Where copies disagree the
+/// first of each byte is read, then the last, then each disagreeing segment laid over the
+/// first reading in turn, so a flag sitting in the middle of three copies is found too.
+/// Every reading's flags are reported, and which is the answer is the person's call.
+fn search_flow(
+    file: &[u8],
+    segments: &Segments,
+    tags: &[String],
+    flags_left: &mut usize,
+    overlays_left: &mut usize,
+) -> FlowFlags {
+    let first_seq = segments.parts.first().map_or(0, |part| part.0);
+    let mut found = FlowFlags {
+        flags: Vec::new(),
+        truncated: false,
+        carried: 0,
+        conflicting: 0,
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+
+    let mut scan = |bytes: &[u8], found: &mut FlowFlags| {
+        let scan = bytes::scan_flags(bytes, tags, true);
+        found.truncated |= scan.truncated;
+        for flag in scan.found {
+            if seen.contains(&flag.text) {
+                continue;
+            }
+            if *flags_left == 0 {
+                found.truncated = true;
+                continue;
+            }
+            *flags_left -= 1;
+            seen.insert(flag.text.clone());
+            found.flags.push(flag.text);
+        }
+    };
+
+    for run in runs(segments) {
+        let length = (run.end - run.start) as usize;
+        found.carried += length;
+
+        // Each position's first value, and any segment that went on to contradict it.
+        let mut reading = vec![0u8; length];
+        let mut written = vec![false; length];
+        let mut disagreeing: Vec<(usize, usize)> = Vec::new();
+        let mut high_water = 0usize;
+
+        for &index in &run.parts {
+            let (seq, at, len) = segments.parts[index];
+            let offset = (seq.wrapping_sub(first_seq) as i32 as i64 - run.start) as usize;
+            let Some(payload) = file.get(at..at + len) else {
+                continue;
+            };
+
+            let mut differing = 0usize;
+            for (i, &byte) in payload.iter().enumerate() {
+                if !written[offset + i] {
+                    reading[offset + i] = byte;
+                    written[offset + i] = true;
+                } else if reading[offset + i] != byte {
+                    differing += 1;
+                }
+            }
+
+            if differing > 0 {
+                disagreeing.push((index, offset));
+                // One byte, one place behind everything sent so far, is a keep-alive
+                // probe, and some stacks put junk in them. That is no story of its own.
+                if len > 1 || offset + 1 != high_water {
+                    found.conflicting += differing;
+                }
+            }
+            high_water = high_water.max(offset + len);
+        }
+
+        scan(&reading, &mut found);
+        if disagreeing.is_empty() {
+            continue;
+        }
+
+        // The other end of the argument: whichever copy of each byte came last.
+        let mut last = reading.clone();
+        for &index in &run.parts {
+            let (seq, at, len) = segments.parts[index];
+            let offset = (seq.wrapping_sub(first_seq) as i32 as i64 - run.start) as usize;
+            if let Some(payload) = file.get(at..at + len) {
+                last[offset..offset + len].copy_from_slice(payload);
+            }
+        }
+        scan(&last, &mut found);
+
+        for (index, offset) in disagreeing {
+            if *overlays_left == 0 {
+                break;
+            }
+            *overlays_left -= 1;
+
+            let (_, at, len) = segments.parts[index];
+            let Some(payload) = file.get(at..at + len) else {
+                continue;
+            };
+            let from = offset.saturating_sub(OVERLAY_MARGIN);
+            let to = (offset + len + OVERLAY_MARGIN).min(length);
+            let mut window = reading[from..to].to_vec();
+            window[offset - from..offset - from + len].copy_from_slice(payload);
+            scan(&window, &mut found);
+        }
+    }
+
+    found
 }
 
 /// Reads the query names out of a DNS message's question section. Compression
@@ -736,11 +949,11 @@ fn worded_duration(seconds: f64) -> String {
 }
 
 pub fn read(data: &[u8], tags: &[String]) -> Option<Capture> {
-    let (frames, link_type, capture_bytes, truncated, format) =
-        if let Some((f, lt, cb, tr)) = parse_pcap(data) {
-            (f, lt, cb, tr, "pcap")
-        } else if let Some((f, lt, cb, tr)) = parse_pcapng(data) {
-            (f, lt, cb, tr, "pcapng")
+    let (frames, link_type, capture_bytes, truncated, packets_capped, format) =
+        if let Some((f, lt, cb, tr, pc)) = parse_pcap(data) {
+            (f, lt, cb, tr, pc, "pcap")
+        } else if let Some((f, lt, cb, tr, pc)) = parse_pcapng(data) {
+            (f, lt, cb, tr, pc, "pcapng")
         } else {
             return None;
         };
@@ -750,7 +963,6 @@ pub fn read(data: &[u8], tags: &[String]) -> Option<Capture> {
     let mut protocols: HashMap<String, (usize, usize)> = HashMap::new();
     let mut conversations: HashMap<(String, String, &'static str), (usize, usize)> = HashMap::new();
     let mut tcp: HashMap<(String, u16, String, u16), Segments> = HashMap::new();
-    let mut segment_total = 0usize;
     let mut dns = Vec::new();
 
     // Timestamps that are all zero (a Simple Packet Block capture) say nothing.
@@ -787,7 +999,6 @@ pub fn read(data: &[u8], tags: &[String]) -> Option<Capture> {
 
         if d.transport == "TCP"
             && d.payload_len > 0
-            && segment_total < MAX_SEGMENTS
             && let Some(seq) = d.seq
         {
             let key = (d.src_ip.clone(), d.src_port, d.dst_ip.clone(), d.dst_port);
@@ -795,7 +1006,6 @@ pub fn read(data: &[u8], tags: &[String]) -> Option<Capture> {
                 .or_default()
                 .parts
                 .push((seq, d.payload_at, d.payload_len));
-            segment_total += 1;
         }
 
         if name == "DNS"
@@ -821,36 +1031,45 @@ pub fn read(data: &[u8], tags: &[String]) -> Option<Capture> {
     flows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
     let mut budget = MAX_REASSEMBLED;
+    let mut flags_left = bytes::MAX_FLAGS;
+    let mut overlays_left = MAX_OVERLAYS;
+    let mut flags_truncated = false;
     let mut streams: Vec<Stream> = Vec::new();
     for (_, (src_ip, sp, dst_ip, dp), segments) in flows {
-        let buf = reassemble(data, &segments, MAX_STREAM_BYTES.min(budget));
+        let limit = MAX_STREAM_BYTES.min(budget.max(FLOW_ALLOWANCE));
+        let buf = reassemble(data, &segments, limit);
         if buf.is_empty() {
             continue;
         }
-        budget -= buf.len();
+        budget = budget.saturating_sub(buf.len());
 
-        let flags = bytes::flag_candidates_for_tags(&buf, tags)
-            .into_iter()
-            .map(|f| f.text)
-            .collect();
+        let searched = search_flow(data, &segments, tags, &mut flags_left, &mut overlays_left);
+        flags_truncated |= searched.truncated;
+
         let embedded_file = (buf.len() >= 8).then(|| bytes::identify(&buf)).flatten();
         streams.push(Stream {
             src: endpoint(&src_ip, sp),
             dst: endpoint(&dst_ip, dp),
             bytes: buf.len(),
-            text: preview(&buf),
+            carried: searched.carried,
+            conflicting: searched.conflicting,
+            text: preview(&buf, PREVIEW_BYTES),
             printable: printable_fraction(&buf),
             embedded_file,
-            flags,
+            flags: searched.flags,
         });
     }
 
     // A stream carrying a flag or a whole file leads; then the largest.
-    streams.sort_by(|a, b| {
-        let weight = |s: &Stream| (!s.flags.is_empty() || s.embedded_file.is_some(), s.bytes);
-        weight(b).cmp(&weight(a))
-    });
-    streams.truncate(MAX_STREAMS);
+    let finding = |s: &Stream| !s.flags.is_empty() || s.embedded_file.is_some();
+    streams.sort_by_key(|s| std::cmp::Reverse((finding(s), s.bytes)));
+
+    let findings = streams.iter().take_while(|s| finding(s)).count();
+    streams.truncate(findings.clamp(MAX_STREAMS, MAX_FINDING_STREAMS));
+    for stream in streams.iter_mut().skip(MAX_STREAMS) {
+        stream.text.truncate(SHORT_PREVIEW_BYTES);
+    }
+    flags_truncated |= findings > MAX_FINDING_STREAMS;
 
     let mut protocols: Vec<Protocol> = protocols
         .into_iter()
@@ -889,6 +1108,8 @@ pub fn read(data: &[u8], tags: &[String]) -> Option<Capture> {
         streams,
         stream_count,
         dns,
+        packets_capped,
+        flags_truncated,
     })
 }
 
@@ -915,6 +1136,10 @@ pub fn json(data: &[u8], tags: &[String]) -> String {
     push_number(&mut out, "streamCount", cap.stream_count);
     out.push(',');
     push_number(&mut out, "conversationCount", cap.conversation_count);
+    out.push(',');
+    push_bool(&mut out, "packetsCapped", cap.packets_capped);
+    out.push(',');
+    push_bool(&mut out, "flagsTruncated", cap.flags_truncated);
     out.push(',');
 
     push_string(&mut out, "protocols");
@@ -965,6 +1190,10 @@ pub fn json(data: &[u8], tags: &[String]) -> String {
         push_field(&mut out, "dst", &s.dst);
         out.push(',');
         push_number(&mut out, "bytes", s.bytes);
+        out.push(',');
+        push_number(&mut out, "carried", s.carried);
+        out.push(',');
+        push_number(&mut out, "conflicting", s.conflicting);
         out.push(',');
         push_field(&mut out, "text", &s.text);
         out.push(',');

@@ -109,6 +109,13 @@ const NO_SQLITE = 'not a SQLite database';
 const NO_PCAP = 'not a packet capture';
 const NO_COEFFICIENTS = 'no readable JPEG coefficients';
 
+/** One entry per distinct flag. The same flag read two ways, a GIF frame and the
+ *  difference that also carries it, collapses to the first. */
+export function uniqueByText<T extends { text: string }>(items: T[]): T[] {
+	const seen = new Set<string>();
+	return items.filter((item) => !seen.has(item.text) && seen.add(item.text));
+}
+
 /** Metadata fields a person types into, as opposed to ones a camera fills in. */
 export const WRITTEN_BY_HAND = new Set([
 	'ImageDescription',
@@ -262,8 +269,8 @@ function pdfNote(pdf: PdfStructure): string {
 		return 'encrypted';
 	}
 
-	const count = pdf.objects.length;
-	return `${count} object${count === 1 ? '' : 's'}, nothing out of place`;
+	const count = pdf.objectCount ?? pdf.objects.length;
+	return `${count.toLocaleString()} object${count === 1 ? '' : 's'}, nothing out of place`;
 }
 
 /**
@@ -372,7 +379,12 @@ export function tools(found: Findings): Tool[] {
 	const decoded = wall !== null || sweep !== null;
 
 	const headerBroken = !structure || isHeaderError(structure.header);
-	const ended = structure?.chunks.some((c) => c.kind === 'IEND') ?? false;
+	const chunksListed = structure?.chunks.length ?? 0;
+	const chunkTotal = structure?.chunkCount ?? chunksListed;
+	const textTotal = structure?.textCount ?? structure?.text.length ?? 0;
+	// IEND comes last, so a list that stopped early cannot say it is missing.
+	const ended =
+		chunkTotal > chunksListed || (structure?.chunks.some((c) => c.kind === 'IEND') ?? false);
 	const badCrc = structure?.chunks.filter((c) => !c.crcOk).length ?? 0;
 	const sweepHits = sweep?.candidates.length ?? 0;
 
@@ -502,7 +514,9 @@ export function tools(found: Findings): Tool[] {
 			scope: 'bytes',
 			group: 'survey',
 			status: embedded.length ? 'hit' : 'clear',
-			value: embedded.length ? `${embedded.length} to extract` : 'none'
+			value: embedded.length
+				? `${embedded.length.toLocaleString()}${survey.magicOmitted ? '+' : ''} to extract`
+				: 'none'
 		},
 		{
 			id: 'gif',
@@ -673,8 +687,8 @@ export function tools(found: Findings): Tool[] {
 			id: 'text',
 			name: 'Text chunks',
 			measures: 'Comments and labels saved inside the image',
-			status: structure?.text.length ? 'hit' : 'clear',
-			value: structure?.text.length ? `${structure.text.length} found` : 'none'
+			status: textTotal ? 'hit' : 'clear',
+			value: textTotal ? `${textTotal.toLocaleString()} found` : 'none'
 		}),
 		png(
 			{
@@ -699,7 +713,11 @@ export function tools(found: Findings): Tool[] {
 			name: 'Chunk CRC',
 			measures: 'Checks each PNG chunk against its own checksum',
 			status: badCrc ? 'hit' : 'clear',
-			value: badCrc ? `${badCrc} mismatch${badCrc === 1 ? '' : 'es'}` : 'all valid'
+			value: badCrc
+				? `${badCrc} mismatch${badCrc === 1 ? '' : 'es'}`
+				: chunkTotal > chunksListed
+					? `first ${chunksListed.toLocaleString()} valid`
+					: 'all valid'
 		}),
 		png({
 			id: 'chunks',
@@ -710,7 +728,7 @@ export function tools(found: Findings): Tool[] {
 				? 'header unreadable'
 				: !ended
 					? 'no IEND, cut short'
-					: `${structure?.chunks.length} chunk${structure?.chunks.length === 1 ? '' : 's'}`
+					: `${chunkTotal.toLocaleString()} chunk${chunkTotal === 1 ? '' : 's'}`
 		}),
 		{
 			id: 'strings',

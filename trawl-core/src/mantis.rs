@@ -29,6 +29,7 @@ pub mod vigenere;
 pub mod xor;
 
 use crate::bytes;
+use std::collections::HashMap;
 
 /// English letter frequencies, in percent, a through z.
 pub(crate) const ENGLISH: [f32; 26] = [
@@ -244,6 +245,8 @@ pub struct Peel {
     pub result: Vec<u8>,
     /// Plainness of the final result, for the caller to report honestly.
     pub score: f32,
+    /// True when the search ran out of budget, so there may be more layers than these.
+    pub search_cut: bool,
 }
 
 /// Name, decoder, and whether the input's own form justifies the peel.
@@ -452,6 +455,28 @@ fn candidates(data: &[u8], tags: &[String]) -> Vec<(&'static str, Vec<u8>, bool)
     out
 }
 
+/// Bytes one search may read through, one node's whole input at a time.
+///
+/// A paste that nests three encodings six layers deep has hundreds of distinct readings
+/// even with each worked out once, and at a quarter of a megabyte each is a tenth of a
+/// second. Past this a node is scored and not opened, so a search that hits it still
+/// answers with the best chain it reached. A paste of ordinary size never comes close.
+const SEARCH_BUDGET: usize = 8 << 20;
+
+/// What one search has worked out so far: the best chain from a reading, per how many
+/// layers were left to spend on it, since different routes reach the same string and each
+/// would otherwise search all of it again.
+struct Search<'a> {
+    tags: &'a [String],
+    memo: HashMap<Vec<u8>, Vec<Reached>>,
+    budget: usize,
+    /// Set the first time the budget turns a node away.
+    cut: bool,
+}
+
+/// The layers that were left, what the best chain scored, and the chain.
+type Reached = (usize, f32, Vec<Step>);
+
 /// The best chain reachable from here, and what it ends up scoring.
 ///
 /// Searching rather than stepping is the whole point. A middle layer usually
@@ -462,24 +487,36 @@ fn candidates(data: &[u8], tags: &[String]) -> Vec<(&'static str, Vec<u8>, bool)
 fn explore(
     data: &[u8],
     seen: &mut Vec<Vec<u8>>,
-    tags: &[String],
-    depth: usize,
-    depth_budget: usize,
+    search: &mut Search,
+    layers_left: usize,
 ) -> (f32, Vec<Step>) {
-    let here = rate(data, tags);
-    if depth >= depth_budget || here == CONCLUSIVE || data.len() > MAX_INPUT {
+    if let Some(known) = search
+        .memo
+        .get(data)
+        .and_then(|known| known.iter().find(|entry| entry.0 == layers_left))
+    {
+        return (known.1, known.2.clone());
+    }
+
+    let here = rate(data, search.tags);
+    if layers_left == 0 || here == CONCLUSIVE || data.len() > MAX_INPUT {
         return (here, Vec::new());
     }
+    if search.budget < data.len() {
+        search.cut = true;
+        return (here, Vec::new());
+    }
+    search.budget -= data.len();
 
     let mut best = (here, Vec::new());
 
-    for (encoding, output, structural) in candidates(data, tags) {
+    for (encoding, output, structural) in candidates(data, search.tags) {
         if seen.contains(&output) {
             continue;
         }
 
         seen.push(output.clone());
-        let (reachable, rest) = explore(&output, seen, tags, depth + 1, depth_budget);
+        let (reachable, rest) = explore(&output, seen, search, layers_left - 1);
         seen.pop();
 
         let score = reachable - STEP_COST;
@@ -487,8 +524,8 @@ fn explore(
             continue;
         }
 
-        let gain = rate(&output, tags) - here;
-        let reason = match conclusive(&output, tags) {
+        let gain = rate(&output, search.tags) - here;
+        let reason = match conclusive(&output, search.tags) {
             Some(why) => why,
             None if gain >= MIN_GAIN => format!("reads {:.0}% more like text", gain * 100.0),
             None => "a layer on the way down".to_string(),
@@ -505,6 +542,11 @@ fn explore(
         best = (score, steps);
     }
 
+    search
+        .memo
+        .entry(data.to_vec())
+        .or_default()
+        .push((layers_left, best.0, best.1.clone()));
     best
 }
 
@@ -594,7 +636,14 @@ fn peel_with(data: &[u8], tags: &[String]) -> Peel {
 /// Used by the worker to share one six-layer budget across Rust and platform layers.
 pub fn peel_with_depth(data: &[u8], tags: &[String], depth_budget: usize) -> Peel {
     let mut seen = vec![data.to_vec()];
-    let (score, steps) = explore(data, &mut seen, tags, 0, depth_budget);
+    let mut search = Search {
+        tags,
+        memo: HashMap::new(),
+        budget: SEARCH_BUDGET,
+        cut: false,
+    };
+    let (score, steps) = explore(data, &mut seen, &mut search, depth_budget);
+    let search_cut = search.cut;
 
     let structural_only = steps.iter().all(|step| step.structural);
     let worth_it = score == CONCLUSIVE || score >= plainness(data) + MIN_GAIN || structural_only;
@@ -610,6 +659,7 @@ pub fn peel_with_depth(data: &[u8], tags: &[String], depth_budget: usize) -> Pee
             steps,
             score: plainness(data),
             result: data.to_vec(),
+            search_cut,
         };
     }
 
@@ -618,17 +668,20 @@ pub fn peel_with_depth(data: &[u8], tags: &[String], depth_budget: usize) -> Pee
         score: plainness(&result),
         steps,
         result,
+        search_cut,
     }
 }
 
 /// Serialises a Peel (steps + final result) into the JSON shape the worker expects.
 /// Does not re-run attacks — used when the worker has already combined layers.
 pub fn json_from_peel(peel: &Peel) -> String {
-    use crate::json::{push_field, push_number, push_string};
+    use crate::json::{push_bool, push_field, push_number, push_string};
 
     let mut out = String::from("{");
 
     push_number(&mut out, "depth", peel.steps.len());
+    out.push(',');
+    push_bool(&mut out, "searchCut", peel.search_cut);
     out.push(',');
     push_string(&mut out, "score");
     out.push_str(&format!(":{:.3}", peel.score));
@@ -747,6 +800,7 @@ pub fn read_for_tags(data: &[u8], tags: &[String]) -> Reading {
                 steps: Vec::new(),
                 result: data.to_vec(),
                 score: plainness(data),
+                search_cut: false,
             })
         };
     }
@@ -866,13 +920,15 @@ pub fn json(data: &[u8]) -> String {
 
 /// The peel, attacks, and working, for a caller that has configured flag tags.
 pub fn json_for_tags(data: &[u8], tags: &[String]) -> String {
-    use crate::json::{push_field, push_number, push_string};
+    use crate::json::{push_bool, push_field, push_number, push_string};
 
     let reading = read_for_tags(data, tags);
     let peeled = &reading.peel;
     let mut out = String::from("{");
 
     push_number(&mut out, "depth", peeled.steps.len());
+    out.push(',');
+    push_bool(&mut out, "searchCut", peeled.search_cut);
     out.push(',');
     push_string(&mut out, "score");
     out.push_str(&format!(":{:.3}", peeled.score));

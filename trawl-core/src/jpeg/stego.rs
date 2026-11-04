@@ -104,13 +104,18 @@ pub struct Candidate {
 pub const COMBINATIONS: usize = 4;
 
 pub fn sweep(coefficients: &Coefficients, max_bytes: usize) -> Vec<Candidate> {
+    sweep_naming(coefficients, max_bytes, &[])
+}
+
+/// [`sweep`], with configured flag tags let past what an unnamed flag has to look like.
+pub fn sweep_naming(coefficients: &Coefficients, max_bytes: usize, tags: &[String]) -> Vec<Candidate> {
     let mut out = Vec::new();
 
     for include_dc in [false, true] {
         for msb_first in [true, false] {
             let stream = extract(coefficients, include_dc, msb_first, max_bytes);
 
-            let flags: Vec<String> = crate::bytes::flag_candidates(&stream)
+            let flags: Vec<String> = crate::bytes::flag_candidates_naming(&stream, tags)
                 .into_iter()
                 .map(|f| f.text)
                 .collect();
@@ -211,6 +216,11 @@ pub fn histogram(coefficients: &Coefficients) -> Vec<(i32, u64)> {
 
 /// Everything the JPEG coefficient tools produce, as JSON.
 pub fn json(file: &[u8], max_bytes: usize, steps: usize) -> String {
+    json_naming(file, max_bytes, steps, &[])
+}
+
+/// [`json`], with configured flag tags.
+pub fn json_naming(file: &[u8], max_bytes: usize, steps: usize, tags: &[String]) -> String {
     use crate::json::{push_bool, push_field, push_number, push_string};
 
     let coefficients = match super::dct::coefficients(file) {
@@ -280,7 +290,7 @@ pub fn json(file: &[u8], max_bytes: usize, steps: usize) -> String {
 
     push_string(&mut out, "candidates");
     out.push_str(":[");
-    for (i, candidate) in sweep(&coefficients, max_bytes).iter().enumerate() {
+    for (i, candidate) in sweep_naming(&coefficients, max_bytes, tags).iter().enumerate() {
         if i > 0 {
             out.push(',');
         }

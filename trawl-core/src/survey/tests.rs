@@ -196,6 +196,85 @@ fn a_file_of_wide_flags_reports_a_bounded_number() {
     assert_eq!(text.matches("\"UTF-16LE text\"").count(), bytes::MAX_FLAGS);
 }
 
+fn tags(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| name.to_string()).collect()
+}
+
+#[test]
+fn a_named_tag_stays_credible_whatever_is_around_it() {
+    // Six hundred random bytes either side, which filed this under a closed list.
+    let mut data = noise(600, 0x1234);
+    data.extend_from_slice(b"flag{the_real_one}");
+    data.extend(noise(600, 0x4321));
+
+    let unnamed = json(&data);
+    assert!(unnamed.contains("\"credible\":false"), "{unnamed}");
+
+    let named = json_for_tags(&data, &tags(&["flag"]));
+    assert!(named.contains("flag{the_real_one}"));
+    assert!(named.contains("\"credible\":true"), "{named}");
+    assert!(!named.contains("\"credible\":false"), "{named}");
+
+    // A tag anyone would recognise counts whatever was configured.
+    assert!(json_for_tags(&data, &tags(&["HV"])).contains("\"credible\":true"));
+}
+
+#[test]
+fn a_shape_nobody_named_is_still_judged_by_where_it_sits() {
+    let mut data = noise(64 * 1024, 0x1234);
+    data[30_000..30_011].copy_from_slice(b"abc{abcde}\0");
+
+    let text = json_for_tags(&data, &tags(&["flag"]));
+    assert!(text.contains("abc{abcde}"), "{text}");
+    assert!(text.contains("\"credible\":false"), "{text}");
+}
+
+#[test]
+fn configured_tags_reach_the_scan() {
+    for (tag, flag) in [
+        ("HV", "HV{two_letter_tag}"),
+        ("cyberapocalypse", "cyberapocalypse{long_tag_here}"),
+        ("CSAW", "CSAW{tHiS_iS_MiXeD_cAsE_fLaG}"),
+        ("flag", "flag{p@$$w0rd_1s_$3cr3t}"),
+    ] {
+        let data = format!("some text {flag} and more text");
+        let text = json_for_tags(data.as_bytes(), &tags(&[tag]));
+        assert!(text.contains(&format!("\"text\":\"{flag}\"")), "{tag}: {text}");
+    }
+
+    let wide: Vec<u8> = "HV{two_letter_wide}".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let text = json_for_tags(&wide, &tags(&["HV"]));
+    assert!(text.contains("\"text\":\"HV{two_letter_wide}\""), "{text}");
+}
+
+#[test]
+fn decoys_do_not_hide_a_real_flag_from_the_survey() {
+    let mut data = b"abc{aaaa}\n".repeat(bytes::MAX_FLAGS + 10);
+    data.extend_from_slice(b"flag{the_real_one}");
+
+    let text = json_for_tags(&data, &tags(&["flag"]));
+    assert!(text.contains("\"text\":\"flag{the_real_one}\""));
+    assert!(text.contains("\"flagsTruncated\":false"));
+}
+
+#[test]
+fn a_survey_that_ran_out_of_room_for_flags_says_so() {
+    let mut data = Vec::new();
+    for i in 0..bytes::MAX_FLAGS + 5 {
+        data.extend_from_slice(format!("flag{{decoy_{i}}}\n").as_bytes());
+    }
+
+    assert!(json_for_tags(&data, &tags(&["flag"])).contains("\"flagsTruncated\":true"));
+    assert!(json(b"flag{just_the_one}").contains("\"flagsTruncated\":false"));
+}
+
+#[test]
+fn signatures_left_out_are_counted() {
+    let data = b"7z\xbc\xaf\x27\x1c".repeat(5000);
+    assert!(json(&data).contains("\"magicOmitted\":904"));
+    assert!(json(b"plain text").contains("\"magicOmitted\":0"));
+}
+
 #[test]
 fn text_that_only_starts_like_a_bitmap_is_not_named_one() {
     assert!(json(b"BM not a bitmap, just text").contains("\"format\":null"));

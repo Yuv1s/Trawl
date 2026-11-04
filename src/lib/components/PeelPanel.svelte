@@ -138,7 +138,7 @@
 			</p>
 
 			<ul class="readings">
-				{#each leading as reading (reading.how)}
+				{#each leading as reading, i (i)}
 					{@render row(reading)}
 				{/each}
 			</ul>
@@ -147,7 +147,7 @@
 				<details class="rest">
 					<summary class="label">{trailing.length} more</summary>
 					<ul class="readings">
-						{#each trailing as reading (reading.how)}
+						{#each trailing as reading, i (i)}
 							{@render row(reading)}
 						{/each}
 					</ul>
@@ -218,7 +218,7 @@
 
 		{#if keyed}
 			<ul class="attempts">
-				{#each keyed.attempts as attempt (attempt.cipher)}
+				{#each keyed.attempts as attempt, i (i)}
 					<li class:found={attempt.flags.length > 0}>
 						<div class="reading-head">
 							<span class="mono how">{attempt.cipher}</span>
@@ -330,7 +330,7 @@
 			</div>
 
 			<ul class="breaks">
-				{#each broken as found (found.attack)}
+				{#each broken as found, i (i)}
 					<li>
 						<span class="encoding">{found.attack}</span>
 						<span class="reason found">{found.because}</span>
@@ -379,7 +379,7 @@
 			</div>
 
 			<ul class="guesses">
-				{#each peel.hash.candidates as name (name)}
+				{#each peel.hash.candidates as name, i (i)}
 					<li class="mono" class:sure={peel.hash.certain}>{name}</li>
 				{/each}
 			</ul>
@@ -433,6 +433,12 @@
 			<div class="pane-head">
 				<h2>Peeled {peel.depth} {peel.depth === 1 ? 'layer' : 'layers'}</h2>
 				<p>Mantis kept each layer because of what decoding it produced.</p>
+				{#if peel.searchCut}
+					<p>
+						This paste has more possible readings than Trawl follows, so it stopped at its budget.
+						There may be more layers than the ones shown.
+					</p>
+				{/if}
 			</div>
 
 			<ol class="chain">
@@ -667,7 +673,7 @@
 							{#if peel.frequency.trigrams.length > 0}
 								<h4 class="label">Repeated triples</h4>
 								<ul class="runs">
-									{#each peel.frequency.trigrams as run (run.text)}
+									{#each peel.frequency.trigrams as run, i (i)}
 										<li class="mono chip">{run.text}<span class="times">{run.count}</span></li>
 									{/each}
 								</ul>
@@ -675,7 +681,7 @@
 							{#if peel.frequency.bigrams.length > 0}
 								<h4 class="label">Repeated pairs</h4>
 								<ul class="runs">
-									{#each peel.frequency.bigrams as run (run.text)}
+									{#each peel.frequency.bigrams as run, i (i)}
 										<li class="mono chip">{run.text}<span class="times">{run.count}</span></li>
 									{/each}
 								</ul>

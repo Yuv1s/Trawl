@@ -321,6 +321,11 @@ fn to_hex(bytes: &[u8]) -> String {
 /// Tries the keys, IVs and ciphertexts a file carries against each other, and
 /// returns the combinations that decrypted to something readable.
 pub fn probe(file: &[u8]) -> Vec<Solved> {
+    probe_naming(file, &[])
+}
+
+/// [`probe`], with configured flag tags let past what an unnamed flag has to look like.
+pub fn probe_naming(file: &[u8], tags: &[String]) -> Vec<Solved> {
     let mut keys: Vec<Vec<u8>> = Vec::new();
     let mut ivs: Vec<Vec<u8>> = Vec::new();
 
@@ -378,7 +383,7 @@ pub fn probe(file: &[u8]) -> Vec<Solved> {
                     continue;
                 }
 
-                let flags: Vec<String> = bytes::flag_candidates(plain)
+                let flags: Vec<String> = bytes::flag_candidates_naming(plain, tags)
                     .into_iter()
                     .map(|found| found.text)
                     .collect();
@@ -428,10 +433,15 @@ pub fn probe(file: &[u8]) -> Vec<Solved> {
 
 /// The probe as JSON, an array that is empty when nothing decrypted.
 pub fn json(file: &[u8]) -> String {
+    json_naming(file, &[])
+}
+
+/// [`json`], with configured flag tags.
+pub fn json_naming(file: &[u8], tags: &[String]) -> String {
     use crate::json::{push_field, push_number, push_string};
 
     let mut out = String::from("[");
-    for (i, item) in probe(file).iter().enumerate() {
+    for (i, item) in probe_naming(file, tags).iter().enumerate() {
         if i > 0 {
             out.push(',');
         }

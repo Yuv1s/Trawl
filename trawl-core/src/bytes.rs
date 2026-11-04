@@ -1,5 +1,7 @@
 //! Format-independent scans over raw bytes. Shared by every category.
 
+use std::collections::HashSet;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Found {
     pub offset: usize,
@@ -102,12 +104,84 @@ fn tag_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Most flag shapes one scan reports.
+/// Most flag shapes one scan reports of each kind.
 ///
 /// Ten bytes of file make one, so a file of nothing else asks for more text than it
 /// holds and a lookup per match behind it. No real file has this many flags, and the
 /// first few thousand already say what such a file is.
 pub const MAX_FLAGS: usize = 10_000;
+
+/// Flags collected under one allowance.
+///
+/// Repeats fill the list and stop there, and a text not seen before still gets a place
+/// once they have. A file of one flag ten thousand times over has said all it has to
+/// say, and whatever different thing comes after it is what somebody was hiding.
+#[derive(Default)]
+struct Allowance {
+    found: Vec<Found>,
+    seen: Option<HashSet<String>>,
+    truncated: bool,
+}
+
+impl Allowance {
+    fn offer(&mut self, found: Found) {
+        if self.found.len() < MAX_FLAGS {
+            self.found.push(found);
+            return;
+        }
+
+        let listed = &self.found;
+        let seen = self
+            .seen
+            .get_or_insert_with(|| listed.iter().map(|f| f.text.clone()).collect());
+        if seen.contains(&found.text) {
+            return;
+        }
+        if seen.len() >= MAX_FLAGS {
+            self.truncated = true;
+            return;
+        }
+        seen.insert(found.text.clone());
+        self.found.push(found);
+    }
+}
+
+/// Flags from one or more scans, with a tag anyone would recognise kept apart from a
+/// shape nobody has named. Ten thousand of `abc{aaaa}` cost a real flag nothing that way.
+#[derive(Default)]
+pub struct FlagList {
+    named: Allowance,
+    unnamed: Allowance,
+}
+
+impl FlagList {
+    pub fn offer(&mut self, found: Found, named: bool) {
+        if named {
+            self.named.offer(found);
+        } else {
+            self.unnamed.offer(found);
+        }
+    }
+
+    pub fn finish(self) -> FlagScan {
+        let truncated = self.named.truncated || self.unnamed.truncated;
+
+        let mut found = self.named.found;
+        found.extend(self.unnamed.found);
+        found.sort_by_key(|f| f.offset);
+
+        FlagScan { found, truncated }
+    }
+}
+
+/// What a flag scan found.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FlagScan {
+    pub found: Vec<Found>,
+    /// True when a flag not yet listed was left out because its allowance had run out,
+    /// so whoever reads this has to be told the list is not the whole of the file.
+    pub truncated: bool,
+}
 
 /// Characters a person would type inside a flag.
 fn body_byte(b: u8) -> bool {
@@ -211,33 +285,59 @@ fn recognised_tag(run: &[u8]) -> bool {
     })
 }
 
+/// True for a flag whose tag has been named, or that anyone would recognise.
+pub fn tag_is_named(text: &str, tags: &[String]) -> bool {
+    tag_is_known(text) || tag_is_known_for(text, tags)
+}
+
 pub fn flag_candidates_for_tags(data: &[u8], tags: &[String]) -> Vec<Found> {
-    flag_candidates_naming(data, tags)
-        .into_iter()
-        .filter(|found| tag_is_known_for(&found.text, tags))
-        .collect()
+    scan_flags(data, tags, true).found
 }
 
 pub fn flag_candidates(data: &[u8]) -> Vec<Found> {
     flag_candidates_naming(data, &[])
 }
 
-/// Every flag shape, with the configured tags let past the checks that exist to
-/// reject noise.
+pub fn flag_candidates_naming(data: &[u8], tags: &[String]) -> Vec<Found> {
+    scan_flags(data, tags, false).found
+}
+
+/// Every flag shape in the whole of `data`, with the configured tags let past the checks
+/// that exist to reject noise.
 ///
 /// Those checks guess at what a tag and a body look like when nobody has said. A
 /// named tag is not a guess: `HV` and `cyberapocalypse` are outside the length limits
 /// because the limits are about unnamed runs. A tag anyone would recognise settles
-/// the case check the same way, since `HTB{Y0u_F0uNd_1T}` is written like that on
-/// purpose and the alternating case that marks noise does not come with a tag on it.
-pub fn flag_candidates_naming(data: &[u8], tags: &[String]) -> Vec<Found> {
+/// the body the same way, since `HTB{Y0u_F0uNd_1T}` and `flag{p@$$w0rd_1s_$3cr3t}` are
+/// written like that on purpose, and the alternating case and punctuation that mark
+/// noise do not come with a tag on them.
+///
+/// @param only_named leave out anything but the tags asked for, before it counts against
+///        an allowance, or anything but the recognised tags when none were asked for
+pub fn scan_flags(data: &[u8], tags: &[String], only_named: bool) -> FlagScan {
     const MAX_BODY: usize = 256;
 
-    let mut out = Vec::new();
+    let mut list = FlagList::default();
     let mut i = 0usize;
+    // The next closing brace, kept between questions. Looking afresh from every opening
+    // brace is 256 comparisons a byte on a file of nothing else.
+    let mut next_close = 0usize;
 
-    while i < data.len() && out.len() < MAX_FLAGS {
-        if data[i] != b'{' {
+    while let Some(open) = data[i..].iter().position(|&b| b == b'{') {
+        i += open;
+
+        if next_close <= i {
+            next_close = data[i + 1..]
+                .iter()
+                .position(|&b| b == b'}')
+                .map_or(data.len(), |p| i + 1 + p);
+        }
+        if next_close == data.len() {
+            break;
+        }
+        let close = next_close;
+        let body = &data[i + 1..close];
+        if body.len() >= MAX_BODY {
             i += 1;
             continue;
         }
@@ -250,19 +350,8 @@ pub fn flag_candidates_naming(data: &[u8], tags: &[String]) -> Vec<Found> {
             tag_start -= 1;
         }
 
-        let Some(close) = data[i + 1..]
-            .iter()
-            .take(MAX_BODY)
-            .position(|&b| b == b'}')
-            .map(|p| i + 1 + p)
-        else {
-            i += 1;
-            continue;
-        };
-
         let tag_len = i - tag_start;
-        let body = &data[i + 1..close];
-        let body_len = body.len();
+        let run = &data[tag_start..i];
 
         // A real tag starts with a letter: picoCTF, flag, HTB. A run of bytes
         // ending in something tag-shaped by accident usually does not.
@@ -271,35 +360,44 @@ pub fn flag_candidates_naming(data: &[u8], tags: &[String]) -> Vec<Found> {
 
         // A named tag outside the shape is reported as itself, not with whatever
         // run of alphanumerics happens to sit in front of it.
-        let named = named_tag(&data[tag_start..i], tags);
+        let named = named_tag(run, tags);
         let start = match named {
             Some(len) if !shaped => i - len,
             _ => tag_start,
         };
-        let tag_ok = shaped || named.is_some();
+        let recognised = recognised_tag(run);
+        let vouched_for = named.is_some() || recognised;
 
-        let written = body.iter().filter(|&&b| body_byte(b)).count();
-        let body_ok = body_len >= MIN_BODY
-            && body.iter().all(|&b| printable(b))
-            // A second opening brace means the match began at the wrong one, so
-            // this is a longer run that happens to span a brace rather than a
-            // flag. The written-byte allowance alone lets one through.
+        // A second opening brace means the match began at the wrong one, so this is a
+        // longer run that happens to span a brace rather than a flag. Asked first, so
+        // that a storm of opening braces stops here for every one of them.
+        let body_ok = body.len() >= MIN_BODY
             && !body.contains(&b'{')
-            && written as f32 / body_len as f32 >= MIN_BODY_WRITTEN
-            && (named.is_some() || recognised_tag(&data[tag_start..i]) || case_is_consistent(body));
+            && body.iter().all(|&b| printable(b))
+            && (vouched_for
+                || (body.iter().filter(|&&b| body_byte(b)).count() as f32 / body.len() as f32
+                    >= MIN_BODY_WRITTEN
+                    && case_is_consistent(body)));
 
-        if tag_ok && body_ok {
-            out.push(Found {
-                offset: start,
-                text: String::from_utf8_lossy(&data[start..=close]).into_owned(),
-            });
-            i = close + 1;
-        } else {
+        if !(shaped || named.is_some()) || !body_ok {
             i += 1;
+            continue;
         }
+
+        let wanted = if tags.is_empty() { recognised } else { named.is_some() };
+        if !only_named || wanted {
+            list.offer(
+                Found {
+                    offset: start,
+                    text: String::from_utf8_lossy(&data[start..=close]).into_owned(),
+                },
+                vouched_for,
+            );
+        }
+        i = close + 1;
     }
 
-    out
+    list.finish()
 }
 
 /// Accepts whatever follows the magic. For signatures long or odd enough that
@@ -560,8 +658,9 @@ impl<'a> Extents<'a> {
     }
 }
 
-/// Most signatures one scan reports. Each is four bytes of file and a line of JSON,
-/// so a file of nothing else would ask for twenty times its own size.
+/// Most signatures of one kind a scan reports. Each is four bytes of file and a line of
+/// JSON, so a file of nothing else would ask for twenty times its own size. Counted per
+/// kind, or four thousand of one worthless signature end the search for every other.
 const MAX_HITS: usize = 4096;
 
 /// Which bytes can begin a signature the scan looks for, so most of a file is one
@@ -583,20 +682,30 @@ const SCAN_STARTS: [bool; 256] = {
 /// This is the binwalk move: a container appended to or embedded inside another
 /// file announces itself with its own magic, wherever it happens to sit.
 pub fn magic_scan(data: &[u8]) -> Vec<MagicHit> {
-    let mut found = Vec::new();
+    magic_scan_counted(data).0
+}
 
-    'scan: for at in 0..data.len() {
+/// [`magic_scan`], with how many signatures were left out because their kind's allowance
+/// had run out.
+pub fn magic_scan_counted(data: &[u8]) -> (Vec<MagicHit>, usize) {
+    let mut found = Vec::new();
+    let mut listed = [0usize; SIGNATURES.len()];
+    let mut omitted = 0usize;
+
+    for at in 0..data.len() {
         if !SCAN_STARTS[data[at] as usize] {
             continue;
         }
-        for candidate in &SIGNATURES {
+        for (kind, candidate) in SIGNATURES.iter().enumerate() {
             let Some(validate) = candidate.embedded else {
                 continue;
             };
             if data[at..].starts_with(candidate.magic) && validate(data, at) {
-                found.push((at, candidate.label));
-                if found.len() >= MAX_HITS {
-                    break 'scan;
+                if listed[kind] < MAX_HITS {
+                    listed[kind] += 1;
+                    found.push((at, candidate.label));
+                } else {
+                    omitted += 1;
                 }
                 break;
             }
@@ -606,7 +715,7 @@ pub fn magic_scan(data: &[u8]) -> Vec<MagicHit> {
     let mut extents = Extents::new(data);
 
     // A second pass, because an unbounded file runs until the next one starts.
-    found
+    let hits = found
         .iter()
         .enumerate()
         .map(|(i, &(at, label))| {
@@ -626,7 +735,9 @@ pub fn magic_scan(data: &[u8]) -> Vec<MagicHit> {
                 },
             }
         })
-        .collect()
+        .collect();
+
+    (hits, omitted)
 }
 
 /// Shannon entropy of a byte run, in bits per byte, so 8.0 is incompressible.
@@ -1322,5 +1433,96 @@ mod tests {
     fn a_file_of_flags_reports_a_bounded_number() {
         let found = flag_candidates(&b"flag{abcd}".repeat(MAX_FLAGS + 50));
         assert_eq!(found.len(), MAX_FLAGS);
+    }
+
+    #[test]
+    fn decoys_nobody_named_do_not_cost_a_real_flag_its_place() {
+        let mut data = b"abc{aaaa}\n".repeat(MAX_FLAGS + 500);
+        data.extend_from_slice(b"flag{the_real_one}");
+
+        let tags = vec!["flag".to_string()];
+        let scan = scan_flags(&data, &tags, true);
+        assert_eq!(scan.found.len(), 1, "the decoys are filtered before they are counted");
+        assert_eq!(scan.found[0].text, "flag{the_real_one}");
+        assert!(!scan.truncated);
+
+        let scan = scan_flags(&data, &[], false);
+        assert_eq!(scan.found.last().unwrap().text, "flag{the_real_one}");
+        assert_eq!(scan.found.len(), MAX_FLAGS + 1);
+    }
+
+    #[test]
+    fn the_same_flag_over_and_over_does_not_cost_a_different_one_its_place() {
+        let mut data = b"flag{aaaa} ".repeat(MAX_FLAGS * 3);
+        data.extend_from_slice(b"flag{the_real_one}");
+
+        let scan = scan_flags(&data, &["flag".to_string()], true);
+        assert_eq!(scan.found.len(), MAX_FLAGS + 1);
+        assert_eq!(scan.found.last().unwrap().text, "flag{the_real_one}");
+        assert!(!scan.truncated, "nothing different was left out");
+    }
+
+    #[test]
+    fn a_scan_that_ran_out_of_room_says_so() {
+        let mut data = Vec::new();
+        for i in 0..MAX_FLAGS + 3 {
+            data.extend_from_slice(format!("flag{{decoy_{i}}} ").as_bytes());
+        }
+
+        let scan = scan_flags(&data, &[], false);
+        assert_eq!(scan.found.len(), MAX_FLAGS);
+        assert!(scan.truncated);
+
+        // Noise running out says the same, and takes nothing from the recognised tags.
+        let mut data = Vec::new();
+        for i in 0..MAX_FLAGS + 3 {
+            data.extend_from_slice(format!("abc{{decoy_{i}}} ").as_bytes());
+        }
+        data.extend_from_slice(b"flag{the_real_one}");
+        let scan = scan_flags(&data, &[], false);
+        assert!(scan.truncated);
+        assert!(scan.found.iter().any(|f| f.text == "flag{the_real_one}"));
+    }
+
+    #[test]
+    fn a_named_tag_is_let_past_the_body_rule_and_an_unnamed_one_is_not() {
+        assert_eq!(flag_candidates(b"flag{p@$$w0rd_1s_$3cr3t}").len(), 1, "anyone knows this tag");
+        let tags = vec!["event".to_string()];
+        assert_eq!(
+            flag_candidates_naming(b"event{p@$$w0rd_1s_$3cr3t}", &tags).len(),
+            1,
+            "somebody named this one"
+        );
+
+        assert!(flag_candidates(b"abc{p@$$w0rd_1s_$3cr3t}").is_empty());
+
+        // Named or not, it still has to be text with no second brace in it.
+        assert!(flag_candidates(b"flag{a\x01b\x02}").is_empty());
+        assert!(flag_candidates(b"flag{a{bcde}").is_empty());
+    }
+
+    #[test]
+    fn a_storm_of_braces_stays_linear() {
+        for piece in [&b"{"[..], b"{a", b"a{", b"{}", b"{a}", b"flag{", b"{aaaaaaaa"] {
+            let data = piece.repeat((16 << 20) / piece.len());
+
+            let started = std::time::Instant::now();
+            let scan = scan_flags(&data, &[], false);
+            assert!(scan.found.is_empty());
+            assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+        }
+    }
+
+    #[test]
+    fn decoy_signatures_do_not_end_the_search_for_another_kind() {
+        let mut data = b"7z\xbc\xaf\x27\x1c".repeat(MAX_HITS + 100);
+        let png_at = data.len();
+        data.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        data.extend_from_slice(&[0u8; 16]);
+
+        let (hits, omitted) = magic_scan_counted(&data);
+        assert_eq!(omitted, 100, "what was left out is counted");
+        assert_eq!(hits.iter().filter(|h| h.label == "7-Zip archive").count(), MAX_HITS);
+        assert!(hits.iter().any(|h| h.label == "PNG image" && h.offset == png_at));
     }
 }

@@ -13,7 +13,7 @@
 	import DownloadPrompt from '$lib/components/DownloadPrompt.svelte';
 	import { buildPixelDemo, type SampleFile, type SampleOpen } from '$lib/tour/demo';
 	import type { TourStep } from '$lib/tour/types';
-	import { attack as attackRsa, looksLikeRsa, type Report } from '$lib/analysis/rsa';
+	import type { Report } from '$lib/analysis/rsa';
 	import Logo from '$lib/components/Logo.svelte';
 	import banner from '$lib/assets/TrawlBanner.png';
 	import ToolRack from '$lib/components/ToolRack.svelte';
@@ -46,6 +46,7 @@
 		nestedFindings,
 		PLANNED,
 		tools,
+		uniqueByText,
 		WRITTEN_BY_HAND
 	} from '$lib/analysis/tools';
 	import { buildSolvePaths } from '$lib/analysis/solve-path';
@@ -80,7 +81,9 @@
 		/** Reaching a live site, which runs against a scanner the person starts themselves. */
 		| { phase: 'web' };
 
-	let view = $state<View>({ phase: 'idle' });
+	/** Raw, because a result can run to hundreds of thousands of objects and is only ever
+	 *  replaced, and a proxy over each of them costs a tab gigabytes to read. */
+	let view = $state.raw<View>({ phase: 'idle' });
 	let activeTool = $state('flags');
 	let selectedChunk = $state(-1);
 	let openPlane = $state<{ channel: number; bit: number; pixels: Uint8Array | null } | null>(null);
@@ -204,14 +207,7 @@
 
 				if (result.status === 'peel') {
 					jobDone();
-					// RSA runs here rather than in the worker: it needs bignum
-					// arithmetic, and the platform's BigInt is the only one there is.
-					view = {
-						phase: 'text',
-						input: result.input,
-						peel: result.peel,
-						rsa: looksLikeRsa(result.input) ? attackRsa(result.input) : null
-					};
+					view = { phase: 'text', input: result.input, peel: result.peel, rsa: result.rsa };
 					return;
 				}
 
@@ -516,9 +512,9 @@
 		});
 	}
 
-	function requestExtract(channels: string, bit: number, msbFirst: boolean) {
+	function requestExtract(channels: string, bit: number, msbFirst: boolean, columnMajor: boolean) {
 		extracted = null;
-		post({ kind: 'extract', id: ticket, channels, bit, msbFirst });
+		post({ kind: 'extract', id: ticket, channels, bit, msbFirst, columnMajor });
 	}
 
 	function requestExtractPalette(msbFirst: boolean) {
@@ -672,13 +668,15 @@
 		uniqueByText(allFlags.filter((f) => f.credible && !matchesFlagTag(f.text, flagTags)))
 	);
 	const suppressedFlags = $derived(allFlags.filter((f) => !f.credible));
-	/** One line per distinct flag in the cod-end. The same flag read two ways, a
-	 *  GIF frame and the difference that also carries it, collapses to the first. */
-	function uniqueByText<T extends { text: string }>(items: T[]): T[] {
-		const out: T[] = [];
-		for (const item of items) if (!out.some((kept) => kept.text === item.text)) out.push(item);
-		return out;
-	}
+	/** Flags to draw before stopping. A file can hold ten thousand, each of them a row
+	 *  in the page, and the writeup still lists every one. */
+	const FLAGS_SHOWN = 200;
+	/** How many of those get their surrounding bytes, which are dozens of elements each. */
+	const CONTEXTS_SHOWN = 20;
+	/** Text chunks to draw, each of which can hold pages of text. */
+	const TEXT_CHUNKS_SHOWN = 100;
+
+	const credibleTexts = $derived(new Set(credibleFlags.map((flag) => flag.text)));
 
 	/** Every sweep find, each carrying the name of the sweep that turned it up. */
 	const sweepFlags = $derived(
@@ -737,11 +735,7 @@
 					text: found.text,
 					origin: `from ${found.origin}`
 				}))
-			].filter(
-				(found) =>
-					matchesFlagTag(found.text, flagTags) &&
-					!credibleFlags.some((flag) => flag.text === found.text)
-			)
+			].filter((found) => matchesFlagTag(found.text, flagTags) && !credibleTexts.has(found.text))
 		)
 	);
 
@@ -770,20 +764,22 @@
 	/** Both sweeps feed one view, so a find looks the same wherever it came from. */
 	const pixelRows = $derived(
 		sweep?.candidates.map((c) => ({
-			key: `${c.channels}-${c.bit}-${c.msbFirst}`,
 			title: c.channels,
-			chips: [`bit ${c.bit}`, `${c.msbFirst ? 'msb' : 'lsb'} first`],
+			chips: [
+				`bit ${c.bit}`,
+				`${c.msbFirst ? 'msb' : 'lsb'} first`,
+				...(c.columnMajor ? ['by column'] : [])
+			],
 			reason: c.reason,
 			preview: c.preview,
 			readable: c.readable,
 			flags: c.flags,
-			onextract: () => requestExtract(c.channels, c.bit, c.msbFirst)
+			onextract: () => requestExtract(c.channels, c.bit, c.msbFirst, c.columnMajor ?? false)
 		})) ?? null
 	);
 
 	const jpegRows = $derived(
 		jpeg?.candidates.map((c) => ({
-			key: `${c.includeDc}-${c.msbFirst}`,
 			title: c.includeDc ? 'all coefficients' : 'skipping DC',
 			chips: [`${c.msbFirst ? 'msb' : 'lsb'} first`],
 			reason: c.reason,
@@ -796,7 +792,6 @@
 
 	const paletteRows = $derived(
 		paletteStego?.candidates.map((c) => ({
-			key: String(c.msbFirst),
 			title: 'palette indices',
 			chips: [`${c.msbFirst ? 'msb' : 'lsb'} first`],
 			reason: c.reason,
@@ -809,7 +804,6 @@
 
 	const audioRows = $derived(
 		audio?.candidates.map((c) => ({
-			key: `${c.channels}-${c.bit}-${c.msbFirst}`,
 			title: c.channels,
 			chips: [`bit ${c.bit}`, `${c.msbFirst ? 'msb' : 'lsb'} first`],
 			reason: c.reason,
@@ -978,6 +972,14 @@
 					{finished.crashed.length === 1 ? 'reader' : 'readers'} crashed on this file, so those results
 					are missing. That is a bug in Trawl.
 				</p>
+			{/if}
+
+			{#if finished?.notes?.length}
+				<ul class="limits" role="status" aria-label="What Trawl stopped short of on this file">
+					{#each finished.notes as note (note)}
+						<li>{note}</li>
+					{/each}
+				</ul>
 			{/if}
 
 			{#if credibleFlags.length > 0 || sweepFlags.length > 0}
@@ -1152,6 +1154,7 @@
 							size={survey.size}
 							bytes={view.bytes}
 							{nested}
+							omitted={survey.magicOmitted}
 							onanalyse={analyseBytes}
 						/>
 					{:else if activeTool === 'exif'}
@@ -1244,7 +1247,7 @@
 							</p>
 						{:else}
 							<ul class="findings">
-								{#each credibleFlags as found (found.text)}
+								{#each credibleFlags.slice(0, FLAGS_SHOWN) as found, i (found.text)}
 									{@const window = contextAround(found.offset, found.text.length)}
 									<li>
 										<span class="mono big flagged">{found.text}</span>
@@ -1252,13 +1255,22 @@
 											0x{found.offset.toString(16)}
 											{#if flagSources[found.offset]}· {flagSources[found.offset]}{/if}
 										</span>
-										<div class="context">
-											<span class="label">Surrounding bytes</span>
-											<HexView bytes={window.bytes} baseOffset={window.start} limit={256} />
-										</div>
+										{#if i < CONTEXTS_SHOWN}
+											<div class="context">
+												<span class="label">Surrounding bytes</span>
+												<HexView bytes={window.bytes} baseOffset={window.start} limit={256} />
+											</div>
+										{/if}
 									</li>
 								{/each}
 							</ul>
+						{/if}
+
+						{#if credibleFlags.length > FLAGS_SHOWN}
+							<p class="scale-note">
+								Showing the first {FLAGS_SHOWN} of {credibleFlags.length.toLocaleString()}. The
+								writeup lists them all.
+							</p>
 						{/if}
 
 						{#if otherShapes.length > 0}
@@ -1269,7 +1281,7 @@
 									they stay out of the Cod-end. Add the tag under Flag formats if one is yours.
 								</p>
 								<ul class="quiet mono">
-									{#each otherShapes as found (found.text)}
+									{#each otherShapes.slice(0, FLAGS_SHOWN) as found (found.text)}
 										<li>
 											<span>{found.text}</span>
 											<span class="muted">0x{found.offset.toString(16)} · {found.region}</span>
@@ -1290,7 +1302,7 @@
 									as finds.
 								</p>
 								<ul class="quiet mono">
-									{#each suppressedFlags as found, i (i)}
+									{#each suppressedFlags.slice(0, FLAGS_SHOWN) as found, i (i)}
 										<li>
 											<span>{found.text}</span>
 											<span class="muted">0x{found.offset.toString(16)} · {found.region}</span>
@@ -1319,19 +1331,29 @@
 							<p class="clear">No tEXt, zTXt or iTXt chunks.</p>
 						{:else}
 							<ul class="findings">
-								{#each structure.text as text, i (i)}
+								{#each structure.text.slice(0, TEXT_CHUNKS_SHOWN) as text, i (i)}
 									<li>
 										<span class="keyword mono">{text.kind} · {text.keyword || 'no keyword'}</span>
 										{#if text.compressed}
 											<span class="muted">
-												Compressed, and inflating it failed{text.error ? `: ${text.error}` : '.'}
+												Compressed, and not read{text.error ? `: ${text.error}` : '.'}
 											</span>
 										{:else}
 											<span class="mono big">{text.text}</span>
+											{#if text.error}
+												<span class="muted">Read as far as it goes: {text.error}</span>
+											{/if}
 										{/if}
 									</li>
 								{/each}
 							</ul>
+							{#if (structure.textCount ?? structure.text.length) > TEXT_CHUNKS_SHOWN}
+								<p class="scale-note">
+									Showing the first {TEXT_CHUNKS_SHOWN} of {(
+										structure.textCount ?? structure.text.length
+									).toLocaleString()} text chunks.
+								</p>
+							{/if}
 						{/if}
 					{:else if activeTool === 'palette' && structure}
 						<PaletteView palette={structure.palette} stego={paletteStego} />
@@ -1367,6 +1389,7 @@
 					{:else if structure}
 						<ChunkList
 							chunks={structure.chunks}
+							total={structure.chunkCount}
 							selected={selectedChunk}
 							onselect={(offset) => (selectedChunk = offset)}
 						/>
@@ -1785,6 +1808,20 @@
 		background: var(--panel-deep);
 		color: var(--signal);
 		font-size: var(--t-label);
+	}
+
+	.limits {
+		list-style: none;
+		margin: 0;
+		padding: var(--s2) var(--s5);
+		display: grid;
+		gap: var(--s1);
+		border-bottom: 1px solid var(--rule);
+		background: var(--panel-deep);
+		color: var(--text);
+		font-size: var(--t-label);
+		line-height: 1.5;
+		overflow-wrap: anywhere;
 	}
 
 	.notice {

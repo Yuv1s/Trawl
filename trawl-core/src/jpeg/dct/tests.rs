@@ -312,6 +312,86 @@ fn a_file_of_nothing_but_scans_stops_at_the_limit() {
     assert!(found.truncated);
 }
 
+/// A one-component progressive frame this many blocks wide and high.
+fn progressive_sof(across: u16, down: u16) -> Vec<u8> {
+    let mut body = vec![8];
+    body.extend_from_slice(&(down * 8).to_be_bytes());
+    body.extend_from_slice(&(across * 8).to_be_bytes());
+    body.extend_from_slice(&[1, 1, 0x11, 0]);
+    segment(0xc2, &body)
+}
+
+/// A comment segment's worth of padding, as much of it as asked for.
+fn padding(mut bytes: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    while bytes > 0 {
+        let run = bytes.min(60_000);
+        out.extend_from_slice(&segment(0xfe, &vec![b'A'; run]));
+        bytes -= run;
+    }
+    out
+}
+
+#[test]
+fn padding_is_not_counted_as_room_for_blocks() {
+    // Two million blocks, in a file long enough for them only because of its comments.
+    // The scans hold a few hundred bytes, which is what the frame has to answer to.
+    let mut file = vec![0xff, 0xd8];
+    file.extend_from_slice(&padding(280_000));
+    file.extend_from_slice(&progressive_sof(1448, 1448));
+    file.extend_from_slice(&one_code_table(0x00, 0));
+    file.extend_from_slice(&one_code_table(0x10, 0xe0));
+    file.extend_from_slice(&segment(0xda, &[1, 1, 0x00, 1, 63, 0]));
+    file.extend_from_slice(&[0u8; 300]);
+    file.extend_from_slice(&[0xff, 0xd9]);
+
+    assert_eq!(coefficients(&file).unwrap_err(), DctError::TooLarge);
+}
+
+#[test]
+fn scans_that_walk_every_block_for_nothing_stop_at_the_visit_budget() {
+    // Enough real bits to justify two million blocks, in a first scan that spends one on
+    // each. Every scan after it covers the whole frame in 240 bytes of end-of-band runs,
+    // which is how 262 KB of file became 268 million block visits and forty seconds.
+    let (across, down) = (1448u16, 1448u16);
+    let blocks = across as usize * down as usize;
+
+    let mut file = vec![0xff, 0xd8];
+    file.extend_from_slice(&progressive_sof(across, down));
+    file.extend_from_slice(&one_code_table(0x00, 0));
+    file.extend_from_slice(&one_code_table(0x10, 0xe0));
+
+    file.extend_from_slice(&segment(0xda, &[1, 1, 0x00, 0, 0, 0]));
+    file.extend_from_slice(&vec![0u8; blocks / 8 + 1]);
+    for _ in 0..60 {
+        file.extend_from_slice(&segment(0xda, &[1, 1, 0x00, 1, 63, 0]));
+        file.extend_from_slice(&[0u8; 300]);
+    }
+    file.extend_from_slice(&[0xff, 0xd9]);
+
+    let started = std::time::Instant::now();
+    let found = coefficients(&file).unwrap();
+    assert!(started.elapsed().as_secs() < 30, "took {:?}", started.elapsed());
+
+    assert!(found.truncated, "what the budget cut off has to be said");
+    assert_eq!(found.scans, MAX_BLOCK_VISITS.div_ceil(blocks));
+    assert_eq!(found.blocks[0].len(), blocks);
+}
+
+#[test]
+fn a_frame_with_no_scan_says_so_and_allocates_nothing() {
+    let mut file = vec![0xff, 0xd8];
+    file.extend_from_slice(&padding(280_000));
+    file.extend_from_slice(&progressive_sof(1448, 1448));
+    file.extend_from_slice(&[0xff, 0xd9]);
+    assert_eq!(coefficients(&file).unwrap_err(), DctError::NoScan);
+
+    let mut small = vec![0xff, 0xd8];
+    small.extend_from_slice(&sof(8, 8));
+    small.extend_from_slice(&[0xff, 0xd9]);
+    assert_eq!(coefficients(&small).unwrap_err(), DctError::NoScan);
+}
+
 #[test]
 fn says_so_when_the_file_is_not_a_jpeg() {
     assert_eq!(

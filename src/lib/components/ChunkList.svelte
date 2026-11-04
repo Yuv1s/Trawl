@@ -3,9 +3,19 @@
 
 	let {
 		chunks,
+		total = chunks.length,
 		selected,
 		onselect
-	}: { chunks: Chunk[]; selected: number; onselect: (offset: number) => void } = $props();
+	}: {
+		chunks: Chunk[];
+		/** How many the file holds, which `chunks` can be a capped copy of. */
+		total?: number;
+		selected: number;
+		onselect: (offset: number) => void;
+	} = $props();
+
+	/** Rows drawn. A chunk is twelve bytes of file. */
+	const ROWS_SHOWN = 500;
 </script>
 
 <table class="chunks">
@@ -19,7 +29,7 @@
 		</tr>
 	</thead>
 	<tbody>
-		{#each chunks as chunk (chunk.offset)}
+		{#each chunks.slice(0, ROWS_SHOWN) as chunk (chunk.offset)}
 			<tr class:current={chunk.offset === selected}>
 				<td>
 					<button type="button" onclick={() => onselect(chunk.offset)}>{chunk.kind}</button>
@@ -33,7 +43,16 @@
 	</tbody>
 </table>
 
+{#if total > ROWS_SHOWN}
+	<p class="capped label">Showing the first {ROWS_SHOWN} of {total.toLocaleString()} chunks.</p>
+{/if}
+
 <style>
+	.capped {
+		margin: var(--s3) 0 0;
+		color: var(--muted);
+	}
+
 	table {
 		width: 100%;
 		border-collapse: collapse;

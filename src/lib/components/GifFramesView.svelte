@@ -121,10 +121,14 @@
 	<div class="detail">
 		{#if frame.lsb.candidates.filter((c) => c.flags.length > 0).length > 0}
 			<ul class="lsb">
-				{#each frame.lsb.candidates.filter((c) => c.flags.length > 0) as cand (cand.channels + cand.bit + cand.msbFirst)}
+				{#each frame.lsb.candidates.filter((c) => c.flags.length > 0) as cand, i (i)}
 					<li>
 						<span class="channels mono">{cand.channels}</span>
-						<span class="chip">{cand.bit} · {cand.msbFirst ? 'MSB' : 'LSB'} first</span>
+						<span class="chip"
+							>{cand.bit} · {cand.msbFirst ? 'MSB' : 'LSB'} first{cand.columnMajor
+								? ' · by column'
+								: ''}</span
+						>
 						<span class="reason">{cand.reason}</span>
 						{#if cand.flags.length > 0}
 							<ul class="flags">

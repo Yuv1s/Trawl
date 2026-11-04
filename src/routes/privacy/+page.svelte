@@ -42,8 +42,8 @@
 	<p>
 		Remora is the one part of Trawl that reaches other sites, and it only runs if you start its
 		scanner yourself. The install line downloads the scanner from GitHub. After that the page talks
-		to the scanner on your own machine, and the scanner talks to the target you name. None of that
-		traffic reaches this site.
+		to the scanner on your own machine, and the scanner talks to the target you name, and to any
+		site that target redirects it to. None of that traffic reaches this site.
 	</p>
 
 	<h2>Third parties</h2>

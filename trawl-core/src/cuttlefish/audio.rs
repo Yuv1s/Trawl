@@ -308,6 +308,11 @@ pub fn extract(
 }
 
 pub fn sweep(samples: &[i32], channels: usize, max_bytes: usize) -> Vec<Candidate> {
+    sweep_naming(samples, channels, max_bytes, &[])
+}
+
+/// [`sweep`], with configured flag tags let past what an unnamed flag has to look like.
+pub fn sweep_naming(samples: &[i32], channels: usize, max_bytes: usize, tags: &[String]) -> Vec<Candidate> {
     let mut out = Vec::new();
 
     for (channel, label) in channel_sets(channels) {
@@ -315,7 +320,7 @@ pub fn sweep(samples: &[i32], channels: usize, max_bytes: usize) -> Vec<Candidat
             for msb_first in [true, false] {
                 let stream = extract(samples, channels, channel, bit, msb_first, max_bytes);
 
-                let flags: Vec<String> = bytes::flag_candidates(&stream)
+                let flags: Vec<String> = bytes::flag_candidates_naming(&stream, tags)
                     .into_iter()
                     .map(|f| f.text)
                     .collect();
@@ -361,9 +366,20 @@ pub fn combination_count(channels: usize) -> usize {
 }
 
 pub fn sweep_json(samples: &[i32], channels: usize, sample_rate: u32, max_bytes: usize) -> String {
+    sweep_json_naming(samples, channels, sample_rate, max_bytes, &[])
+}
+
+/// [`sweep_json`], with configured flag tags.
+pub fn sweep_json_naming(
+    samples: &[i32],
+    channels: usize,
+    sample_rate: u32,
+    max_bytes: usize,
+    tags: &[String],
+) -> String {
     use crate::json::{push_bool, push_field, push_number, push_string};
 
-    let found = sweep(samples, channels, max_bytes);
+    let found = sweep_naming(samples, channels, max_bytes, tags);
     let mut out = String::from("{");
 
     push_number(&mut out, "samples", samples.len());

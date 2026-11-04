@@ -1,39 +1,45 @@
 <script lang="ts">
 	import type { MagicHit, NestedArtifact, NestedAnalysis } from '$lib/worker/protocol';
+	import { tally } from './tally';
 
 	let {
 		hits,
 		size,
 		bytes,
 		onanalyse,
-		nested
+		nested,
+		omitted = 0
 	}: {
 		hits: MagicHit[];
 		size: number;
 		bytes: Uint8Array;
 		onanalyse?: (bytes: Uint8Array, name: string) => void;
 		nested?: NestedAnalysis | null;
+		/** Signatures the scan itself left out, past its allowance for their kind. */
+		omitted?: number;
 	} = $props();
+
+	/** Rows drawn for each kind of signature, so a file of one kind cannot bury another. */
+	const SHOWN_OF_EACH_KIND = 50;
 
 	const embedded = $derived(hits.filter((h) => h.embedded));
 	const header = $derived(hits.find((h) => !h.embedded) ?? null);
 
+	/** The rows drawn, in file order, and how many of each kind there were to draw. */
+	const kinds = $derived(tally(embedded, (hit) => hit.label, SHOWN_OF_EACH_KIND));
+	const overflowing = $derived([...kinds.counts].filter(([, count]) => count > SHOWN_OF_EACH_KIND));
+
 	const startsWithVowel = /^[aeiou]/i;
 	const hex = (n: number) => `0x${n.toString(16)}`;
 
-	/** Find the carved child that automatic analysis attached to this magic hit. */
-	function nestedFor(hit: MagicHit): NestedArtifact | undefined {
-		if (!nested) return undefined;
-		const walk = (roots: NestedArtifact[]): NestedArtifact | undefined => {
-			for (const child of roots) {
-				if (child.source === 'carved' && child.offset === hit.offset) return child;
-				const deeper = walk(child.children);
-				if (deeper) return deeper;
-			}
-			return undefined;
-		};
-		return walk(nested.roots);
-	}
+	/** What the walk made of each signature, by where it sits. */
+	const children = $derived(
+		new Map(
+			(nested?.roots ?? [])
+				.filter((child) => child.source === 'carved')
+				.map((child) => [child.offset, child])
+		)
+	);
 
 	function statusChip(status: 'analysed' | 'skipped' | 'error', reason?: string): string {
 		switch (status) {
@@ -108,7 +114,9 @@
 	</p>
 {:else}
 	<ul class="hits">
-		{#each embedded as hit, i (i)}
+		{#each kinds.kept as hit, i (i)}
+			{@const child = children.get(hit.offset)}
+			{@const beneath = child ? findingsCount(child) : 0}
 			<li>
 				<div class="head">
 					<span class="label-text">{hit.label}</span>
@@ -132,14 +140,11 @@
 					{kb(hit.length)} at {hex(hit.offset)}, {((hit.offset / size) * 100).toFixed(1)}% into the
 					file
 				</span>
-				{#if nestedFor(hit)}
-					{@const child = nestedFor(hit)!}
+				{#if child}
 					<span class="status">
 						<span class="chip">{statusChip(child.status, child.reason)}</span>
-						{#if findingsCount(child) > 0}
-							<span class="chip flagged"
-								>{findingsCount(child)} finding{findingsCount(child) === 1 ? '' : 's'} beneath</span
-							>
+						{#if beneath > 0}
+							<span class="chip flagged">{beneath} finding{beneath === 1 ? '' : 's'} beneath</span>
 						{/if}
 					</span>
 				{/if}
@@ -152,6 +157,18 @@
 			</li>
 		{/each}
 	</ul>
+
+	{#each overflowing as [label, count] (label)}
+		<p class="capped label">
+			Showing the first {SHOWN_OF_EACH_KIND} of {count.toLocaleString()}
+			{label} signatures.
+		</p>
+	{/each}
+	{#if omitted > 0}
+		<p class="capped label">
+			Another {omitted.toLocaleString()} were left out of the scan, past the first 4,096 of their kind.
+		</p>
+	{/if}
 
 	<p class="caveat">
 		A file signature this far into another file is rarely an accident. PNG, JPEG, ZIP and PDF mark
@@ -257,6 +274,11 @@
 	.chip.flagged {
 		color: var(--signal);
 		border-color: var(--signal);
+	}
+
+	.capped {
+		margin: var(--s3) 0 0;
+		color: var(--muted);
 	}
 
 	.caveat {

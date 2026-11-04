@@ -11,6 +11,10 @@
 	/** Chunks a player reads to make sound, as opposed to ones it steps over. */
 	const KNOWN = new Set(['fmt ', 'data', 'fact']);
 
+	/** Rows drawn. A chunk is eight bytes of file. */
+	const ROWS_SHOWN = 500;
+	const TEXTS_SHOWN = 100;
+
 	const duration = (seconds: number) => {
 		const minutes = Math.floor(seconds / 60);
 		const rest = seconds - minutes * 60;
@@ -66,7 +70,7 @@
 			</tr>
 		</thead>
 		<tbody>
-			{#each chunks as chunk (chunk.offset)}
+			{#each chunks.slice(0, ROWS_SHOWN) as chunk (chunk.offset)}
 				<tr>
 					<td class="mono id">{chunk.id}</td>
 					<td class="mono muted">{hex(chunk.offset)}</td>
@@ -84,19 +88,27 @@
 			{/each}
 		</tbody>
 	</table>
+	{#if chunks.length > ROWS_SHOWN}
+		<p class="clear">Showing the first {ROWS_SHOWN} of {chunks.length.toLocaleString()} chunks.</p>
+	{/if}
 {/if}
 
 {#if walked?.text.length}
 	<section class="found">
 		<h3 class="label">Text in the chunks a player skips</h3>
 		<ul>
-			{#each walked.text as found, i (i)}
+			{#each walked.text.slice(0, TEXTS_SHOWN) as found, i (i)}
 				<li>
 					<span class="mono big" class:flagged={found.text.includes('{')}>{found.text}</span>
 					<span class="mono muted">{found.chunk} · {hex(found.offset)}</span>
 				</li>
 			{/each}
 		</ul>
+		{#if walked.text.length > TEXTS_SHOWN}
+			<p class="clear">
+				Showing the first {TEXTS_SHOWN} of {walked.text.length.toLocaleString()} strings.
+			</p>
+		{/if}
 	</section>
 {:else if walked}
 	<p class="footnote">

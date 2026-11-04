@@ -132,6 +132,13 @@ fn blocks_site_local_and_the_azure_wire_server() {
 }
 
 #[test]
+fn blocks_google_v6_metadata_even_in_local_mode() {
+    assert!(forbidden(v6("fd20:ce::254")).is_some());
+    let reason = forbidden_with(v6("fd20:ce::254"), true).unwrap();
+    assert!(reason.contains("cloud metadata"), "{reason}");
+}
+
+#[test]
 fn blocks_aws_v6_metadata_even_in_local_mode() {
     // fd00:ec2::254 is unique-local by shape, so local mode would have opened it;
     // it is AWS's IMDS endpoint and the metadata promise must hold in both modes.

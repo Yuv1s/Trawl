@@ -105,12 +105,20 @@ pub struct Binary {
     /// True totals, which the two lists above are capped copies of.
     pub import_count: usize,
     pub export_count: usize,
+    /// True when a budget ended the walk before the end of the symbol tables, so those
+    /// totals, and whether a guard symbol turned up, stop where the walk did.
+    pub symbols_capped: bool,
 }
 
 /// How many symbols of each kind reach the caller. A challenge binary has a
 /// handful; a system library can have thousands, and the true count is
 /// reported separately so a capped list never reads as the whole truth.
 pub const MAX_SYMBOLS: usize = 512;
+
+/// How many sections and segments reach the caller. A header table can name sixty-five
+/// thousand of them out of a 128-byte file, all of them the same one, and a real binary
+/// has a few dozen. The true counts are reported alongside.
+const MAX_TABLE_ROWS: usize = 4096;
 
 /// Reads whichever executable format the bytes are in, or nothing.
 pub fn read(data: &[u8]) -> Option<Binary> {
@@ -180,6 +188,12 @@ pub fn json(data: &[u8]) -> String {
     out.push(',');
     push_number(&mut out, "exportCount", binary.export_count);
     out.push(',');
+    push_bool(&mut out, "symbolsCapped", binary.symbols_capped);
+    out.push(',');
+    push_number(&mut out, "sectionCount", binary.sections.len());
+    out.push(',');
+    push_number(&mut out, "segmentCount", binary.segments.len());
+    out.push(',');
 
     push_string(&mut out, "needed");
     out.push_str(":[");
@@ -193,7 +207,7 @@ pub fn json(data: &[u8]) -> String {
 
     push_string(&mut out, "sections");
     out.push_str(":[");
-    for (i, section) in binary.sections.iter().enumerate() {
+    for (i, section) in binary.sections.iter().take(MAX_TABLE_ROWS).enumerate() {
         if i > 0 {
             out.push(',');
         }
@@ -215,7 +229,7 @@ pub fn json(data: &[u8]) -> String {
 
     push_string(&mut out, "segments");
     out.push_str(":[");
-    for (i, segment) in binary.segments.iter().enumerate() {
+    for (i, segment) in binary.segments.iter().take(MAX_TABLE_ROWS).enumerate() {
         if i > 0 {
             out.push(',');
         }

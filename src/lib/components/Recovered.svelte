@@ -18,7 +18,12 @@
 		onpeel?: (text: string) => void;
 	} = $props();
 
+	/** A file can hold thousands, and each is a row here. The writeup lists every one. */
+	const SHOWN = 200;
+
 	const total = $derived(candidates.length + fromPixels.length);
+	const shownCandidates = $derived(candidates.slice(0, SHOWN));
+	const shownPixels = $derived(fromPixels.slice(0, SHOWN - shownCandidates.length));
 	const pathFor = $derived(new Map(paths.map((p) => [p.text, p.steps])));
 </script>
 
@@ -31,7 +36,7 @@
 	</div>
 
 	<ul>
-		{#each candidates as found (found.text)}
+		{#each shownCandidates as found (found.text)}
 			<li>
 				<div class="row">
 					<output class="value mono">{found.text}</output>
@@ -48,7 +53,7 @@
 				{/if}
 			</li>
 		{/each}
-		{#each fromPixels as found (found.text)}
+		{#each shownPixels as found (found.text)}
 			<li>
 				<div class="row">
 					<output class="value mono">{found.text}</output>
@@ -65,6 +70,10 @@
 			</li>
 		{/each}
 	</ul>
+
+	{#if total > SHOWN}
+		<p class="caveat">Showing the first {SHOWN}. The writeup lists all {total.toLocaleString()}.</p>
+	{/if}
 
 	<p class="caveat">
 		The cod-end is the closed end of a trawl net, where the catch collects. Everything here matched
@@ -103,12 +112,16 @@
 		color: var(--muted);
 	}
 
+	/* Scrolls past a screenful, so a file of two hundred decoys cannot push every tool out
+	   of sight beneath them. */
 	ul {
 		list-style: none;
 		margin: var(--s3) 0 0;
 		padding: 0;
 		display: grid;
 		gap: var(--s3);
+		max-height: 40dvh;
+		overflow-y: auto;
 	}
 
 	li {

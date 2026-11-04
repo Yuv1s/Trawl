@@ -512,6 +512,496 @@ fn a_string_reading_like_a_header_does_not_cost_a_real_dictionary() {
 }
 
 #[test]
+fn an_object_header_can_be_split_by_any_whitespace() {
+    for header in ["1 0\nobj", "1\t0\tobj", "1\r\n0\r\nobj", "1  0  obj", "1\x000 obj", "1 0\x0cobj"] {
+        let file = format!("%PDF-1.7\n{header}\n<< /Length 4 >>\nstream\nABCD\nendstream\nendobj\n");
+        let doc = read(file.as_bytes()).unwrap();
+
+        assert_eq!(doc.objects.len(), 1, "{header:?}");
+        assert_eq!(doc.objects[0].number, 1);
+        assert_eq!(doc.objects[0].generation, 0);
+        assert_eq!(doc.objects[0].offset, 9);
+        assert_eq!(doc.objects[0].stream.as_ref().unwrap().length, 4, "{header:?}");
+    }
+}
+
+#[test]
+fn only_the_keyword_itself_opens_an_object() {
+    for text in ["1 0 object", "1 0 objx", "endobj", "x 0 obj", "1 x obj", "obj"] {
+        let file = format!("%PDF-1.7\n{text}\n");
+        assert!(read(file.as_bytes()).unwrap().objects.is_empty(), "{text:?}");
+    }
+}
+
+#[test]
+fn a_close_inside_a_string_does_not_end_the_dictionary() {
+    for dict in [
+        "<< /Title (>>) /Filter /FlateDecode /Length 4 >>",
+        "<< /Title (a \\) >> b) /Filter /FlateDecode /Length 4 >>",
+        "<< /Title (nested (>>) still) /Filter /FlateDecode /Length 4 >>",
+        "<< /Note <3E3E> /Filter /FlateDecode /Length 4 >>",
+        "<< /Note <AB>/Filter /FlateDecode /Length 4 >>",
+        "<< /Note 1 %>> not yet\n/Filter /FlateDecode /Length 4 >>",
+    ] {
+        let body = format!("{dict}\nstream\nABCD\nendstream");
+        let doc = read(&build(&[Put::new(1, &body)])).unwrap();
+        let stream = doc.objects[0].stream.as_ref().unwrap_or_else(|| panic!("{dict}"));
+        assert_eq!(stream.filter, "FlateDecode", "{dict}");
+        assert_eq!(stream.length, 4, "{dict}");
+    }
+}
+
+#[test]
+fn a_hex_string_up_against_the_close_is_read_as_one() {
+    let doc = read(&build(&[Put::new(1, "<< /ID <AB>>>\nstream\nABCD\nendstream")])).unwrap();
+    assert_eq!(doc.objects[0].stream.as_ref().unwrap().length, 4);
+}
+
+#[test]
+fn a_string_that_never_closes_leaves_the_dictionary_to_be_read_anyway() {
+    let doc = read(&build(&[Put::new(1, "<< /Note (open /Length 4 >>\nstream\nABCD\nendstream")])).unwrap();
+    assert_eq!(doc.objects[0].stream.as_ref().unwrap().length, 4);
+
+    let mut file = b"%PDF-1.7\n1 0 obj<<".to_vec();
+    file.extend_from_slice(&b"(".repeat(1 << 20));
+    file.extend_from_slice(&b"<".repeat(1 << 20));
+    file.extend_from_slice(b">>");
+    let started = std::time::Instant::now();
+    assert!(read(&file).is_some());
+    assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+}
+
+#[test]
+fn name_escapes_are_undone_wherever_they_turn_up() {
+    let doc = read(&build(&[Put::new(
+        1,
+        "<< /Fil#74er /Fl#61teDecode /Ty#70e /XOb#6Aect /Length 4 >>\nstream\nABCD\nendstream",
+    )]))
+    .unwrap();
+    assert_eq!(doc.objects[0].stream.as_ref().unwrap().filter, "FlateDecode");
+    assert_eq!(doc.objects[0].kind.as_deref(), Some("XObject"));
+
+    assert_eq!(unescape_name("plain"), "plain");
+    assert_eq!(unescape_name("a#20b"), "a b");
+    assert_eq!(unescape_name("not#zzhex#"), "not#zzhex#");
+}
+
+#[test]
+fn a_filter_in_another_object_is_followed() {
+    let body = "<< /Filter 5 0 R /Length 4 >>\nstream\nABCD\nendstream";
+    let doc = read(&build(&[Put::new(4, body), Put::new(5, "/FlateDecode")])).unwrap();
+    assert_eq!(doc.objects[0].stream.as_ref().unwrap().filter, "FlateDecode");
+
+    let doc = read(&build(&[Put::new(5, "[/AHx /Fl]"), Put::new(6, "<< /Filter 5 0 R >>\nstream\nAB\nendstream")])).unwrap();
+    assert_eq!(doc.objects[1].stream.as_ref().unwrap().filter, "ASCIIHexDecode then FlateDecode");
+}
+
+#[test]
+fn the_short_names_an_inline_image_uses_read_as_the_long_ones() {
+    for (short, long) in [
+        ("Fl", "FlateDecode"),
+        ("AHx", "ASCIIHexDecode"),
+        ("A85", "ASCII85Decode"),
+        ("LZW", "LZWDecode"),
+        ("RL", "RunLengthDecode"),
+        ("DCT", "DCTDecode"),
+        ("CCF", "CCITTFaxDecode"),
+    ] {
+        let body = format!("<< /Filter /{short} >>\nstream\nAB\nendstream");
+        let doc = read(&build(&[Put::new(4, &body)])).unwrap();
+        assert_eq!(doc.objects[0].stream.as_ref().unwrap().filter, long);
+    }
+}
+
+#[test]
+fn a_filter_array_can_point_at_its_names() {
+    let body = "<< /Length 4 /Filter [7 0 R /ASCIIHexDecode] >>\nstream\nABCD\nendstream";
+    let doc = read(&build(&[Put::new(4, body), Put::new(7, "/FlateDecode")])).unwrap();
+    assert_eq!(doc.objects[0].stream.as_ref().unwrap().filter, "FlateDecode then ASCIIHexDecode");
+}
+
+#[test]
+fn a_filter_array_element_that_cannot_be_resolved_is_reported() {
+    let body = "<< /Length 4 /Filter [99 0 R] >>\nstream\nABCD\nendstream";
+    let doc = read(&build(&[Put::new(4, body)])).unwrap();
+
+    let filter = &doc.objects[0].stream.as_ref().unwrap().filter;
+    assert_eq!(filter, UNRESOLVED_FILTER);
+
+    let found = decode_stream(b"ABCD", filter, 1 << 20);
+    assert!(found.error.is_some_and(|said| said.contains(UNRESOLVED_FILTER)));
+}
+
+#[test]
+fn a_comment_does_not_hide_a_filter() {
+    for dict in [
+        "<< /Filter [%c\n/FlateDecode] /Length 4 >>",
+        "<< /Filter [%c ] d\n/FlateDecode] /Length 4 >>",
+        "<< /Filter %c d\n/FlateDecode /Length 4 >>",
+        "<< /Filter %c\n7 0 R /Length 4 >>",
+        "<< /Filter [%c\n7 0 R] /Length 4 >>",
+    ] {
+        let body = format!("{dict}\nstream\nABCD\nendstream");
+        let doc = read(&build(&[Put::new(4, &body), Put::new(7, "/FlateDecode")])).unwrap();
+        assert_eq!(doc.objects[0].stream.as_ref().unwrap().filter, "FlateDecode", "{dict}");
+    }
+
+    let body = "<< /Filter %c\n/FlateDecode /DecodeParms << /Predictor %c\n12 /Columns 4 >> /Length 4 >>\nstream\nABCD\nendstream";
+    let doc = read(&build(&[Put::new(4, body)])).unwrap();
+    assert_eq!(doc.objects[0].stream.as_ref().unwrap().filter, "FlateDecode predictor=12 columns=4");
+}
+
+#[test]
+fn a_percent_sign_in_a_string_is_not_a_comment() {
+    for dict in [
+        "<< /Title (100%) /Filter /FlateDecode /Length 4 >>",
+        "<< /Title (a \\) 100%) /Filter /FlateDecode /Length 4 >>",
+        "<< /Title (a (b) 100%) /Filter /FlateDecode /Length 4 >>",
+    ] {
+        let body = format!("{dict}\nstream\nABCD\nendstream");
+        let doc = read(&build(&[Put::new(4, &body)])).unwrap();
+        assert_eq!(doc.objects[0].stream.as_ref().unwrap().filter, "FlateDecode", "{dict}");
+    }
+}
+
+#[test]
+fn the_last_filter_a_dictionary_gives_is_the_one_read() {
+    for dict in [
+        "<< /Filter /DCTDecode /Filter /FlateDecode /Length 4 >>",
+        "<< /Filter /ASCIIHexDecode /Filter /FlateDecode /Length 4 >>",
+        "<< /Foo /Filter /Filter /FlateDecode /Length 4 >>",
+        "<< /Length 4 /Filter /FlateDecode /Foo /Filter >>",
+        // Names sitting where a value belongs, whatever they spell.
+        "<< /Length 4 /Filter /FlateDecode /A /Filter /DCTDecode /B >>",
+        "<< /Length 4 /A /Filter /B /F /Filter /FlateDecode >>",
+        "<< /Length 4 /Filter /FlateDecode /A [ /Filter /DCTDecode ] >>",
+        "<< /Length 4 /Filter /FlateDecode /A << /Filter /DCTDecode >> >>",
+        "<< /Length 4 /Filter /FlateDecode /A (/Filter /DCTDecode) >>",
+        "<< /Length 4 /Filter /FlateDecode /A <2F46> /B 5 0 R /C true /D null >>",
+        // A NUL is whitespace to a reader.
+        "<< /Length 4 /Filter\0/FlateDecode >>",
+    ] {
+        let body = format!("{dict}\nstream\nABCD\nendstream");
+        let doc = read(&build(&[Put::new(4, &body)])).unwrap();
+        assert_eq!(doc.objects[0].stream.as_ref().unwrap().filter, "FlateDecode", "{dict}");
+    }
+}
+
+#[test]
+fn a_name_where_a_value_belongs_is_not_a_filter() {
+    let doc = read(&build(&[Put::new(4, "<< /Length 4 /Foo /Filter /Bar /DCTDecode >>\nstream\nABCD\nendstream")])).unwrap();
+    assert_eq!(doc.objects[0].stream.as_ref().unwrap().filter, "");
+}
+
+#[test]
+fn a_value_is_stepped_over_whatever_follows_it() {
+    for dict in [
+        "<< /A 5 0 R /Filter /FlateDecode >>",
+        "<< /A 5 /Filter /FlateDecode >>",
+        "<< /A 5 0 /Filter /FlateDecode >>",
+        "<< /A 5\n\t0\r\nR/Filter /FlateDecode >>",
+        "<< /A 12345678901234567890123456789012345678901234567890 é /Filter /FlateDecode >>",
+    ] {
+        assert_eq!(filter_field(dict).as_deref(), Some("FlateDecode"), "{dict}");
+    }
+}
+
+#[test]
+fn deep_nesting_does_not_run_out_the_stack() {
+    let dict = format!("<< /A {} /Filter /FlateDecode >>", "[".repeat(1 << 20));
+    assert_eq!(field(&dict, "Filter"), None, "the array never closes, so to a reader this is all the array");
+
+    let dict = format!("<< /A {}{} /Filter /FlateDecode >>", "[".repeat(1 << 20), "]".repeat(1 << 20));
+    assert_eq!(filter_field(&dict).as_deref(), Some("FlateDecode"));
+}
+
+#[test]
+fn the_last_of_a_repeated_parameter_is_the_one_read() {
+    for parms in [
+        "/DecodeParms << /Predictor 1 /Predictor 12 /Columns 4 >>",
+        "/DecodeParms << /Predictor 3 >> /DecodeParms << /Predictor 12 /Columns 4 >>",
+        "/DecodeParms << /Predictor 12 /Columns 4 >> /Foo /DecodeParms /Bar 1",
+    ] {
+        let body = format!("<< /Filter /FlateDecode {parms} /Length 4 >>\nstream\nABCD\nendstream");
+        let doc = read(&build(&[Put::new(4, &body)])).unwrap();
+        assert_eq!(
+            doc.objects[0].stream.as_ref().unwrap().filter,
+            "FlateDecode predictor=12 columns=4",
+            "{parms}"
+        );
+    }
+}
+
+#[test]
+fn a_filter_can_go_by_its_short_key() {
+    assert_eq!(filter_field("<< /F /FlateDecode >>").as_deref(), Some("FlateDecode"));
+    assert_eq!(filter_field("<< /F (a file.bin) >>"), None);
+}
+
+fn filter_field(dict: &str) -> Option<String> {
+    filter_of(dict, &|_| None)
+}
+
+/// Data in a zlib wrapper, in one stored block.
+fn stored_zlib(data: &[u8]) -> Vec<u8> {
+    let length = data.len() as u16;
+    let mut out = vec![0x78, 0x01, 1];
+    out.extend_from_slice(&length.to_le_bytes());
+    out.extend_from_slice(&(!length).to_le_bytes());
+    out.extend_from_slice(data);
+
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in data {
+        a = (a + byte as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    out.extend_from_slice(&(b << 16 | a).to_be_bytes());
+    out
+}
+
+/// Text the way a PNG predictor leaves it, with the Sub filter on every row.
+fn png_sub(text: &[u8], columns: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for row in text.chunks(columns) {
+        out.push(1);
+        let mut left = 0u8;
+        for &byte in row {
+            out.push(byte.wrapping_sub(left));
+            left = byte;
+        }
+    }
+    out
+}
+
+#[test]
+fn a_png_predictor_is_undone() {
+    let text = b"BT (flag{predictor_hides_this}) Tj ET";
+    let zlib = stored_zlib(&png_sub(text, 8));
+
+    let found = decode_stream(&zlib, "FlateDecode predictor=11 columns=8", 1 << 20);
+    assert_eq!(found.error, None);
+    assert!(found.output.starts_with(text), "{:?}", String::from_utf8_lossy(&found.output));
+
+    let plain = decode_stream(&zlib, "FlateDecode", 1 << 20);
+    assert!(!plain.output.starts_with(text), "the predictor is what was hiding it");
+}
+
+#[test]
+fn a_tiff_predictor_is_undone() {
+    let text = b"flag{tiff_style}";
+    let mut held = text.to_vec();
+    for at in (1..held.len()).rev() {
+        held[at] = held[at].wrapping_sub(held[at - 1]);
+    }
+
+    let found = decode_stream(&stored_zlib(&held), &format!("FlateDecode predictor=2 columns={}", text.len()), 1 << 20);
+    assert_eq!(found.error, None);
+    assert_eq!(found.output, text);
+}
+
+#[test]
+fn a_predictor_that_cannot_be_undone_says_so_and_keeps_the_data() {
+    for filter in [
+        "FlateDecode predictor=7 columns=2",
+        "FlateDecode predictor=12 columns=4294967295 colors=4294967295",
+        "FlateDecode predictor=2 bits=4 columns=2",
+    ] {
+        let found = decode_stream(&stored_zlib(b"abcdefgh"), filter, 1 << 20);
+        assert!(found.error.is_some_and(|said| said.contains("predictor")), "{filter}");
+        assert_eq!(found.output, b"abcdefgh", "{filter}");
+    }
+}
+
+#[test]
+fn decode_parms_reach_the_filter_they_belong_to() {
+    let dict = "<< /Filter [/ASCIIHexDecode /FlateDecode] /DecodeParms [null << /Predictor 12 /Columns 4 >>] /Length 4 >>";
+    let body = format!("{dict}\nstream\nABCD\nendstream");
+    let doc = read(&build(&[Put::new(4, &body)])).unwrap();
+    assert_eq!(
+        doc.objects[0].stream.as_ref().unwrap().filter,
+        "ASCIIHexDecode then FlateDecode predictor=12 columns=4"
+    );
+
+    let body = "<< /Filter /FlateDecode /DecodeParms 8 0 R /Length 4 >>\nstream\nABCD\nendstream";
+    let held = "<< /Predictor 9 0 R /Columns 3 >>";
+    let doc = read(&build(&[Put::new(4, body), Put::new(8, held), Put::new(9, "15")])).unwrap();
+    assert_eq!(doc.objects[0].stream.as_ref().unwrap().filter, "FlateDecode predictor=15 columns=3");
+}
+
+#[test]
+fn an_adobe_opening_on_ascii85_is_no_part_of_the_data() {
+    let found = decode_stream(b"<~87cURD]i,\"Ebo80~>", "ASCII85Decode", 1 << 20);
+    assert_eq!(found.output, b"Hello World!");
+}
+
+#[test]
+fn lzw_widens_a_code_later_when_a_stream_says_to() {
+    // A clear, then more than 253 literals, the last few at ten bits with early change off.
+    let (mut hold, mut bits, mut out) = (0u32, 0u32, Vec::new());
+    let mut put = |code: u32, width: u32, out: &mut Vec<u8>| {
+        hold = (hold << width) | code;
+        bits += width;
+        while bits >= 8 {
+            bits -= 8;
+            out.push((hold >> bits) as u8);
+        }
+    };
+
+    put(256, 9, &mut out);
+    let text: Vec<u8> = (0..260u32).map(|i| b'a' + (i % 26) as u8).collect();
+    for (index, &byte) in text.iter().enumerate() {
+        // Each code after the first adds an entry, so the next code to be defined is 258
+        // plus how many went before, and it widens once that passes 511 with no early change.
+        let width = if 258 + index > 512 { 10 } else { 9 };
+        put(byte as u32, width, &mut out);
+    }
+    put(257, 10, &mut out);
+    put(0, 7, &mut out);
+
+    let found = decode_stream(&out, "LZWDecode early=0", 1 << 20);
+    assert_eq!(found.error, None);
+    assert_eq!(found.output, text);
+}
+
+#[test]
+fn a_table_that_cannot_be_read_says_so() {
+    let doc = read(b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\ntrailer<</Size 2>>\n%%EOF\n").unwrap();
+    assert!(doc.xref_unread);
+    assert!(!doc.objects[0].orphaned);
+}
+
+#[test]
+fn an_offset_past_32_bits_does_not_cost_the_rest_of_the_table() {
+    let body = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n2 0 obj\n<<>>\nendobj\n";
+    let mut file = body.to_vec();
+    let xref = file.len();
+    file.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \n");
+    file.extend_from_slice(b"3 1\n9999999999 00000 n \n");
+    file.extend_from_slice(format!("trailer<</Size 4>>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+
+    let doc = read(&file).unwrap();
+    assert!(!doc.xref_unread);
+    assert!(!doc.objects[0].orphaned, "the table names it");
+    assert!(doc.objects[1].orphaned, "the table does not");
+}
+
+#[test]
+fn a_chain_longer_than_the_limit_says_so() {
+    let mut layered = b"flag{under_nine_layers}".to_vec();
+    for _ in 0..9 {
+        layered = layered.iter().flat_map(|b| format!("{b:02x}").into_bytes()).collect();
+    }
+
+    let eight = ["ASCIIHexDecode"; 8].join(" then ");
+    let found = decode_stream(&layered, &eight, 1 << 20);
+    assert_eq!(found.error, None);
+
+    let nine = ["ASCIIHexDecode"; 9].join(" then ");
+    let found = decode_stream(&layered, &nine, 1 << 20);
+    assert!(found.error.as_deref().is_some_and(|said| said.contains("9 filters")), "{:?}", found.error);
+    assert!(!found.output.is_empty(), "what came out of the eight is kept");
+}
+
+#[test]
+fn every_filter_in_a_chain_is_undone_in_order() {
+    let zlib = {
+        // A stored block, so the test does not need a compressor.
+        let text = b"flag{through_the_chain}";
+        let mut out = vec![0x78, 0x01, 0x01];
+        out.extend_from_slice(&(text.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(!(text.len() as u16)).to_le_bytes());
+        out.extend_from_slice(text);
+        let adler = text
+            .iter()
+            .fold((1u32, 0u32), |(a, b), &byte| {
+                let a = (a + byte as u32) % 65521;
+                (a, (b + a) % 65521)
+            });
+        out.extend_from_slice(&(adler.1 << 16 | adler.0).to_be_bytes());
+        out
+    };
+
+    let hex: String = zlib.iter().map(|b| format!("{b:02x}")).collect();
+    let found = decode_stream(format!("{hex} >").as_bytes(), "ASCIIHexDecode then FlateDecode", 1 << 20);
+    assert_eq!(found.error, None);
+    assert_eq!(found.output, b"flag{through_the_chain}");
+
+    let found = decode_stream(&zlib, "FlateDecode", 1 << 20);
+    assert_eq!(found.output, b"flag{through_the_chain}");
+}
+
+#[test]
+fn ascii85_reads_the_way_its_definition_says() {
+    // "Man " and "sure" are the textbook example, and the tail covers a short group.
+    let found = decode_stream(b"9jqo^F*2M7/c~>", "ASCII85Decode", 1 << 20);
+    assert_eq!(found.error, None);
+    assert_eq!(found.output, b"Man sure.");
+
+    let found = decode_stream(b"z 9jqo^~>", "ASCII85Decode", 1 << 20);
+    assert_eq!(found.output, b"\0\0\0\0Man ");
+
+    let found = decode_stream(b"9jqo^\x7f", "ASCII85Decode", 1 << 20);
+    assert_eq!(found.output, b"Man ");
+    assert!(found.error.is_some());
+}
+
+#[test]
+fn run_length_reads_the_way_its_definition_says() {
+    let found = decode_stream(&[2, b'a', b'b', b'c', 254, b'z', 128, 9, 9], "RunLengthDecode", 1 << 20);
+    assert_eq!(found.error, None);
+    assert_eq!(found.output, b"abczzz");
+
+    let found = decode_stream(&[129, b'z'], "RunLengthDecode", 10);
+    assert_eq!(found.output, vec![b'z'; 10]);
+    assert!(found.capped);
+
+    let found = decode_stream(&[5, b'a'], "RunLengthDecode", 10);
+    assert_eq!(found.output, b"a");
+    assert!(found.error.is_some());
+}
+
+#[test]
+fn lzw_reads_what_a_pdf_writer_writes() {
+    // The worked example from the format's own specification: -----A---B.
+    let packed = [0x80, 0x0b, 0x60, 0x50, 0x22, 0x0c, 0x0c, 0x85, 0x01];
+    let found = decode_stream(&packed, "LZWDecode", 1 << 20);
+    assert_eq!(found.error, None);
+    assert_eq!(found.output, [45, 45, 45, 45, 45, 65, 45, 45, 45, 66]);
+
+    let found = decode_stream(&packed, "LZWDecode", 4);
+    assert!(found.capped);
+    assert!(found.output.len() <= 5);
+}
+
+#[test]
+fn a_filter_this_cannot_read_stops_the_chain_and_says_which() {
+    let found = decode_stream(b"41 42>", "ASCIIHexDecode then DCTDecode", 1 << 20);
+    assert_eq!(found.output, b"AB");
+    assert!(found.error.unwrap().contains("DCTDecode"));
+}
+
+#[test]
+fn a_chain_keeps_what_the_failing_filter_managed() {
+    // Hex digits, then one that is not.
+    let found = decode_stream(b"4142zz", "ASCIIHexDecode then FlateDecode", 1 << 20);
+    assert_eq!(found.output, b"AB");
+    assert!(found.error.is_some());
+}
+
+#[test]
+fn objects_that_say_nothing_are_not_all_listed_and_the_rest_are() {
+    let mut file = b"%PDF-1.7\n".to_vec();
+    file.extend_from_slice(&b"1 0 obj\n".repeat(MAX_PLAIN_OBJECTS_LISTED + 500));
+    file.extend_from_slice(b"7 0 obj\n<< /Filter /FlateDecode /Length 4 >>\nstream\nABCD\nendstream\nendobj\n");
+
+    let text = json(&file);
+    assert!(crate::json::is_well_formed(&text));
+    assert!(text.contains(&format!("\"objectCount\":{}", MAX_PLAIN_OBJECTS_LISTED + 501)));
+    assert_eq!(text.matches("\"orphaned\":").count(), MAX_PLAIN_OBJECTS_LISTED + 1);
+    assert!(text.contains("\"filter\":\"FlateDecode\""), "the stream past them is still there");
+}
+
+#[test]
 fn json_output_is_well_formed_with_every_field_populated() {
     // One object of each shape this module reports on: a plain dictionary, a
     // stream with a filter, an unlisted object, and an embedded file, so

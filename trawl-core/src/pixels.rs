@@ -16,7 +16,9 @@ pub const MAX_PIXELS: usize = 1 << 27;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Raster {
     pub width: usize,
+    /// The rows actually decoded, which a damaged PNG can leave short of what it declared.
     pub height: usize,
+    pub declared_height: usize,
     pub rgba: Vec<u8>,
     /// False when the alpha channel is a synthesised 255, so the sweep can skip
     /// combinations that would only ever read a constant.
@@ -26,16 +28,16 @@ pub struct Raster {
 
 /// Decodes to RGBA8.
 ///
-/// @param inflated the already-inflated IDAT stream, which only PNG needs.
-///        `DecompressionStream` does that on the JS side; BMP is uncompressed
-///        and GIF carries its own LZW, so both ignore this.
+/// @param inflated the already-inflated IDAT stream, which only PNG needs. BMP is
+///        uncompressed and GIF carries its own LZW, so both ignore this.
 pub fn decode(file: &[u8], inflated: &[u8]) -> Result<Raster, String> {
     if png::has_signature(file) {
         let header = png::header(file).map_err(|e| e.to_string())?;
-        let rgba = png::decode(file, inflated).map_err(|e| e.to_string())?;
+        let (rgba, rows) = png::decode_available(file, inflated).map_err(|e| e.to_string())?;
         return Ok(Raster {
             width: header.width as usize,
-            height: header.height as usize,
+            height: rows,
+            declared_height: header.height as usize,
             rgba,
             has_alpha: matches!(header.color_type, 4 | 6),
             format: "PNG",
@@ -47,6 +49,7 @@ pub fn decode(file: &[u8], inflated: &[u8]) -> Result<Raster, String> {
         return Ok(Raster {
             width: header.width,
             height: header.height,
+            declared_height: header.height,
             rgba,
             has_alpha: header.bits_per_pixel == 32,
             format: "BMP",
@@ -58,6 +61,7 @@ pub fn decode(file: &[u8], inflated: &[u8]) -> Result<Raster, String> {
         return Ok(Raster {
             width: header.width,
             height: header.height,
+            declared_height: header.height,
             rgba,
             // GIF alpha is a single fully transparent index rather than a
             // channel, so sweeping it would read one bit of nothing.

@@ -1,6 +1,5 @@
 <script lang="ts">
 	type Row = {
-		key: string;
 		/** The channel selection, shown large. */
 		title: string;
 		/** Everything else about the read: bit plane, bit order, traversal. */
@@ -39,8 +38,9 @@
 	<p class="clear">{blocked}{error ? ` ${error}` : ''}</p>
 {:else if rows.length === 0}
 	<p class="clear">
-		Swept {combinations} parameter combinations across {over}. None produced a file signature,
-		printable text, or a flag shape. That does not rule out an encrypted or non-sequential payload.
+		Read the first 4 KB of each of {combinations} combinations across {over}. None produced a file
+		signature, printable text, or a flag shape. That does not rule out a payload that starts further
+		in, is encrypted, or is not sequential.
 	</p>
 {:else}
 	<p class="lead">
@@ -48,7 +48,7 @@
 	</p>
 
 	<ul class="hits">
-		{#each rows as row (row.key)}
+		{#each rows as row, i (i)}
 			<li>
 				<div class="params">
 					<span class="mono channels">{row.title}</span>

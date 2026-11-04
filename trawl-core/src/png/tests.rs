@@ -629,6 +629,182 @@ fn a_huge_interlaced_header_on_a_tiny_file_is_refused() {
     ));
 }
 
+/// Three rows of a 2 by 3 truecolour image, unfiltered, each pixel's bytes its own number.
+fn three_rows() -> Vec<u8> {
+    vec![
+        0, 1, 2, 3, 4, 5, 6, //
+        0, 7, 8, 9, 10, 11, 12, //
+        0, 13, 14, 15, 16, 17, 18,
+    ]
+}
+
+#[test]
+fn whole_data_decodes_the_same_way_either_way() {
+    let file = bare(2, 3, 8, 2, 0);
+    let (rgba, rows) = decode_available(&file, &three_rows()).unwrap();
+    assert_eq!(rows, 3);
+    assert_eq!(rgba, decode(&file, &three_rows()).unwrap());
+}
+
+#[test]
+fn data_cut_short_gives_the_rows_it_reached() {
+    let file = bare(2, 3, 8, 2, 0);
+    let data = three_rows();
+
+    // Two whole rows and the start of a third, which stays strict in `decode`.
+    assert!(decode(&file, &data[..17]).is_err());
+    let (rgba, rows) = decode_available(&file, &data[..17]).unwrap();
+    assert_eq!(rows, 3);
+    assert_eq!(rgba.len(), 2 * 3 * 4);
+    assert_eq!(&rgba[..3], &[1, 2, 3]);
+    assert_eq!(&rgba[16..19], &[13, 14, 0], "the part of the row that arrived");
+    assert_eq!(&rgba[20..23], &[0, 0, 0], "and the rest is zero");
+
+    let (rgba, rows) = decode_available(&file, &data[..14]).unwrap();
+    assert_eq!(rows, 2);
+    assert_eq!(rgba.len(), 2 * 2 * 4);
+}
+
+#[test]
+fn a_row_with_a_filter_that_does_not_exist_ends_the_image_there() {
+    let file = bare(2, 3, 8, 2, 0);
+    let mut data = three_rows();
+    data[14] = 9;
+
+    assert!(decode(&file, &data).is_err());
+    let (rgba, rows) = decode_available(&file, &data).unwrap();
+    assert_eq!(rows, 2);
+    assert_eq!(rgba.len(), 2 * 2 * 4);
+
+    data[0] = 9;
+    assert_eq!(decode_available(&file, &data), Err(PngError::BadFilterType(9)));
+}
+
+#[test]
+fn a_palette_index_past_the_end_is_black_rather_than_the_end_of_the_image() {
+    let file = png(2, 1, 8, 3, &[chunk(b"PLTE", &[9, 9, 9])]);
+    let data = [0, 0, 200];
+
+    assert!(decode(&file, &data).is_err());
+    let (rgba, rows) = decode_available(&file, &data).unwrap();
+    assert_eq!(rows, 1);
+    assert_eq!(&rgba[..3], &[9, 9, 9]);
+    assert_eq!(&rgba[4..7], &[0, 0, 0]);
+}
+
+#[test]
+fn nothing_at_all_is_still_nothing_to_decode() {
+    let file = bare(2, 3, 8, 2, 0);
+    assert!(matches!(
+        decode_available(&file, &[]),
+        Err(PngError::ShortPixelData { .. })
+    ));
+    assert_eq!(
+        decode_available(&bare(65_536, 65_536, 8, 6, 0), &[0u8; 100]),
+        Err(PngError::TooLarge)
+    );
+}
+
+#[test]
+fn a_row_too_long_to_finish_is_not_filled_out() {
+    // One row of a gigabyte, and four bytes of it. Padding that is the attack.
+    let file = bare(1 << 27, 1, 16, 6, 0);
+    assert!(matches!(
+        decode_available(&file, &[0, 1, 2, 3]),
+        Err(PngError::ShortPixelData { .. })
+    ));
+}
+
+#[test]
+fn an_interlaced_image_short_of_data_is_still_refused_before_its_canvas_exists() {
+    let file = bare(8192, 8192, 8, 6, 1);
+    assert!(matches!(
+        decode_available(&file, &[0u8; 16]),
+        Err(PngError::ShortPixelData { .. })
+    ));
+}
+
+#[test]
+fn the_indices_of_a_damaged_image_are_read_as_far_as_they_go() {
+    let file = png(2, 3, 8, 3, &[chunk(b"PLTE", &[0; 12])]);
+    let data = [0, 1, 2, 0, 3, 0, 0, 1];
+    assert_eq!(palette_indices(&file, &data), Some(vec![1, 2, 3, 0]));
+    assert_eq!(palette_indices(&file, &data[..2]), None);
+}
+
+#[test]
+fn a_file_cut_off_inside_its_last_idat_still_gives_what_it_holds() {
+    let mut file = Vec::new();
+    file.extend_from_slice(&SIGNATURE);
+    file.extend_from_slice(&ihdr(2, 3, 8, 2, 0));
+    file.extend_from_slice(&chunk(b"IDAT", b"whole"));
+    file.extend_from_slice(&chunk(b"IDAT", b"then cut"));
+    let cut = file.len() - 4 - 3;
+    file.truncate(cut);
+
+    assert_eq!(idat(&file), b"wholethen ");
+
+    // A chunk of another kind, cut off the same way, is none of this.
+    let mut other = Vec::new();
+    other.extend_from_slice(&SIGNATURE);
+    other.extend_from_slice(&ihdr(2, 3, 8, 2, 0));
+    other.extend_from_slice(&chunk(b"IDAT", b"whole"));
+    other.extend_from_slice(&chunk(b"tEXt", b"then cut"));
+    let cut = other.len() - 4 - 3;
+    other.truncate(cut);
+    assert_eq!(idat(&other), b"whole");
+}
+
+#[test]
+fn a_named_tag_is_credited_wherever_it_sits() {
+    let mut data = b"Secret".to_vec();
+    data.extend_from_slice(&[0, 0]);
+    data.extend_from_slice(b"flag{inside_ztxt}");
+    let file = png(2, 2, 8, 2, &[chunk(b"zTXt", &data), chunk(b"IDAT", b"\x78\x01 abc{not_named} ")]);
+
+    let (found, truncated) = located_flags_for_tags(&file, &["flag".to_string()]);
+    assert!(!truncated);
+    let named = found.iter().find(|f| f.text == "flag{inside_ztxt}").unwrap();
+    assert!(named.credible);
+    assert_eq!(named.region, "inside zTXt");
+
+    // The shape nobody named is still judged by where it is.
+    let unnamed = found.iter().find(|f| f.text == "abc{not_named}").unwrap();
+    assert!(!unnamed.credible);
+}
+
+#[test]
+fn configured_tags_reach_the_walk() {
+    let mut text = b"Comment".to_vec();
+    text.push(0);
+    text.extend_from_slice(b"HV{two_letter_tag}");
+    let file = png(2, 2, 8, 2, &[chunk(b"tEXt", &text)]);
+
+    let json = structure_json_for_tags(&file, &["HV".to_string()]);
+    assert!(crate::json::is_well_formed(&json), "{json}");
+    assert!(json.contains("\"text\":\"HV{two_letter_tag}\",\"region\":\"inside tEXt\""), "{json}");
+    assert!(json.contains("\"flagsTruncated\":false"));
+
+    assert!(!structure_json(&file).contains("\"text\":\"HV{two_letter_tag}\",\"region\""));
+}
+
+#[test]
+fn a_walk_of_a_great_many_chunks_lists_some_and_counts_them_all() {
+    let empty = chunk(b"aaAa", &[]);
+    let text = chunk(b"tEXt", b"k\0");
+    let mut file = SIGNATURE.to_vec();
+    file.extend_from_slice(&ihdr(1, 1, 8, 0, 0));
+    file.extend_from_slice(&empty.repeat(MAX_CHUNKS_LISTED));
+    file.extend_from_slice(&text.repeat(MAX_TEXT_LISTED + 7));
+
+    let json = structure_json(&file);
+    assert!(crate::json::is_well_formed(&json));
+    assert!(json.contains(&format!("\"chunkCount\":{}", 1 + MAX_CHUNKS_LISTED + MAX_TEXT_LISTED + 7)));
+    assert!(json.contains(&format!("\"textCount\":{}", MAX_TEXT_LISTED + 7)));
+    assert_eq!(json.matches("\"crcOk\":").count(), MAX_CHUNKS_LISTED);
+    assert_eq!(json.matches("\"keyword\":").count(), MAX_TEXT_LISTED);
+}
+
 #[test]
 fn a_one_bit_image_cannot_turn_a_small_stream_into_gigabytes() {
     // Two bytes a row at one bit per pixel, so the inflated data fits a test while

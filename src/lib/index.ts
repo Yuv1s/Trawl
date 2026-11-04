@@ -14,6 +14,9 @@ export function setTourChoice(choice: TourChoice): void {
 }
 
 export const SCANNER_TOKEN_KEY = 'trawl.scanner.token';
+/** What this page generates. The token goes into a shell line the person pastes, so
+ *  whatever else is stored here, by anything else this origin has served, is ignored. */
+const TOKEN_SHAPE = /^[0-9a-f]{64}$/;
 const ANALYSE_PREFIX = 'trawl.analyse.';
 
 /** Where the scanner listens. The default is IPv4 because that is what the scanner
@@ -44,7 +47,8 @@ export function takeAddress(code: string): string | null {
 }
 
 export function getScannerToken(): string | null {
-	return readSetting(SCANNER_TOKEN_KEY);
+	const token = readSetting(SCANNER_TOKEN_KEY);
+	return token && TOKEN_SHAPE.test(token) ? token : null;
 }
 
 export function getOrCreateScannerToken(): string {

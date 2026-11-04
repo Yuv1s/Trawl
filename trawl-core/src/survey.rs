@@ -85,7 +85,21 @@ fn exif_block(data: &[u8]) -> Option<&[u8]> {
     None
 }
 
+/// The survey with no tags named, so where a flag sits is all it has to go on.
 pub fn json(data: &[u8]) -> String {
+    survey(data, &[], false)
+}
+
+/// The survey for a caller that has said which tags it is looking for.
+pub fn json_for_tags(data: &[u8], tags: &[String]) -> String {
+    survey(data, tags, true)
+}
+
+/// @param trust_tags keep a recognised or configured tag credible whatever is around it.
+///        Noise throws up a brace shape often enough to need judging, and a tag somebody
+///        named comes up by chance once in tens of gigabytes. Six hundred random bytes on
+///        either side of a flag are how it gets hidden, and nothing else is.
+fn survey(data: &[u8], tags: &[String], trust_tags: bool) -> String {
     let mut out = String::from("{");
 
     push_number(&mut out, "size", data.len());
@@ -120,36 +134,46 @@ pub fn json(data: &[u8]) -> String {
     };
 
     let end = format_end(data);
-    for found in bytes::flag_candidates(data) {
-        let (region, ok) = credible(data, &found, end);
+    let plain = bytes::scan_flags(data, tags, false);
+    for found in &plain.found {
+        let (region, ok) = credible(data, found, end);
+        let ok = ok || (trust_tags && bytes::tag_is_named(&found.text, tags));
         emit_flag(&mut out, found.offset, &found.text, &region, ok);
     }
 
     // A flag written as UTF-16LE has a null between every character, so the
     // byte-level scan walks straight past it. Search the decoded text as well.
-    let mut left = bytes::MAX_FLAGS;
+    let mut wide_flags = bytes::FlagList::default();
     for wide in bytes::utf16le_strings(data, STRING_MIN) {
-        for found in bytes::flag_candidates(wide.text.as_bytes()) {
-            if left == 0 {
-                break;
-            }
-            left -= 1;
-            emit_flag(
-                &mut out,
-                wide.offset + found.offset * 2,
-                &found.text,
-                "UTF-16LE text",
-                true,
+        for found in bytes::scan_flags(wide.text.as_bytes(), tags, false).found {
+            let named = bytes::tag_is_named(&found.text, tags);
+            wide_flags.offer(
+                bytes::Found {
+                    offset: wide.offset + found.offset * 2,
+                    text: found.text,
+                },
+                named,
             );
         }
+    }
+    let wide = wide_flags.finish();
+    for found in &wide.found {
+        emit_flag(&mut out, found.offset, &found.text, "UTF-16LE text", true);
     }
 
     out.push(']');
 
     out.push(',');
+    push_bool(&mut out, "flagsTruncated", plain.truncated || wide.truncated);
+
+    let (magic, magic_omitted) = bytes::magic_scan_counted(data);
+    out.push(',');
+    push_number(&mut out, "magicOmitted", magic_omitted);
+
+    out.push(',');
     push_string(&mut out, "magic");
     out.push_str(":[");
-    for (i, hit) in bytes::magic_scan(data).iter().enumerate() {
+    for (i, hit) in magic.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }

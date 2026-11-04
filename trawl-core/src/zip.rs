@@ -25,9 +25,9 @@ const END: &[u8; 4] = b"PK\x05\x06";
 const DESCRIPTOR: &[u8; 4] = b"PK\x07\x08";
 
 /// Most entries read from either place. A header is thirty bytes, so a file of nothing
-/// else would report far more text than it holds, and the format's own limit without
-/// its 64-bit extension is 65,535.
-const MAX_ENTRIES: usize = 1 << 17;
+/// else would report far more text than it holds, and this is the format's own limit
+/// without its 64-bit extension. An archive past it is told so.
+const MAX_ENTRIES: usize = 1 << 16;
 
 /// Bytes a local file header occupies before the name begins.
 const LOCAL_HEADER: usize = 30;
@@ -99,6 +99,10 @@ fn readable(raw: &[u8]) -> String {
 pub struct Entry {
     pub name: String,
     pub method: &'static str,
+    /// What the local header called the method, when the directory calls it otherwise.
+    pub local_method: Option<&'static str>,
+    /// The directory's numbers when it lists this entry, since those are what every
+    /// reader goes by. What the header says instead is in `disagreement`.
     pub compressed: u64,
     pub uncompressed: u64,
     pub crc: u32,
@@ -108,6 +112,10 @@ pub struct Entry {
     /// name. None for a phantom the directory points at with no header of its
     /// own, since there is no data to point to.
     pub data_offset: Option<usize>,
+    /// How many bytes from `data_offset` to read: the longest either description makes
+    /// possible, so a size zeroed or inflated in one place does not hide what the other
+    /// describes.
+    pub read_length: usize,
     /// The archive's own password flag. Trawl does not crack these.
     ///
     /// Set only when both places say so. The two disagreeing is pseudo-encryption,
@@ -148,6 +156,8 @@ pub struct Archive {
     /// Compared against what it actually lists, since the count is a separate
     /// field and can be edited on its own.
     pub declared: usize,
+    /// True when the walk stopped at [`MAX_ENTRIES`] with more of the file to go.
+    pub capped: bool,
 }
 
 /// A header read out of a local file record, if the bytes really are one.
@@ -176,11 +186,13 @@ fn local_at(data: &[u8], at: usize) -> Option<Entry> {
     Some(Entry {
         name: readable(name),
         method: method_name(method),
+        local_method: None,
         crc: u32_at(data, at + 14)?,
         compressed: u32_at(data, at + 18)? as u64,
         uncompressed: u32_at(data, at + 22)? as u64,
         offset: at,
         data_offset: Some(name_at + name_len + extra_len),
+        read_length: 0,
         // Bit zero is the archive saying its own data is encrypted.
         encrypted: flags & 1 == 1,
         // Bit three says the three fields above are zero here, and come after the data.
@@ -191,11 +203,12 @@ fn local_at(data: &[u8], at: usize) -> Option<Entry> {
     })
 }
 
-/// Every local header in the file, in the order they appear.
+/// Every local header in the file, in the order they appear, and whether the walk
+/// stopped at the limit before the end of the file.
 ///
 /// Walked rather than followed from the directory, so an entry the directory
 /// never mentions is still found. That is the whole point.
-fn locals(data: &[u8]) -> Vec<Entry> {
+fn locals(data: &[u8]) -> (Vec<Entry>, bool) {
     let mut out = Vec::new();
     let mut at = 0usize;
 
@@ -221,7 +234,8 @@ fn locals(data: &[u8]) -> Vec<Entry> {
         }
     }
 
-    out
+    let capped = out.len() >= MAX_ENTRIES && bytes::find(data, at, LOCAL).is_some();
+    (out, capped)
 }
 
 /// Fills in a streamed entry's sizes from the descriptor that follows its data.
@@ -451,7 +465,7 @@ fn covered(spans: &[(usize, usize)], offset: usize) -> bool {
 /// says. One with headers but no directory is a zip somebody truncated or
 /// stripped, and it is still worth reporting, so that case comes back.
 pub fn read(data: &[u8]) -> Option<Archive> {
-    let mut entries = locals(data);
+    let (mut entries, capped) = locals(data);
     if entries.is_empty() {
         return None;
     }
@@ -465,27 +479,53 @@ pub fn read(data: &[u8]) -> Option<Archive> {
         .map(|(index, entry)| (entry.offset, index))
         .collect();
 
+    // What the local header claimed for each entry the directory also lists, for
+    // working out what is inside what once the directory's numbers have replaced it.
+    let mut local_claims: HashMap<usize, u64> = HashMap::new();
+
+    // Everywhere an entry starts, which is as far as looking for a descriptor has to go.
+    let mut starts: Vec<usize> = records
+        .iter()
+        .map(|record| record.points_at)
+        .chain(entries.iter().map(|entry| entry.offset))
+        .collect();
+    starts.sort_unstable();
+
     // Matched by where the directory points, since that is the only link the
     // format actually defines. Names are not unique and can be edited freely.
     for record in &records {
+        // A header the walk stopped short of, or stepped over, is still a header.
+        if !at_offset.contains_key(&record.points_at)
+            && let Some(mut entry) = local_at(data, record.points_at)
+        {
+            if entry.streamed {
+                let next = starts.partition_point(|&start| start <= record.points_at);
+                let bound = starts.get(next).copied().unwrap_or(data.len());
+                read_descriptor(data, &mut entry, bound);
+            }
+            at_offset.insert(entry.offset, entries.len());
+            entries.push(entry);
+        }
+
         match at_offset.get(&record.points_at).map(|&index| &mut entries[index]) {
             Some(entry) => {
                 entry.undeclared = false;
                 entry.comment = record.comment.clone();
                 entry.disagreement = compare(entry, record);
                 entry.encrypted &= record.encrypted;
-                // What the header left out, the directory supplies.
-                if entry.streamed {
-                    if entry.compressed == 0 {
-                        entry.compressed = record.compressed;
-                    }
-                    if entry.uncompressed == 0 {
-                        entry.uncompressed = record.uncompressed;
-                    }
-                    if entry.crc == 0 {
-                        entry.crc = record.crc;
-                    }
+                local_claims.insert(entry.offset, entry.compressed);
+
+                // The directory is what every reader goes by. A header saying nothing
+                // or anything else leaves the entry where the directory put it, and
+                // the difference has already been written down above.
+                entry.compressed = record.compressed;
+                entry.uncompressed = record.uncompressed;
+                entry.crc = record.crc;
+                if entry.method != record.method && record.method != "unknown" {
+                    entry.local_method = Some(entry.method);
+                    entry.method = record.method;
                 }
+
                 // The directory's name is the one readers show, so a name that
                 // differs between the two is worth saying out loud.
                 if entry.name != record.name {
@@ -506,11 +546,13 @@ pub fn read(data: &[u8]) -> Option<Archive> {
                 entries.push(Entry {
                     name: record.name.clone(),
                     method: record.method,
+                    local_method: None,
                     compressed: record.compressed,
                     uncompressed: record.uncompressed,
                     crc: record.crc,
                     offset: record.points_at,
                     data_offset: None,
+                    read_length: 0,
                     encrypted: record.encrypted,
                     streamed: false,
                     comment: record.comment.clone(),
@@ -521,15 +563,24 @@ pub fn read(data: &[u8]) -> Option<Archive> {
         }
     }
 
+    set_read_lengths(data, &mut entries, &local_claims);
+
     // A header inside a listed file's stored data belongs to that file, such as a
-    // ZIP stored in a ZIP. It is not this archive hiding an entry.
+    // ZIP stored in a ZIP. It is not this archive hiding an entry. Measured by the
+    // shorter claim, since a directory stretched over the rest of the file would
+    // otherwise swallow whatever it wanted hidden.
     let inside = merged(
         entries
             .iter()
             .filter(|e| !e.undeclared && e.method == "stored")
             .filter_map(|e| {
                 let start = e.data_offset?;
-                Some((start, start.saturating_add(e.compressed as usize)))
+                let local = local_claims.get(&e.offset).copied().unwrap_or(e.compressed);
+                let claim = match local {
+                    0 => e.compressed,
+                    local => local.min(e.compressed),
+                };
+                Some((start, start.saturating_add(claim as usize)))
             })
             .collect(),
     );
@@ -544,11 +595,51 @@ pub fn read(data: &[u8]) -> Option<Archive> {
         prefix,
         trailing,
         declared: declared_count,
+        capped,
     })
 }
 
+/// How much of the file each entry's data can be read from.
+///
+/// A claim running past the end of the file is impossible, and a zero is what a header
+/// says when it has been cleared, so the longest claim that fits is the one taken. With
+/// nothing that fits, what is there runs to the next header: deflate stops itself, and
+/// stored data is better read with a tail than not at all.
+fn set_read_lengths(data: &[u8], entries: &mut [Entry], local_claims: &HashMap<usize, u64>) {
+    let mut headers: Vec<usize> = entries
+        .iter()
+        .filter(|e| e.data_offset.is_some())
+        .map(|e| e.offset)
+        .collect();
+    headers.sort_unstable();
+
+    for entry in entries.iter_mut() {
+        let Some(start) = entry.data_offset else {
+            continue;
+        };
+        let available = data.len().saturating_sub(start) as u64;
+        let local = local_claims.get(&entry.offset).copied().unwrap_or(entry.compressed);
+
+        let longest = [entry.compressed, local].into_iter().filter(|&claim| claim <= available).max();
+        let said_something = entry.compressed != 0 || local != 0 || entry.uncompressed != 0;
+
+        entry.read_length = match longest {
+            Some(claim) if claim > 0 => claim as usize,
+            // Nothing was claimed. That is an empty file, unless the writer promised to
+            // say later and never did, or claims to hold something after all.
+            Some(_) if !said_something && !entry.streamed => 0,
+            _ => to_next_header(data.len(), start, &headers),
+        };
+    }
+}
+
+fn to_next_header(end: usize, start: usize, headers: &[usize]) -> usize {
+    let next = headers.partition_point(|&offset| offset < start);
+    headers.get(next).copied().unwrap_or(end).min(end).saturating_sub(start)
+}
+
 pub fn json(data: &[u8]) -> String {
-    use crate::json::{push_field, push_number, push_string};
+    use crate::json::{push_bool, push_field, push_number, push_string};
 
     let Some(archive) = read(data) else {
         return "null".to_string();
@@ -560,6 +651,8 @@ pub fn json(data: &[u8]) -> String {
     push_number(&mut out, "trailing", archive.trailing);
     out.push(',');
     push_number(&mut out, "declared", archive.declared);
+    out.push(',');
+    push_bool(&mut out, "capped", archive.capped);
     out.push(',');
     push_field(&mut out, "comment", &archive.comment);
     out.push(',');
@@ -575,11 +668,22 @@ pub fn json(data: &[u8]) -> String {
         out.push(',');
         push_field(&mut out, "method", entry.method);
         out.push(',');
+        push_string(&mut out, "localMethod");
+        match entry.local_method {
+            Some(method) => {
+                out.push(':');
+                push_string(&mut out, method);
+            }
+            None => out.push_str(":null"),
+        }
+        out.push(',');
         push_number(&mut out, "compressed", entry.compressed as usize);
         out.push(',');
         push_number(&mut out, "uncompressed", entry.uncompressed as usize);
         out.push(',');
         push_number(&mut out, "offset", entry.offset);
+        out.push(',');
+        push_number(&mut out, "readLength", entry.read_length);
         out.push(',');
         push_string(&mut out, "dataOffset");
         match entry.data_offset {

@@ -174,3 +174,42 @@ fn decode_url_turns_a_filename_flag_back() {
     // A stray percent that is not an escape is left alone.
     assert_eq!(decode_url("/a%zz/b"), "/a%zz/b");
 }
+
+#[test]
+fn repeated_attributes_cost_neither_memory_nor_time() {
+    // Every bare value used to run to the next space, which here is the end of the page,
+    // and each one was copied: gigabytes from a body the fetch cap allows.
+    let base = Url::parse("https://example.test/").unwrap();
+    let body = "href=".repeat(2 * 1024 * 1024 / 5);
+
+    let started = std::time::Instant::now();
+    let found = references(&base, body.as_bytes());
+
+    assert!(found.len() <= MAX_REFERENCES);
+    assert!(
+        started.elapsed().as_secs() < 10,
+        "took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn an_overlong_value_is_skipped_and_the_links_after_it_are_still_read() {
+    let base = Url::parse("https://example.test/").unwrap();
+    let long = "é".repeat(MAX_ATTRIBUTE_VALUE);
+    let body = format!("<a href=\"{long}\">x</a><a href=\"/after\">y</a><a href=/bare>z</a>");
+
+    let urls: Vec<String> = references(&base, body.as_bytes())
+        .into_iter()
+        .map(|found| found.url)
+        .collect();
+
+    assert!(
+        urls.contains(&"https://example.test/after".to_string()),
+        "{urls:?}"
+    );
+    assert!(
+        urls.contains(&"https://example.test/bare".to_string()),
+        "{urls:?}"
+    );
+}
