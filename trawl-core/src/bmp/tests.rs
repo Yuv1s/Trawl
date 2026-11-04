@@ -183,6 +183,82 @@ fn a_truncated_file_is_reported_not_read_past() {
     assert_eq!(decode(&file[..file.len() - 4]), Err(BmpError::Truncated));
 }
 
+/// A bare 54-byte header claiming whatever geometry a test wants.
+fn bare_header(width: i32, height: i32, bpp: u16) -> Vec<u8> {
+    let mut file = build(1, 1, 24, &[], &[bgr(&[[0, 0, 0]])]);
+    file.truncate(54);
+    file[18..22].copy_from_slice(&width.to_le_bytes());
+    file[22..26].copy_from_slice(&height.to_le_bytes());
+    file[28..30].copy_from_slice(&bpp.to_le_bytes());
+    file
+}
+
+#[test]
+fn a_geometry_that_wraps_a_32_bit_size_is_refused() {
+    // 65536 x 65536 x 32 bits is 2^34 bytes, zero in 32 bits. The size check passed
+    // and so did the allocation of nothing, and the first pixel trapped.
+    let file = bare_header(65_536, 65_536, 32);
+    assert_eq!(decode(&file), Err(BmpError::Truncated));
+
+    let file = bare_header(i32::MAX, i32::MAX, 32);
+    assert_eq!(decode(&file), Err(BmpError::Truncated));
+
+    let file = bare_header(i32::MAX, i32::MIN, 32);
+    assert_eq!(decode(&file), Err(BmpError::Truncated));
+}
+
+#[test]
+fn a_size_too_large_to_count_is_a_truncated_file_and_not_a_small_one() {
+    let header = Header {
+        width: usize::MAX / 2,
+        height: 3,
+        bits_per_pixel: 32,
+        top_down: false,
+        palette_entries: 0,
+        data_offset: 54,
+    };
+    assert_eq!(pixel_bytes(&header), None);
+}
+
+#[test]
+fn a_data_offset_past_the_end_of_memory_is_refused() {
+    let mut file = bare_header(1, 1, 24);
+    file[10..14].copy_from_slice(&0xffff_fff8u32.to_le_bytes());
+    assert_eq!(decode(&file), Err(BmpError::Truncated));
+}
+
+#[test]
+fn a_one_bit_image_cannot_buy_gigabytes_of_rgba() {
+    // Four bytes a row buys 32 pixels, so a file that really does hold every row can
+    // still ask for 32 times its own size.
+    let (width, height) = (1i32 << 14, 1i32 << 14);
+    let mut file = bare_header(width, height, 1);
+    let rows = (width as usize).div_ceil(32) * 4 * height as usize;
+    file.resize(54 + 2 * 4 + rows, 0);
+    file[10..14].copy_from_slice(&((54 + 2 * 4) as u32).to_le_bytes());
+
+    assert_eq!(decode(&file), Err(BmpError::TooLarge));
+}
+
+#[test]
+fn a_colour_count_of_four_billion_returns_at_once() {
+    let mut file = build(1, 1, 8, &[[1, 2, 3]], &[vec![0]]);
+    file[46..50].copy_from_slice(&u32::MAX.to_le_bytes());
+
+    let started = std::time::Instant::now();
+    let found = palette(&file).unwrap();
+    assert!(found.len() <= 256);
+    assert_eq!(header(&file).unwrap().palette_entries, 256);
+    assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+}
+
+#[test]
+fn a_header_size_that_wraps_finds_no_colour_table() {
+    let mut file = build(1, 1, 8, &[[1, 2, 3]], &[vec![0]]);
+    file[14..18].copy_from_slice(&0xffff_fff8u32.to_le_bytes());
+    assert_eq!(palette(&file).unwrap_or_default(), Vec::<[u8; 3]>::new());
+}
+
 #[test]
 fn something_that_is_not_a_bitmap_is_refused() {
     assert_eq!(decode(b"\x89PNG\r\n\x1a\n"), Err(BmpError::NotBmp));

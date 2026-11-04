@@ -118,7 +118,7 @@ pub fn read(data: &[u8]) -> Option<Binary> {
 }
 
 pub fn json(data: &[u8]) -> String {
-    use crate::json::{push_bool, push_field, push_number, push_string};
+    use crate::json::{push_bool, push_field, push_number, push_string, push_u64};
 
     let Some(binary) = read(data) else {
         return "null".to_string();
@@ -204,9 +204,9 @@ pub fn json(data: &[u8]) -> String {
         out.push(',');
         push_field(&mut out, "address", &format!("0x{:x}", section.address));
         out.push(',');
-        push_number(&mut out, "offset", section.offset as usize);
+        push_u64(&mut out, "offset", section.offset);
         out.push(',');
-        push_number(&mut out, "size", section.size as usize);
+        push_u64(&mut out, "size", section.size);
         out.push(',');
         push_field(&mut out, "flags", &section.flags);
         out.push('}');
@@ -226,11 +226,11 @@ pub fn json(data: &[u8]) -> String {
         out.push(',');
         push_field(&mut out, "address", &format!("0x{:x}", segment.address));
         out.push(',');
-        push_number(&mut out, "offset", segment.offset as usize);
+        push_u64(&mut out, "offset", segment.offset);
         out.push(',');
-        push_number(&mut out, "fileSize", segment.file_size as usize);
+        push_u64(&mut out, "fileSize", segment.file_size);
         out.push(',');
-        push_number(&mut out, "memorySize", segment.memory_size as usize);
+        push_u64(&mut out, "memorySize", segment.memory_size);
         out.push('}');
     }
     out.push_str("],");

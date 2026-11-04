@@ -79,7 +79,7 @@ export const STATUS_LABEL: Record<ToolStatus, string> = {
 	hit: 'hit',
 	clear: 'clear',
 	ready: 'ready',
-	pending: 'not built'
+	pending: 'does not apply'
 };
 
 /**
@@ -98,12 +98,12 @@ export function flagsOf(survey: Survey, structure: Structure | null): FlagHit[] 
 	return [...structure.flags, ...survey.flags.filter((f) => !judged.has(f.offset))];
 }
 
-const NO_WALKER = 'PNG only, for now';
+const NO_WALKER = 'PNG only';
 const NO_DECODER = 'no decoder for this format';
 const NO_AUDIO = 'not an audio file';
 const NO_ARCHIVE = 'not a ZIP archive';
 const NO_PDF = 'not a PDF document';
-const NO_BINARY = 'not an executable this reads';
+const NO_BINARY = 'not an ELF or PE binary';
 const NO_HIVE = 'not a registry hive';
 const NO_SQLITE = 'not a SQLite database';
 const NO_PCAP = 'not a packet capture';
@@ -144,7 +144,22 @@ export type Findings = {
 	pcap?: PcapCapture | null;
 	nested?: NestedAnalysis | null;
 	gif?: GifAnalysis | null;
+	pixelError?: string | null;
 };
+
+/**
+ * Whether a chi-square hit counts as a finding.
+ *
+ * Chi-square reads any randomised low bits as a payload, so a synthetic image can
+ * set it off with nothing hidden. RS measures something different, and when it can
+ * read the image and sees nothing, chi-square alone is not enough to claim a hit.
+ */
+export function chiStands(
+	chi: { detected: boolean } | null,
+	rs: { detected: boolean; reliable?: boolean } | null
+): boolean {
+	return chi?.detected === true && !(rs?.reliable && !rs.detected);
+}
 
 /** Every finding anywhere in the nested tree, each carrying its full path. */
 export function nestedFindings(roots: NestedArtifact[]): { text: string; origin: string }[] {
@@ -193,7 +208,7 @@ function archiveNote(zip: ZipArchive): string {
 		return `${hidden} not in the directory`;
 	}
 	if (zip.entries.some((e) => e.disagreement !== null)) {
-		return 'the two copies disagree';
+		return 'directory and headers disagree';
 	}
 	if (zip.trailing > 0) {
 		return `${zip.trailing.toLocaleString()} B appended`;
@@ -265,9 +280,9 @@ function hiveNote(hive: RegistryHive): string {
 		return `${count} USB device${count === 1 ? '' : 's'} remembered`;
 	}
 	if (hive.searched.length > 0) {
-		return `${hive.kind}, no device history`;
+		return `${hive.kind}, no devices recorded`;
 	}
-	return `${hive.kind}, nowhere here keeps device history`;
+	return `${hive.kind}, keeps no device history`;
 }
 
 /** Whether a database is worth a second look: a deleted row still in the file
@@ -340,7 +355,7 @@ export function tools(found: Findings): Tool[] {
 	const { survey, structure = null, sweep = null, wall = null, chi = null, rs = null } = found;
 	const { audio = null, spectrogram = null, paletteStego = null, zip = null } = found;
 	const { pdf = null, binary = null, hive = null, sqlite = null, pcap = null } = found;
-	const { nested = null, gif = null } = found;
+	const { nested = null, gif = null, pixelError = null } = found;
 	const aes = found.aes ?? [];
 	const wav = found.wav && !isWavError(found.wav) ? found.wav : null;
 	const jpeg = found.jpeg && !isJpegError(found.jpeg) ? found.jpeg : null;
@@ -357,6 +372,7 @@ export function tools(found: Findings): Tool[] {
 	const decoded = wall !== null || sweep !== null;
 
 	const headerBroken = !structure || isHeaderError(structure.header);
+	const ended = structure?.chunks.some((c) => c.kind === 'IEND') ?? false;
 	const badCrc = structure?.chunks.filter((c) => !c.crcOk).length ?? 0;
 	const sweepHits = sweep?.candidates.length ?? 0;
 
@@ -376,7 +392,13 @@ export function tools(found: Findings): Tool[] {
 	const pixel = (tool: Partial): Tool =>
 		decoded
 			? { ...tool, scope: 'pixels', group: 'cuttlefish' }
-			: { ...tool, scope: 'pixels', group: 'cuttlefish', status: 'pending', value: NO_DECODER };
+			: {
+					...tool,
+					scope: 'pixels',
+					group: 'cuttlefish',
+					status: 'pending',
+					value: pixelError ? 'pixels unreadable' : NO_DECODER
+				};
 
 	const coefficient = (tool: Partial): Tool =>
 		jpeg
@@ -433,52 +455,50 @@ export function tools(found: Findings): Tool[] {
 		archive({
 			id: 'archive',
 			name: 'Archive entries',
-			measures: 'Reads a ZIP twice and reports where the two copies disagree',
+			measures: "Reads a ZIP's headers and directory, and reports where they disagree",
 			status: zip && archiveOdd(zip) ? 'hit' : 'clear',
 			value: zip ? archiveNote(zip) : ''
 		}),
 		pdfTool({
 			id: 'pdf',
 			name: 'PDF structure',
-			measures:
-				'Walks a PDF for every object, and reports what the cross-reference table leaves out',
+			measures: 'Finds every object in a PDF and reports what the cross-reference table leaves out',
 			status: pdf && pdfOdd(pdf) ? 'hit' : 'clear',
 			value: pdf ? pdfNote(pdf) : ''
 		}),
 		registry({
 			id: 'hive',
 			name: 'Registry hive',
-			measures: 'Walks a Windows hive for what it remembers about the USB devices plugged in',
+			measures: 'Reads which USB devices a Windows registry hive remembers, and when',
 			status: hive && hive.devices.length > 0 ? 'hit' : 'clear',
 			value: hive ? hiveNote(hive) : ''
 		}),
 		database({
 			id: 'sqlite',
 			name: 'SQLite database',
-			measures:
-				'Reads a database for its tables and rows, and the rows deleted but still in the file',
+			measures: 'Reads tables and rows, including deleted rows still in the file',
 			status: sqlite && sqliteOdd(sqlite) ? 'hit' : 'clear',
 			value: sqlite ? sqliteNote(sqlite) : ''
 		}),
 		network({
 			id: 'pcap',
 			name: 'Network capture',
-			measures: 'Reads a packet capture, reassembling TCP streams for a flag split across packets',
+			measures:
+				'Reads a packet capture and rebuilds TCP streams to catch a flag split across packets',
 			status: pcap && pcapOdd(pcap) ? 'hit' : 'clear',
 			value: pcap ? pcapNote(pcap) : ''
 		}),
 		executable({
 			id: 'binary',
 			name: 'Binary structure',
-			measures:
-				'Reads what an executable declares: its sections, what it calls, and its own defences',
+			measures: "Reads an ELF or PE's sections, imports and declared protections",
 			status: binary && binaryWeak(binary) ? 'hit' : 'clear',
 			value: binary ? binaryNote(binary) : ''
 		}),
 		{
 			id: 'magic',
 			name: 'Embedded files',
-			measures: 'Finds files hidden inside this one, and saves them',
+			measures: 'Finds files inside this one and lets you save them',
 			scope: 'bytes',
 			group: 'survey',
 			status: embedded.length ? 'hit' : 'clear',
@@ -487,7 +507,7 @@ export function tools(found: Findings): Tool[] {
 		{
 			id: 'gif',
 			name: 'GIF frames',
-			measures: 'Checks every frame and the gaps between them for hidden bits',
+			measures: 'Checks every frame, and the differences between them, for hidden bits',
 			scope: 'gif',
 			group: 'cuttlefish',
 			status: gifFrameStatus(gif),
@@ -496,7 +516,7 @@ export function tools(found: Findings): Tool[] {
 		pixel({
 			id: 'lsb',
 			name: 'LSB sweep',
-			measures: 'Tries every way of reading hidden bits',
+			measures: 'Tries each channel, bit and bit order for hidden data',
 			status: sweepHits ? 'hit' : sweep ? 'clear' : 'pending',
 			value: sweepHits
 				? `${sweepHits} of ${sweep?.combinations} combinations`
@@ -508,17 +528,19 @@ export function tools(found: Findings): Tool[] {
 			id: 'chi',
 			name: 'Chi-square attack',
 			measures: 'Statistical test for a hidden payload',
-			status: chi?.detected ? 'hit' : chi ? 'clear' : 'pending',
-			value: chi?.detected
-				? `${(chi.embeddedFraction * 100).toFixed(0)}% embedded`
-				: chi
-					? `peak p ${chi.peakProbability.toFixed(2)}`
-					: 'pixels unavailable'
+			status: chiStands(chi, rs) ? 'hit' : chi?.detected ? 'ready' : chi ? 'clear' : 'pending',
+			value: chiStands(chi, rs)
+				? `${(chi!.embeddedFraction * 100).toFixed(0)}% embedded`
+				: chi?.detected
+					? 'fits, but RS disagrees'
+					: chi
+						? `peak p ${chi.peakProbability.toFixed(2)}`
+						: 'pixels unavailable'
 		}),
 		pixel({
 			id: 'rs',
 			name: 'RS analysis',
-			measures: 'Second opinion on how much is hidden',
+			measures: 'A second estimate of how much is hidden',
 			status: rs?.detected ? 'hit' : rs?.reliable ? 'clear' : rs ? 'ready' : 'pending',
 			value: rs?.detected
 				? `${(rs.rate * 100).toFixed(0)}% of low bits`
@@ -560,7 +582,7 @@ export function tools(found: Findings): Tool[] {
 		{
 			id: 'jpeg',
 			name: 'JPEG segments',
-			measures: 'Lists every part of a JPEG',
+			measures: 'Lists every segment of a JPEG',
 			scope: 'bytes',
 			group: 'survey',
 			status:
@@ -570,13 +592,13 @@ export function tools(found: Findings): Tool[] {
 				: survey.jpegTrailing
 					? `${survey.jpegTrailing.length.toLocaleString()} bytes past EOI`
 					: jpegish
-						? `${survey.jpegSegments.length} segments`
+						? `${survey.jpegSegments.length} segment${survey.jpegSegments.length === 1 ? '' : 's'}`
 						: 'not a JPEG'
 		},
 		coefficient({
 			id: 'jsteg',
 			name: 'JSteg sweep',
-			measures: 'Reads hidden bits out of a JPEG after compression',
+			measures: "Reads hidden bits from a JPEG's compressed coefficients",
 			status: jpegHits ? 'hit' : jpeg ? 'clear' : 'pending',
 			value: jpegHits
 				? `${jpegHits} of ${jpeg?.combinations} combinations`
@@ -609,7 +631,7 @@ export function tools(found: Findings): Tool[] {
 		sound({
 			id: 'audio-lsb',
 			name: 'Audio LSB sweep',
-			measures: 'Tries every way of reading hidden bits from the samples',
+			measures: 'Tries each channel, bit and bit order across the samples',
 			status: audioHits ? 'hit' : audio ? 'clear' : 'pending',
 			value: audioHits
 				? `${audioHits} of ${audio?.combinations} combinations`
@@ -621,13 +643,13 @@ export function tools(found: Findings): Tool[] {
 			{
 				id: 'riff',
 				name: 'RIFF chunks',
-				measures: 'Lists every part of the sound file',
+				measures: 'Lists every chunk in a WAV file',
 				status: wavText || wav?.trailing ? 'hit' : 'ready',
 				value: wavText
 					? `${wavText} text ${wavText === 1 ? 'string' : 'strings'}`
 					: wav?.trailing
 						? `${wav.trailing.length.toLocaleString()} bytes past the end`
-						: `${wav?.chunks.length} chunks`
+						: `${wav?.chunks.length} chunk${wav?.chunks.length === 1 ? '' : 's'}`
 			},
 			'survey'
 		),
@@ -675,21 +697,25 @@ export function tools(found: Findings): Tool[] {
 		png({
 			id: 'crc',
 			name: 'Chunk CRC',
-			measures: 'Checks each part against its own checksum',
+			measures: 'Checks each PNG chunk against its own checksum',
 			status: badCrc ? 'hit' : 'clear',
 			value: badCrc ? `${badCrc} mismatch${badCrc === 1 ? '' : 'es'}` : 'all valid'
 		}),
 		png({
 			id: 'chunks',
 			name: 'Chunk walk',
-			measures: 'Lists every part of the file',
-			status: headerBroken ? 'hit' : 'ready',
-			value: headerBroken ? 'header unreadable' : `${structure?.chunks.length} chunks`
+			measures: 'Lists every chunk in a PNG',
+			status: headerBroken || !ended ? 'hit' : 'ready',
+			value: headerBroken
+				? 'header unreadable'
+				: !ended
+					? 'no IEND, cut short'
+					: `${structure?.chunks.length} chunk${structure?.chunks.length === 1 ? '' : 's'}`
 		}),
 		{
 			id: 'strings',
 			name: 'Readable text',
-			measures: 'Text anywhere in the file, plain or wide',
+			measures: 'Finds ASCII and UTF-16 text anywhere in the file',
 			scope: 'bytes',
 			group: 'survey',
 			status: 'ready',
@@ -700,9 +726,9 @@ export function tools(found: Findings): Tool[] {
 		pixel({
 			id: 'pixels',
 			name: 'Pixel decode',
-			measures: 'Reads exact pixel values, nothing altered',
-			status: headerBroken ? 'pending' : 'ready',
-			value: headerBroken ? 'blocked' : 'verified'
+			measures: 'Reads exact pixel values without altering them',
+			status: 'ready',
+			value: 'verified'
 		})
 	];
 }
@@ -711,13 +737,15 @@ function gifFrameStatus(gif: GifAnalysis | null): ToolStatus {
 	if (!gif) return 'pending';
 	if (gif.error) return 'clear';
 	if (gif.sources.length === 0) return 'clear';
-	if (gif.sources.some((s) => s.lsb.candidates.length > 0 || s.chi?.detected || s.rs?.detected))
+	if (
+		gif.sources.some((s) => s.lsb.candidates.length > 0 || chiStands(s.chi, s.rs) || s.rs?.detected)
+	)
 		return 'hit';
 	return 'clear';
 }
 
 function gifFrameValue(gif: GifAnalysis | null, nested: NestedAnalysis | null): string {
-	if (!gif) return 'pixels unavailable';
+	if (!gif) return 'not a GIF';
 	if (gif.error) return `error: ${gif.error}`;
 	if (gif.sources.length === 0) return 'no frames analysed';
 	const frames = gif.sources.filter((s) => s.kind === 'frame').length;
@@ -732,3 +760,33 @@ function gifFrameValue(gif: GifAnalysis | null, nested: NestedAnalysis | null): 
 /** Named so the rack shows the whole instrument, not only the parts that work.
  *  Empty when everything the rack currently advertises has shipped. */
 export const PLANNED: Tool[] = [];
+
+const NO_FILE: Survey = {
+	size: 0,
+	format: null,
+	flags: [],
+	magic: [],
+	exif: null,
+	jpegSegments: [],
+	jpegComments: [],
+	jpegTrailing: null,
+	strings: { total: 0, wide: 0, sample: [] },
+	entropy: { window: 0, values: [] }
+};
+
+/** The rack before any file has been read, so the start page can list it. */
+export const RACK_OVERVIEW: Tool[] = tools({ survey: NO_FILE });
+
+/** What Mantis tries on a pasted string. Mantis has no rack of its own, so this
+ *  list has to be kept true by hand. */
+export const MANTIS_TOOLS: [string, string][] = [
+	['Encoding peeler', 'Unwraps base64, hex, morse and more, layer by layer, through gzip and zlib'],
+	['Caesar and rotations', 'Tries every shift and keeps the one that reads'],
+	['XOR', 'Recovers single-byte and repeating keys'],
+	['Vigenère', 'Works out the key and its length from the text'],
+	['Affine and Hill', 'Tries every key that can be undone'],
+	['Transposition', 'Puts rail fence and columnar text back in order'],
+	['Substitution', 'Climbs towards the alphabet using a model of English'],
+	['Hash identifier', 'Names every format a hash could be'],
+	['RSA', 'Breaks badly built keys: small exponent, close or shared primes, small private exponent']
+];

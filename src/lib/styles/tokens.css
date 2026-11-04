@@ -33,7 +33,7 @@
 	--ink: #7a4a2e;
 	--signal: #e3b23c;
 	--text: #d8dedc;
-	--muted: #6b7b80;
+	--muted: #84959a;
 
 	--panel-lift: #1e282e;
 	--panel-deep: #131b1f;
@@ -69,9 +69,9 @@
 	--panel: #dde3e2;
 	--rule: #c3cbca;
 	--ink: #8a5a34;
-	--signal: #9c6a12;
+	--signal: #7f540b;
 	--text: #1b2426;
-	--muted: #57676a;
+	--muted: #4f5f62;
 
 	--panel-lift: #d2d9d8;
 	--panel-deep: #e6ebea;
@@ -130,6 +130,20 @@ h4 {
 
 .flagged {
 	color: var(--signal);
+}
+
+/* A finger needs a bigger target than a mouse pointer does. */
+@media (pointer: coarse) {
+	button,
+	nav a {
+		min-height: 44px;
+		min-width: 44px;
+	}
+
+	nav a {
+		display: inline-flex;
+		align-items: center;
+	}
 }
 
 /* Scrollbars, in the same language as everything else: square, hairline, and

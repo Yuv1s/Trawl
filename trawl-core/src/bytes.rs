@@ -102,6 +102,13 @@ fn tag_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Most flag shapes one scan reports.
+///
+/// Ten bytes of file make one, so a file of nothing else asks for more text than it
+/// holds and a lookup per match behind it. No real file has this many flags, and the
+/// first few thousand already say what such a file is.
+pub const MAX_FLAGS: usize = 10_000;
+
 /// Characters a person would type inside a flag.
 fn body_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b' ' | b'.' | b'!' | b'?')
@@ -120,8 +127,12 @@ const MIN_BODY_WRITTEN: f32 = 0.85;
 /// Two-character tags are where the noise lives: a bitmap threw two dozen of
 /// them per image, `iJ{eHzcJ}` and the like, all pure alphanumeric so no
 /// character test separates them. Real prefixes are `flag`, `picoCTF`, `HTB`.
-/// A two-letter competition prefix would be missed, and that is the trade.
+/// A two-letter competition prefix is found only by naming it in the flag tags.
 const MIN_TAG: usize = 3;
+
+/// Longest tag trusted without being named. Real prefixes are short: flag, picoCTF,
+/// HTB, testCTF. An event with a longer one names it in the flag tags.
+const MAX_TAG: usize = 12;
 
 const MIN_BODY: usize = 4;
 
@@ -174,26 +185,58 @@ pub fn tag_is_known_for(text: &str, tags: &[String]) -> bool {
         return KNOWN_TAGS.iter().any(|known| lower.ends_with(known));
     }
 
+    let lower = tag.to_ascii_lowercase();
+    tags.iter().any(|known| {
+        let known = known.trim().to_ascii_lowercase();
+        !known.is_empty() && lower.ends_with(&known)
+    })
+}
+
+/// How many bytes of a tag run a configured tag accounts for, if any of them does.
+///
+/// Matched on the ending, the same rule [`tag_is_known_for`] applies.
+fn named_tag(run: &[u8], tags: &[String]) -> Option<usize> {
     tags.iter()
-        .any(|known| tag.eq_ignore_ascii_case(known.trim()))
+        .map(|tag| tag.trim().as_bytes())
+        .filter(|tag| !tag.is_empty() && tag.len() <= run.len())
+        .filter(|tag| run[run.len() - tag.len()..].eq_ignore_ascii_case(tag))
+        .map(<[u8]>::len)
+        .max()
+}
+
+/// True for a run ending in a tag anyone would recognise.
+fn recognised_tag(run: &[u8]) -> bool {
+    KNOWN_TAGS.iter().any(|known| {
+        known.len() <= run.len() && run[run.len() - known.len()..].eq_ignore_ascii_case(known.as_bytes())
+    })
 }
 
 pub fn flag_candidates_for_tags(data: &[u8], tags: &[String]) -> Vec<Found> {
-    flag_candidates(data)
+    flag_candidates_naming(data, tags)
         .into_iter()
         .filter(|found| tag_is_known_for(&found.text, tags))
         .collect()
 }
 
 pub fn flag_candidates(data: &[u8]) -> Vec<Found> {
-    // Real prefixes are short: flag, picoCTF, HTB, testCTF. Nothing near twelve.
-    const MAX_TAG: usize = 12;
+    flag_candidates_naming(data, &[])
+}
+
+/// Every flag shape, with the configured tags let past the checks that exist to
+/// reject noise.
+///
+/// Those checks guess at what a tag and a body look like when nobody has said. A
+/// named tag is not a guess: `HV` and `cyberapocalypse` are outside the length limits
+/// because the limits are about unnamed runs. A tag anyone would recognise settles
+/// the case check the same way, since `HTB{Y0u_F0uNd_1T}` is written like that on
+/// purpose and the alternating case that marks noise does not come with a tag on it.
+pub fn flag_candidates_naming(data: &[u8], tags: &[String]) -> Vec<Found> {
     const MAX_BODY: usize = 256;
 
     let mut out = Vec::new();
     let mut i = 0usize;
 
-    while i < data.len() {
+    while i < data.len() && out.len() < MAX_FLAGS {
         if data[i] != b'{' {
             i += 1;
             continue;
@@ -223,8 +266,17 @@ pub fn flag_candidates(data: &[u8]) -> Vec<Found> {
 
         // A real tag starts with a letter: picoCTF, flag, HTB. A run of bytes
         // ending in something tag-shaped by accident usually does not.
-        let tag_ok =
+        let shaped =
             (MIN_TAG..=MAX_TAG).contains(&tag_len) && data[tag_start].is_ascii_alphabetic();
+
+        // A named tag outside the shape is reported as itself, not with whatever
+        // run of alphanumerics happens to sit in front of it.
+        let named = named_tag(&data[tag_start..i], tags);
+        let start = match named {
+            Some(len) if !shaped => i - len,
+            _ => tag_start,
+        };
+        let tag_ok = shaped || named.is_some();
 
         let written = body.iter().filter(|&&b| body_byte(b)).count();
         let body_ok = body_len >= MIN_BODY
@@ -234,12 +286,12 @@ pub fn flag_candidates(data: &[u8]) -> Vec<Found> {
             // flag. The written-byte allowance alone lets one through.
             && !body.contains(&b'{')
             && written as f32 / body_len as f32 >= MIN_BODY_WRITTEN
-            && case_is_consistent(body);
+            && (named.is_some() || recognised_tag(&data[tag_start..i]) || case_is_consistent(body));
 
         if tag_ok && body_ok {
             out.push(Found {
-                offset: tag_start,
-                text: String::from_utf8_lossy(&data[tag_start..=close]).into_owned(),
+                offset: start,
+                text: String::from_utf8_lossy(&data[start..=close]).into_owned(),
             });
             i = close + 1;
         } else {
@@ -250,37 +302,165 @@ pub fn flag_candidates(data: &[u8]) -> Vec<Found> {
     out
 }
 
-const SIGNATURES: [(&[u8], &str); 19] = [
-    (b"\x89PNG\r\n\x1a\n", "PNG image"),
-    (b"\xff\xd8\xff", "JPEG image"),
-    (b"GIF8", "GIF image"),
-    (b"BM", "BMP image"),
-    (b"PK\x03\x04", "ZIP archive"),
-    (b"\x1f\x8b", "gzip stream"),
-    (b"BZh", "bzip2 stream"),
-    (b"7z\xbc\xaf\x27\x1c", "7-Zip archive"),
-    (b"Rar!\x1a\x07", "RAR archive"),
-    (b"%PDF", "PDF document"),
-    (b"regf", "Windows registry hive"),
-    (b"\x7fELF", "ELF binary"),
-    (b"RIFF", "RIFF container"),
+/// Accepts whatever follows the magic. For signatures long or odd enough that
+/// finding one is already the evidence.
+fn always(_: &[u8], _: usize) -> bool {
+    true
+}
+
+/// gzip: the only defined compression method is deflate, and the reserved bits
+/// of FLG are zero.
+fn gzip_flags(data: &[u8], at: usize) -> bool {
+    data.get(at + 2) == Some(&0x08) && data.get(at + 3).is_some_and(|&flg| flg & 0xe0 == 0)
+}
+
+/// JPEG at the start of a file: the byte after SOI names a marker. Enough there, where
+/// nothing has to be found by chance, and an encoder can open with any of them.
+fn jpeg_opening(data: &[u8], at: usize) -> bool {
+    matches!(data.get(at + 3), Some(0xc0..=0xfe))
+}
+
+/// JPEG part way through a file: the byte after SOI begins a segment a file usually
+/// opens with, and that segment's length lands on the next marker. Three bytes and a
+/// marker class alone turn up by chance in any file of a few megabytes.
+fn jpeg_segment(data: &[u8], at: usize) -> bool {
+    if !matches!(
+        data.get(at + 3),
+        Some(0xe0..=0xef) | Some(0xdb) | Some(0xc0) | Some(0xc4) | Some(0xfe)
+    ) {
+        return false;
+    }
+    let Some(field) = data.get(at + 4..at + 6) else {
+        return false;
+    };
+    let length = u16::from_be_bytes([field[0], field[1]]) as usize;
+    length >= 2 && data.get(at + 4 + length) == Some(&0xff)
+}
+
+/// GIF: the version field is either 87a or 89a.
+fn gif_version(data: &[u8], at: usize) -> bool {
+    matches!(data.get(at + 4), Some(b'7') | Some(b'9')) && data.get(at + 5) == Some(&b'a')
+}
+
+/// BMP: the declared file size has to fit in what is left of the buffer, the
+/// reserved field is zero, and the info header is one of the sizes the format
+/// defines. Two magic bytes alone turn up constantly by chance.
+fn bmp_size(data: &[u8], at: usize) -> bool {
+    let Some(header) = data.get(at..at + 18) else {
+        return false;
+    };
+    let declared = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+    let info = u32::from_le_bytes([header[14], header[15], header[16], header[17]]);
+    (26..=data.len() - at).contains(&declared)
+        && header[6..10] == [0, 0, 0, 0]
+        && matches!(info, 12 | 16 | 40 | 52 | 56 | 64 | 108 | 124)
+}
+
+/// BMP at the start of a file: the info header is one of the sizes the format defines.
+/// That is three zero bytes in a row, which no readable text has, and it is all that
+/// is asked here. The size can be wrong and the reserved bytes can hold something on a
+/// doctored bitmap, which is still a bitmap.
+fn bmp_info(data: &[u8], at: usize) -> bool {
+    data.get(at + 14..at + 18).is_some_and(|field| {
+        matches!(
+            u32::from_le_bytes([field[0], field[1], field[2], field[3]]),
+            12 | 16 | 40 | 52 | 56 | 64 | 108 | 124
+        )
+    })
+}
+
+/// RIFF: the container type at offset 8 is four printable characters.
+fn riff_type(data: &[u8], at: usize) -> bool {
+    data.get(at + 8..at + 12)
+        .is_some_and(|kind| kind.iter().all(|b| b.is_ascii_uppercase() || *b == b' '))
+}
+
+/// bzip2: the block-size digit is 1 through 9.
+fn bzip_level(data: &[u8], at: usize) -> bool {
+    data.get(at + 3).is_some_and(|b| (b'1'..=b'9').contains(b))
+}
+
+/// Registry hive: the base block's major version, which has only ever been 1. The
+/// magic alone is four lowercase letters, and a rotation of ordinary text reaches
+/// those as easily as any others.
+fn hive_version(data: &[u8], at: usize) -> bool {
+    data.get(at + 0x14..at + 0x18) == Some(&[1, 0, 0, 0])
+}
+
+/// pcapng: the byte-order magic a Section Header Block carries. The block type alone
+/// is a pair of line endings.
+fn pcapng_order(data: &[u8], at: usize) -> bool {
+    matches!(
+        data.get(at + 8..at + 12),
+        Some([0x4d, 0x3c, 0x2b, 0x1a]) | Some([0x1a, 0x2b, 0x3c, 0x4d])
+    )
+}
+
+/// A signature plus whatever extra check keeps it from firing on noise.
+///
+/// Short magics are the problem. Two bytes match roughly once every 64 KB of
+/// random data, so scanning half a megabyte for `BM` alone would report eight
+/// imaginary bitmaps. Each short signature therefore carries a validator that
+/// tests a field the format actually constrains.
+///
+/// Readable text has the same problem at offset zero: `TELL ME` rotates to `BMTT UM`,
+/// and calling that a bitmap makes it the answer. So naming a format asks the same
+/// question scanning for one does.
+struct Signature {
+    magic: &'static [u8],
+    label: &'static str,
+    /// What has to hold for a file to open with this format.
+    opening: fn(&[u8], usize) -> bool,
+    /// What has to hold for this format to be reported part way through a file.
+    /// None for the ones not worth carving out.
+    embedded: Option<fn(&[u8], usize) -> bool>,
+}
+
+const fn signature(
+    magic: &'static [u8],
+    label: &'static str,
+    opening: fn(&[u8], usize) -> bool,
+    embedded: Option<fn(&[u8], usize) -> bool>,
+) -> Signature {
+    Signature {
+        magic,
+        label,
+        opening,
+        embedded,
+    }
+}
+
+const SIGNATURES: [Signature; 19] = [
+    signature(b"\x89PNG\r\n\x1a\n", "PNG image", always, Some(always)),
+    signature(b"\xff\xd8\xff", "JPEG image", jpeg_opening, Some(jpeg_segment)),
+    signature(b"GIF8", "GIF image", gif_version, Some(gif_version)),
+    signature(b"BM", "BMP image", bmp_info, Some(bmp_size)),
+    signature(b"PK\x03\x04", "ZIP archive", always, Some(always)),
+    signature(b"\x1f\x8b", "gzip stream", gzip_flags, Some(gzip_flags)),
+    signature(b"BZh", "bzip2 stream", bzip_level, Some(bzip_level)),
+    signature(b"7z\xbc\xaf\x27\x1c", "7-Zip archive", always, Some(always)),
+    signature(b"Rar!\x1a\x07", "RAR archive", always, Some(always)),
+    signature(b"%PDF", "PDF document", always, Some(always)),
+    signature(b"regf", "Windows registry hive", hive_version, None),
+    signature(b"\x7fELF", "ELF binary", always, Some(always)),
+    signature(b"RIFF", "RIFF container", riff_type, Some(riff_type)),
     // Classic libpcap, all four byte orders and both timestamp resolutions.
-    (b"\xd4\xc3\xb2\xa1", "packet capture"),
-    (b"\xa1\xb2\xc3\xd4", "packet capture"),
-    (b"\x4d\x3c\xb2\xa1", "packet capture"),
-    (b"\xa1\xb2\x3c\x4d", "packet capture"),
+    signature(b"\xd4\xc3\xb2\xa1", "packet capture", always, None),
+    signature(b"\xa1\xb2\xc3\xd4", "packet capture", always, None),
+    signature(b"\x4d\x3c\xb2\xa1", "packet capture", always, None),
+    signature(b"\xa1\xb2\x3c\x4d", "packet capture", always, None),
     // pcapng, whose first block is always a Section Header Block.
-    (b"\x0a\x0d\x0d\x0a", "packet capture"),
+    signature(b"\x0a\x0d\x0d\x0a", "packet capture", pcapng_order, None),
     // SQLite, so the header line names one before the database reader runs.
-    (b"SQLite format 3\x00", "SQLite database"),
+    signature(b"SQLite format 3\x00", "SQLite database", always, None),
 ];
 
 /// Names the format a byte run starts with, if any.
 pub fn identify(data: &[u8]) -> Option<&'static str> {
     SIGNATURES
         .iter()
-        .find(|(magic, _)| data.starts_with(magic))
-        .map(|(_, name)| *name)
+        .find(|signature| data.starts_with(signature.magic) && (signature.opening)(data, 0))
+        .map(|signature| signature.label)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,153 +483,100 @@ pub fn find(data: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
         .map(|p| from + p)
 }
 
-/// Where an embedded file ends, for the formats that say so.
+/// The next place one terminator occurs, remembered between questions.
+///
+/// Questions arrive in file order, so an answer stays good until the scan passes it,
+/// and "none" stays good for the rest of the file. Asking afresh each time rescans to
+/// the end of the file for every signature, which is quadratic on a file made of
+/// nothing but signatures.
+struct Ahead<'a> {
+    data: &'a [u8],
+    needle: &'static [u8],
+    next: Option<usize>,
+    exhausted: bool,
+}
+
+impl<'a> Ahead<'a> {
+    fn new(data: &'a [u8], needle: &'static [u8]) -> Self {
+        Self {
+            data,
+            needle,
+            next: None,
+            exhausted: false,
+        }
+    }
+
+    fn at_or_after(&mut self, at: usize) -> Option<usize> {
+        if self.exhausted {
+            return None;
+        }
+        if self.next.is_none_or(|next| next < at) {
+            self.next = find(self.data, at, self.needle);
+            self.exhausted = self.next.is_none();
+        }
+        self.next
+    }
+}
+
+/// Where embedded files end, for the formats that say so.
 ///
 /// Carving without this is guesswork: you get the file plus everything after it.
 /// Each of these terminators is defined by the format, so the extraction is
 /// exact rather than approximate.
-fn extent(data: &[u8], at: usize, label: &str) -> Option<usize> {
-    match label {
-        // The IEND chunk is the last thing in a PNG: type, then a four-byte CRC.
-        "PNG image" => find(data, at, b"IEND").map(|p| p + 8),
-        // End of image.
-        "JPEG image" => find(data, at + 2, &[0xff, 0xd9]).map(|p| p + 2),
-        // End of central directory, then a variable-length comment.
-        "ZIP archive" => find(data, at, b"PK\x05\x06").and_then(|p| {
-            let comment = data.get(p + 20..p + 22)?;
-            Some(p + 22 + u16::from_le_bytes([comment[0], comment[1]]) as usize)
-        }),
-        "PDF document" => {
-            // A PDF may be appended to several times, so the last one wins.
-            let mut last = None;
-            let mut from = at;
-            while let Some(p) = find(data, from, b"%%EOF") {
-                last = Some(p + 5);
-                from = p + 5;
-            }
-            last
+struct Extents<'a> {
+    data: &'a [u8],
+    iend: Ahead<'a>,
+    eoi: Ahead<'a>,
+    end_of_directory: Ahead<'a>,
+    /// The last `%%EOF` in the file, since a PDF may be appended to several times.
+    pdf_end: Option<usize>,
+}
+
+impl<'a> Extents<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            iend: Ahead::new(data, b"IEND"),
+            eoi: Ahead::new(data, &[0xff, 0xd9]),
+            end_of_directory: Ahead::new(data, b"PK\x05\x06"),
+            pdf_end: data.windows(5).rposition(|w| w == b"%%EOF"),
         }
-        _ => None,
+    }
+
+    fn of(&mut self, at: usize, label: &str) -> Option<usize> {
+        match label {
+            // The IEND chunk is the last thing in a PNG: type, then a four-byte CRC.
+            "PNG image" => self.iend.at_or_after(at).map(|p| p + 8),
+            // End of image.
+            "JPEG image" => self.eoi.at_or_after(at + 2).map(|p| p + 2),
+            // End of central directory, then a variable-length comment.
+            "ZIP archive" => self.end_of_directory.at_or_after(at).and_then(|p| {
+                let comment = self.data.get(p + 20..p + 22)?;
+                Some(p + 22 + u16::from_le_bytes([comment[0], comment[1]]) as usize)
+            }),
+            "PDF document" => self.pdf_end.filter(|&p| p >= at).map(|p| p + 5),
+            _ => None,
+        }
     }
 }
 
-/// A signature plus whatever extra check keeps it from firing on noise.
-///
-/// Short magics are the problem. Two bytes match roughly once every 64 KB of
-/// random data, so scanning half a megabyte for `BM` alone would report eight
-/// imaginary bitmaps. Each short signature therefore carries a validator that
-/// tests a field the format actually constrains.
-struct Scannable {
-    magic: &'static [u8],
-    label: &'static str,
-    validate: fn(&[u8], usize) -> bool,
-}
+/// Most signatures one scan reports. Each is four bytes of file and a line of JSON,
+/// so a file of nothing else would ask for twenty times its own size.
+const MAX_HITS: usize = 4096;
 
-fn always(_: &[u8], _: usize) -> bool {
-    true
-}
-
-/// gzip: the only defined compression method is deflate, and the reserved bits
-/// of FLG are zero.
-fn gzip_flags(data: &[u8], at: usize) -> bool {
-    data.get(at + 2) == Some(&0x08) && data.get(at + 3).is_some_and(|&flg| flg & 0xe0 == 0)
-}
-
-/// JPEG: the byte after SOI must begin a marker segment we recognise.
-fn jpeg_marker(data: &[u8], at: usize) -> bool {
-    matches!(
-        data.get(at + 3),
-        Some(0xe0..=0xef) | Some(0xdb) | Some(0xc0) | Some(0xc4) | Some(0xfe)
-    )
-}
-
-/// GIF: the version field is either 87a or 89a.
-fn gif_version(data: &[u8], at: usize) -> bool {
-    matches!(data.get(at + 4), Some(b'7') | Some(b'9')) && data.get(at + 5) == Some(&b'a')
-}
-
-/// BMP: the declared file size has to fit in what is left of the buffer.
-fn bmp_size(data: &[u8], at: usize) -> bool {
-    let Some(field) = data.get(at + 2..at + 6) else {
-        return false;
-    };
-    let declared = u32::from_le_bytes([field[0], field[1], field[2], field[3]]) as usize;
-    (26..=data.len() - at).contains(&declared)
-}
-
-/// RIFF: the container type at offset 8 is four printable characters.
-fn riff_type(data: &[u8], at: usize) -> bool {
-    data.get(at + 8..at + 12)
-        .is_some_and(|kind| kind.iter().all(|b| b.is_ascii_uppercase() || *b == b' '))
-}
-
-/// bzip2: the block-size digit is 1 through 9.
-fn bzip_level(data: &[u8], at: usize) -> bool {
-    data.get(at + 3).is_some_and(|b| (b'1'..=b'9').contains(b))
-}
-
-const SCANNABLE: [Scannable; 12] = [
-    Scannable {
-        magic: b"RIFF",
-        label: "RIFF container",
-        validate: riff_type,
-    },
-    Scannable {
-        magic: b"\x89PNG\r\n\x1a\n",
-        label: "PNG image",
-        validate: always,
-    },
-    Scannable {
-        magic: b"PK\x03\x04",
-        label: "ZIP archive",
-        validate: always,
-    },
-    Scannable {
-        magic: b"%PDF",
-        label: "PDF document",
-        validate: always,
-    },
-    Scannable {
-        magic: b"\x7fELF",
-        label: "ELF binary",
-        validate: always,
-    },
-    Scannable {
-        magic: b"7z\xbc\xaf\x27\x1c",
-        label: "7-Zip archive",
-        validate: always,
-    },
-    Scannable {
-        magic: b"Rar!\x1a\x07",
-        label: "RAR archive",
-        validate: always,
-    },
-    Scannable {
-        magic: b"GIF8",
-        label: "GIF image",
-        validate: gif_version,
-    },
-    Scannable {
-        magic: b"BZh",
-        label: "bzip2 stream",
-        validate: bzip_level,
-    },
-    Scannable {
-        magic: b"\xff\xd8\xff",
-        label: "JPEG image",
-        validate: jpeg_marker,
-    },
-    Scannable {
-        magic: b"\x1f\x8b",
-        label: "gzip stream",
-        validate: gzip_flags,
-    },
-    Scannable {
-        magic: b"BM",
-        label: "BMP image",
-        validate: bmp_size,
-    },
-];
+/// Which bytes can begin a signature the scan looks for, so most of a file is one
+/// table lookup rather than a comparison per signature.
+const SCAN_STARTS: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut i = 0;
+    while i < SIGNATURES.len() {
+        if SIGNATURES[i].embedded.is_some() {
+            table[SIGNATURES[i].magic[0] as usize] = true;
+        }
+        i += 1;
+    }
+    table
+};
 
 /// Every file signature anywhere in the buffer, not only at offset zero.
 ///
@@ -458,14 +585,25 @@ const SCANNABLE: [Scannable; 12] = [
 pub fn magic_scan(data: &[u8]) -> Vec<MagicHit> {
     let mut found = Vec::new();
 
-    for at in 0..data.len() {
-        for candidate in &SCANNABLE {
-            if data[at..].starts_with(candidate.magic) && (candidate.validate)(data, at) {
+    'scan: for at in 0..data.len() {
+        if !SCAN_STARTS[data[at] as usize] {
+            continue;
+        }
+        for candidate in &SIGNATURES {
+            let Some(validate) = candidate.embedded else {
+                continue;
+            };
+            if data[at..].starts_with(candidate.magic) && validate(data, at) {
                 found.push((at, candidate.label));
+                if found.len() >= MAX_HITS {
+                    break 'scan;
+                }
                 break;
             }
         }
     }
+
+    let mut extents = Extents::new(data);
 
     // A second pass, because an unbounded file runs until the next one starts.
     found
@@ -473,7 +611,7 @@ pub fn magic_scan(data: &[u8]) -> Vec<MagicHit> {
         .enumerate()
         .map(|(i, &(at, label))| {
             let next = found.get(i + 1).map(|&(o, _)| o).unwrap_or(data.len());
-            match extent(data, at, label) {
+            match extents.of(at, label) {
                 Some(end) if end > at && end <= data.len() => MagicHit {
                     offset: at,
                     label,
@@ -676,11 +814,26 @@ mod tests {
     }
 
     #[test]
+    fn magic_scan_ignores_a_jpeg_signature_with_no_next_segment() {
+        // The opening bytes alone, as they turn up by chance in audio samples.
+        let mut data = vec![0x11u8; 64];
+        data[20..26].copy_from_slice(&[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x05]);
+        assert!(!magic_scan(&data).iter().any(|hit| hit.label == "JPEG image"));
+    }
+
+    #[test]
+    fn magic_scan_ignores_a_bmp_signature_with_no_real_header() {
+        let mut data = vec![0x11u8; 64];
+        data[20..26].copy_from_slice(&[b'B', b'M', 30, 0, 0, 0]);
+        assert!(!magic_scan(&data).iter().any(|hit| hit.label == "BMP image"));
+    }
+
+    #[test]
     fn magic_scan_measures_a_jpeg_to_its_end_of_image_marker() {
         let mut data = vec![0u8; 32];
         let at = data.len();
-        data.extend_from_slice(&[0xff, 0xd8, 0xff, 0xe0]);
-        data.extend_from_slice(&[0u8; 20]);
+        data.extend_from_slice(&[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x14]);
+        data.extend_from_slice(&[0u8; 18]);
         data.extend_from_slice(&[0xff, 0xd9]);
         data.extend_from_slice(b"after the image");
 
@@ -782,6 +935,7 @@ mod tests {
         let mut data = b"BM".to_vec();
         data.extend_from_slice(&60u32.to_le_bytes());
         data.extend_from_slice(&[0u8; 64]);
+        data[14] = 40;
         assert_eq!(magic_scan(&data)[0].label, "BMP image");
     }
 
@@ -915,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_flag_tags_match_the_whole_prefix_without_suffix_guessing() {
+    fn configured_flag_tags_match_on_the_ending_of_the_tag() {
         let tags = vec!["picoCTF".to_string(), "event".to_string()];
         let found = flag_candidates_for_tags(
             b"picoCTF{first_flag} testCTF{not_selected} event{second_flag}",
@@ -926,6 +1080,8 @@ mod tests {
         assert_eq!(texts, vec!["picoCTF{first_flag}", "event{second_flag}"]);
         assert!(tag_is_known_for("PICOctf{case_insensitive}", &tags));
         assert!(!tag_is_known_for("testCTF{not_selected}", &tags));
+        assert!(tag_is_known_for("testCTF{event_name_in_front}", &["CTF".to_string()]));
+        assert!(!tag_is_known_for("CTFtest{ending_differs}", &["CTF".to_string()]));
     }
 
     #[test]
@@ -1002,5 +1158,169 @@ mod tests {
         data.extend(std::iter::repeat_n(b'a', 400));
         data.push(b'}');
         assert!(flag_candidates(&data).is_empty());
+    }
+
+    /// `TELL ME` rotates to `BMTT UM`, and calling that a bitmap made a readable
+    /// sentence lose to its own ciphertext.
+    #[test]
+    fn identify_asks_more_of_a_signature_than_its_first_bytes() {
+        assert_eq!(identify(b"BMTT UM ALPE LOP VPJZPE KPZZHNP"), None);
+        assert_eq!(identify(b"BM not a bitmap, just text"), None);
+        assert_eq!(identify(b"BZhello there"), None);
+        assert_eq!(identify(b"GIF8 is not a version"), None);
+        assert_eq!(identify(b"RIFF raff and other riff raff"), None);
+        assert_eq!(identify(b"regf is four letters"), None);
+        assert_eq!(identify(b"\x0a\x0d\x0d\x0ajust some line endings"), None);
+        assert_eq!(identify(&[0x1f, 0x8b, 0x41, 0x41]), None);
+        assert_eq!(identify(&[0xff, 0xd8, 0xff, 0x41]), None);
+
+        assert_eq!(identify(b"BZh91AY&SY"), Some("bzip2 stream"));
+        assert_eq!(identify(b"GIF89a"), Some("GIF image"));
+        assert_eq!(identify(b"RIFF\0\0\0\0WAVE"), Some("RIFF container"));
+        assert_eq!(identify(&[0x1f, 0x8b, 0x08, 0x00]), Some("gzip stream"));
+        assert_eq!(identify(&[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]), Some("JPEG image"));
+        assert_eq!(identify(&[0xff, 0xd8, 0xff, 0xc2, 0x00, 0x11]), Some("JPEG image"));
+
+        let mut bmp = b"BM".to_vec();
+        bmp.extend_from_slice(&60u32.to_le_bytes());
+        bmp.extend_from_slice(&[0u8; 64]);
+        bmp[14] = 40;
+        assert_eq!(identify(&bmp), Some("BMP image"));
+
+        // A size that lies and reserved bytes holding something are what a doctored
+        // bitmap looks like, and it is still one. Only the scan asks more of it.
+        bmp[2..6].copy_from_slice(&u32::MAX.to_le_bytes());
+        bmp[6..10].copy_from_slice(b"flag");
+        assert_eq!(identify(&bmp), Some("BMP image"));
+        assert!(magic_scan(&bmp).iter().all(|hit| hit.label != "BMP image"));
+
+        let mut hive = b"regf".to_vec();
+        hive.resize(4096, 0);
+        hive[0x14] = 1;
+        assert_eq!(identify(&hive), Some("Windows registry hive"));
+
+        let mut capture = b"\x0a\x0d\x0d\x0a".to_vec();
+        capture.extend_from_slice(&28u32.to_le_bytes());
+        capture.extend_from_slice(&0x1a2b_3c4du32.to_le_bytes());
+        assert_eq!(identify(&capture), Some("packet capture"));
+    }
+
+    /// Each signature rescanning to the end of the file for its terminator makes 800 KB
+    /// of `PK\x03\x04` a minute and a half of work.
+    #[test]
+    fn a_file_of_nothing_but_signatures_scans_in_linear_time() {
+        for magic in [&b"PK\x03\x04"[..], b"\x89PNG\r\n\x1a\n", b"%PDF", b"BZh9"] {
+            let data = magic.repeat(8_000_000 / magic.len());
+
+            let started = std::time::Instant::now();
+            let hits = magic_scan(&data);
+
+            assert_eq!(hits.len(), MAX_HITS, "the report has to stay bounded");
+            assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        }
+    }
+
+    #[test]
+    fn a_remembered_terminator_is_still_the_right_one() {
+        // Two archives and one terminator after each: the first must not be measured
+        // to the second's end, and neither to one that sits before it.
+        let mut data = b"PK\x03\x04".to_vec();
+        data.extend_from_slice(b"PK\x05\x06");
+        data.extend_from_slice(&[0u8; 18]);
+        let second = data.len();
+        data.extend_from_slice(b"PK\x03\x04");
+        data.extend_from_slice(&[1u8; 8]);
+        data.extend_from_slice(b"PK\x05\x06");
+        data.extend_from_slice(&[0u8; 18]);
+
+        let hits = magic_scan(&data);
+        assert_eq!(hits.len(), 2);
+        assert_eq!((hits[0].offset, hits[0].length), (0, 26));
+        assert_eq!((hits[1].offset, hits[1].length), (second, 34));
+
+        // No terminator after the last signature, though one sits before it.
+        let mut data = b"PK\x03\x04".to_vec();
+        data.extend_from_slice(b"PK\x05\x06");
+        data.extend_from_slice(&[0u8; 18]);
+        data.extend_from_slice(b"PK\x03\x04");
+        let hits = magic_scan(&data);
+        assert!(hits[0].bounded);
+        assert!(!hits[1].bounded);
+    }
+
+    #[test]
+    fn a_tag_anyone_would_recognise_settles_the_case_check() {
+        for real in [&b"HTB{Y0u_F0uNd_1T}"[..], b"picoCTF{mIxEd_CaSe_FlAg}", b"flag{tHiS_iS_fInE}"] {
+            assert_eq!(
+                flag_candidates(real).len(),
+                1,
+                "{} was rejected",
+                String::from_utf8_lossy(real)
+            );
+        }
+
+        // The noise the check exists for has no such tag on it.
+        assert!(flag_candidates(b"qWx{eLwaGqDnYDoZHt}").is_empty());
+    }
+
+    #[test]
+    fn a_configured_tag_is_trusted_past_the_length_limits() {
+        let short = vec!["HV".to_string()];
+        let found = flag_candidates_for_tags(b"HV{some_flag_here}", &short);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].text, "HV{some_flag_here}");
+
+        let long = vec!["cyberapocalypse".to_string()];
+        let found = flag_candidates_for_tags(b"..cyberapocalypse{some_flag_here}", &long);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].text, "cyberapocalypse{some_flag_here}");
+        assert_eq!(found[0].offset, 2);
+
+        // Neither passes unnamed, which is what the limits are for.
+        assert!(flag_candidates(b"HV{some_flag_here}").is_empty());
+        assert!(flag_candidates(b"cyberapocalypse{some_flag_here}").is_empty());
+    }
+
+    #[test]
+    fn a_configured_tag_is_trusted_past_the_case_check() {
+        let tags = vec!["event".to_string()];
+        let found = flag_candidates_for_tags(b"event{mIxEd_CaSe_BoDy}", &tags);
+        assert_eq!(found[0].text, "event{mIxEd_CaSe_BoDy}");
+
+        // Named or not, the body still has to look like a body.
+        assert!(flag_candidates_for_tags(b"event{\x00\x01\x02\x03}", &tags).is_empty());
+        assert!(flag_candidates_for_tags(b"event{ab}", &tags).is_empty());
+        assert!(flag_candidates_for_tags(b"event{{{{{{{{}", &tags).is_empty());
+    }
+
+    #[test]
+    fn a_configured_tag_at_the_end_of_a_long_run_is_reported_as_itself() {
+        // Whatever precedes it is not part of the flag, and a run of a megabyte of
+        // alphanumerics must not come back as one.
+        let mut data = vec![b'x'; 1 << 20];
+        data.extend_from_slice(b"HV{some_flag_here}");
+        let found = flag_candidates_for_tags(&data, &["HV".to_string()]);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].text, "HV{some_flag_here}");
+        assert_eq!(found[0].offset, 1 << 20);
+    }
+
+    #[test]
+    fn a_name_the_filter_never_asked_for_stays_filtered_out() {
+        let tags = vec!["HV".to_string()];
+        assert!(flag_candidates_for_tags(b"flag{not_configured}", &tags).is_empty());
+        assert_eq!(flag_candidates_naming(b"flag{shaped_anyway}", &tags).len(), 1);
+    }
+
+    #[test]
+    fn a_blank_configured_tag_names_nothing() {
+        assert!(flag_candidates_naming(b"no{body_here}", &[String::new(), " ".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn a_file_of_flags_reports_a_bounded_number() {
+        let found = flag_candidates(&b"flag{abcd}".repeat(MAX_FLAGS + 50));
+        assert_eq!(found.len(), MAX_FLAGS);
     }
 }

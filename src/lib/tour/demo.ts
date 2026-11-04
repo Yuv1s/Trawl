@@ -163,7 +163,7 @@ export const SAMPLE_GROUPS: SampleGroup[] = [
 	},
 	{
 		title: 'Built-in practice',
-		note: 'The four files the tour points at, loaded straight from the app.',
+		note: 'Four practice files served with the app.',
 		entries: [
 			{
 				name: 'spectrogram-source.png',
@@ -193,7 +193,7 @@ export const SAMPLE_GROUPS: SampleGroup[] = [
 	},
 	{
 		title: 'Clean controls',
-		note: 'Nothing is hidden here. A detector should stay quiet on ordinary input.',
+		note: 'Nothing is hidden in these, so every detector should stay quiet.',
 		entries: [
 			{
 				name: 'clean.png',
@@ -270,7 +270,7 @@ export const SAMPLE_GROUPS: SampleGroup[] = [
 				name: 'gif-comment.gif',
 				mime: 'image/gif',
 				url: '/samples/survey/gif-comment.gif',
-				blurb: 'flag{gif_comment_block} from a comment, plus a duplicate palette entry.'
+				blurb: 'flag{gif_comment_block} from a comment.'
 			},
 			{
 				name: 'wav-riff-comment.wav',
@@ -324,7 +324,7 @@ export const SAMPLE_GROUPS: SampleGroup[] = [
 	},
 	{
 		title: 'Binaries',
-		note: 'Two pairs, each differing only in what it was built with, so the defence rack is the only thing that changes.',
+		note: 'Two pairs. The files in a pair differ only in how they were built, so only the protections change.',
 		entries: [
 			{
 				name: 'vulnerable-elf',
@@ -338,7 +338,7 @@ export const SAMPLE_GROUPS: SampleGroup[] = [
 				mime: 'application/x-executable',
 				url: '/samples/binaries/hardened-elf',
 				blurb:
-					'The same source with the protections on, so the defence rack reads the other way and the tool stays quiet.'
+					'The same source with the protections on, so every protection reads on and the tool stays quiet.'
 			},
 			{
 				name: 'vulnerable-pe.bin',
@@ -408,7 +408,7 @@ export const SAMPLE_GROUPS: SampleGroup[] = [
 				mime: 'image/png',
 				url: '/samples/cuttlefish/png-bit-plane-region.png',
 				blurb:
-					'A rectangular low-bit region on the bit-plane wall. Noise, not text, so extraction stays quiet.'
+					'A rectangular low-bit region on the bit-plane wall. It holds noise, so extraction stays quiet.'
 			},
 			{
 				name: 'png-embedded-25.png',
@@ -509,7 +509,7 @@ export const SAMPLE_GROUPS: SampleGroup[] = [
 	},
 	{
 		title: 'Mantis and AES',
-		note: 'Check a paste sample to run it in place, or download it to paste the line yourself. The AES file drops in like any other.',
+		note: 'Run a paste sample here, or download it and paste the line yourself. The AES file is dropped like any other file.',
 		entries: [
 			{
 				name: 'mantis-base64-gzip.txt',

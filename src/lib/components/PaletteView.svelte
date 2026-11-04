@@ -20,16 +20,16 @@
 
 	{#if palette.duplicates.length === 0}
 		<p class="clear">
-			Every entry is a different colour. Two entries painting the same colour would let an encoder
-			pick either one, changing the file without changing the picture, and there is none of that
-			here.
+			Every entry is a different colour. Data can hide in a palette when two entries paint the same
+			colour, because an encoder can pick either one without changing the picture. This palette has
+			no such pairs.
 		</p>
 	{:else}
 		<ul class="dupes">
-			{#each palette.duplicates as dup (dup.colour)}
+			{#each palette.duplicates as dup, i (i)}
 				<li>
 					<span class="swatches" aria-hidden="true">
-						{#each { length: dup.count }, i (i)}
+						{#each { length: dup.count }, swatch (swatch)}
 							<span class="swatch" style="background: {dup.colour}"></span>
 						{/each}
 					</span>
@@ -50,18 +50,16 @@
 
 	{#if read > 0}
 		<p class="caveat found">
-			Something used that capacity. The choices between entries were read back and produced
-			something legible, which is below.
+			Something used that capacity. Reading back the choices between entries produced the legible
+			text below.
 		</p>
 	{:else if palette.duplicates.length > 0}
 		<p class="caveat">
-			The choices between these entries were read back in both bit orders and produced nothing
-			legible. The capacity is real; either nothing used it, or what did is encrypted.
+			Reading back the choices in both bit orders produced nothing legible. Either nothing used this
+			capacity or the data is encrypted.
 		</p>
 	{:else}
-		<p class="caveat">
-			With no repeated colour there is no free choice to make, so there is nothing here to read.
-		</p>
+		<p class="caveat">With no repeated colours there are no choices to read.</p>
 	{/if}
 {/if}
 

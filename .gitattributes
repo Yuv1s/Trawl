@@ -5,5 +5,14 @@
 *.bmp binary
 *.gif binary
 
+*.pdf binary
+*.zip binary
+*.woff2 binary
+
+# Samples are test data, so their exact bytes matter. A Windows checkout must not
+# rewrite their line endings, or it would analyse different files from the live site.
+static/samples/** -text
+static/samples/README.md text=auto
+
 # Shell scripts must keep LF, or the shebang breaks on Unix.
 *.sh text eol=lf

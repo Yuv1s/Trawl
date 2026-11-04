@@ -36,7 +36,7 @@
 </script>
 
 {#if values.length === 0}
-	<p class="clear">The file is too small to window.</p>
+	<p class="clear">The file is too small to measure in windows.</p>
 {:else}
 	<dl class="stats mono">
 		<div>
@@ -80,10 +80,10 @@
 	</figure>
 
 	<p class="caveat">
-		8.00 means the bytes are indistinguishable from random, which is what compressed or encrypted
-		data looks like. A PNG sits near 8.00 through its pixel data by design, so a high reading is not
-		a finding on its own. What is worth looking at is a change: a flat stretch inside a compressed
-		file, or high entropy continuing past where the container should have ended.
+		8.00 means the bytes look random, which is what compressed or encrypted data looks like. A PNG
+		sits near 8.00 through its pixel data by design, so a high reading means little on its own. Look
+		for a change instead: a flat stretch inside a compressed file, or high entropy continuing past
+		where the container should have ended.
 	</p>
 {/if}
 

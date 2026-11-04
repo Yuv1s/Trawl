@@ -23,18 +23,23 @@ use super::dct::{Coefficients, DctError};
 
 /// Coefficient values in true entropy-stream order.
 ///
+/// Walked rather than collected: the sweep stops after a few kilobytes, and a large
+/// image has hundreds of megabytes of these.
+///
 /// @param include_dc the original JSteg embeds in DC too; most later variants
 ///        skip it, and reading the wrong one shifts every bit after block one
+fn walk(coefficients: &Coefficients, include_dc: bool) -> impl Iterator<Item = i32> + '_ {
+    let from = if include_dc { 0 } else { 1 };
+
+    coefficients.order.iter().flat_map(move |&(component, index)| {
+        coefficients.blocks[component][index][from..].iter().copied()
+    })
+}
+
+/// [`walk`], collected.
+#[cfg(test)]
 pub fn values(coefficients: &Coefficients, include_dc: bool) -> Vec<i32> {
-    let mut out = Vec::with_capacity(coefficients.total_blocks() * 64);
-
-    for &(component, index) in &coefficients.order {
-        let block = &coefficients.blocks[component][index];
-        let from = if include_dc { 0 } else { 1 };
-        out.extend_from_slice(&block[from..]);
-    }
-
-    out
+    walk(coefficients, include_dc).collect()
 }
 
 /// True for a coefficient JSteg would have written into.
@@ -53,7 +58,7 @@ pub fn extract(
     let mut byte = 0u8;
     let mut filled = 0u8;
 
-    for value in values(coefficients, include_dc) {
+    for value in walk(coefficients, include_dc) {
         if !carries(value) {
             continue;
         }
@@ -147,8 +152,7 @@ pub fn sweep(coefficients: &Coefficients, max_bytes: usize) -> Vec<Candidate> {
 /// and anything outside the range is dropped rather than clamped, which would
 /// pile unrelated counts onto the end bins.
 fn chi_samples(coefficients: &Coefficients, include_dc: bool) -> Vec<u8> {
-    values(coefficients, include_dc)
-        .into_iter()
+    walk(coefficients, include_dc)
         .filter(|&v| carries(v) && (-128..128).contains(&v))
         .map(|v| (v + 128) as u8)
         .collect()
@@ -194,7 +198,7 @@ pub const HISTOGRAM_RANGE: i32 = 12;
 pub fn histogram(coefficients: &Coefficients) -> Vec<(i32, u64)> {
     let mut counts = vec![0u64; (HISTOGRAM_RANGE * 2 + 1) as usize];
 
-    for value in values(coefficients, false) {
+    for value in walk(coefficients, false) {
         if (-HISTOGRAM_RANGE..=HISTOGRAM_RANGE).contains(&value) {
             counts[(value + HISTOGRAM_RANGE) as usize] += 1;
         }

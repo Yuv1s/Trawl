@@ -148,6 +148,22 @@ fn sitemap_locs_finds_a_page_nothing_links_to() {
 }
 
 #[test]
+fn references_and_comments_are_capped_on_a_hostile_page() {
+    // A page with far more links and comments than the caps must come back
+    // bounded, not with the whole flood, so one document cannot exhaust memory.
+    let mut html = String::new();
+    for i in 0..(MAX_REFERENCES + 500) {
+        html.push_str(&format!("<a href=\"/p/{i}\">{i}</a>"));
+    }
+    for i in 0..(MAX_COMMENTS + 500) {
+        html.push_str(&format!("<!-- c{i} -->"));
+    }
+    let refs = references(&base(), html.as_bytes());
+    assert_eq!(refs.len(), MAX_REFERENCES);
+    assert_eq!(comments(html.as_bytes()).len(), MAX_COMMENTS);
+}
+
+#[test]
 fn decode_url_turns_a_filename_flag_back() {
     assert_eq!(
         decode_url("/static/img/gallery-CTF%7Bin_the_name%7D.png"),

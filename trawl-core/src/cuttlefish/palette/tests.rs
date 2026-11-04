@@ -175,6 +175,38 @@ fn json_is_shaped_for_the_worker() {
 }
 
 #[test]
+fn entries_past_the_256th_do_not_wrap_onto_the_first() {
+    // 300 entries, all the same colour. Index 256 as a byte is index 0, so the group
+    // used to claim copies it could not hold and hand index 0 two positions.
+    let palette = vec![9u8; 300 * 3];
+    let found = groups(&palette);
+
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].indices.len(), 256);
+    assert_eq!(found[0].bits, 8);
+    assert_eq!(capacity(&palette, &[0, 255]), 16);
+    assert_eq!(extract(&palette, &[255], true, 16), vec![255]);
+}
+
+#[test]
+fn a_palette_lookup_does_not_search_per_pixel() {
+    // Every entry duplicated, and a pixel count a compressed stream can reach. The
+    // groups used to be searched, and each group's indices, for every one of them.
+    let mut palette = Vec::new();
+    for colour in 0..128u8 {
+        for _ in 0..2 {
+            palette.extend_from_slice(&[colour, colour, colour]);
+        }
+    }
+    let indices = vec![255u8; 32_000_000];
+
+    let started = std::time::Instant::now();
+    assert_eq!(capacity(&palette, &indices), 32_000_000);
+    assert_eq!(extract(&palette, &indices, true, 4096).len(), 4096);
+    assert!(started.elapsed().as_secs() < 15, "took {:?}", started.elapsed());
+}
+
+#[test]
 fn json_reports_an_ordinary_palette_as_carrying_nothing() {
     let palette = palette_with(0, 30);
     let out = json(&palette, &[0, 1, 2, 3], 4096);

@@ -17,10 +17,17 @@
 //! there, and what sits in the gaps between them.
 
 use crate::bytes;
+use std::collections::HashMap;
 
 const LOCAL: &[u8; 4] = b"PK\x03\x04";
 const CENTRAL: &[u8; 4] = b"PK\x01\x02";
 const END: &[u8; 4] = b"PK\x05\x06";
+const DESCRIPTOR: &[u8; 4] = b"PK\x07\x08";
+
+/// Most entries read from either place. A header is thirty bytes, so a file of nothing
+/// else would report far more text than it holds, and the format's own limit without
+/// its 64-bit extension is 65,535.
+const MAX_ENTRIES: usize = 1 << 17;
 
 /// Bytes a local file header occupies before the name begins.
 const LOCAL_HEADER: usize = 30;
@@ -102,7 +109,14 @@ pub struct Entry {
     /// own, since there is no data to point to.
     pub data_offset: Option<usize>,
     /// The archive's own password flag. Trawl does not crack these.
+    ///
+    /// Set only when both places say so. The two disagreeing is pseudo-encryption,
+    /// a flag flipped so tools ask for a password the data was never locked with,
+    /// which is reported as a disagreement and leaves the entry worth opening.
     pub encrypted: bool,
+    /// True when the local header says its sizes follow the data rather than being in
+    /// the header, the way a writer that cannot seek back has to do it.
+    pub streamed: bool,
     /// Per-entry comment, which readers rarely show and puzzles sometimes use.
     pub comment: String,
     /// True when only a local header names this, with nothing in the directory.
@@ -169,6 +183,8 @@ fn local_at(data: &[u8], at: usize) -> Option<Entry> {
         data_offset: Some(name_at + name_len + extra_len),
         // Bit zero is the archive saying its own data is encrypted.
         encrypted: flags & 1 == 1,
+        // Bit three says the three fields above are zero here, and come after the data.
+        streamed: flags & 8 != 0,
         comment: String::new(),
         undeclared: true,
         disagreement: None,
@@ -183,7 +199,9 @@ fn locals(data: &[u8]) -> Vec<Entry> {
     let mut out = Vec::new();
     let mut at = 0usize;
 
-    while let Some(found) = bytes::find(data, at, LOCAL) {
+    while out.len() < MAX_ENTRIES
+        && let Some(found) = bytes::find(data, at, LOCAL)
+    {
         match local_at(data, found) {
             Some(entry) => {
                 at = found + LOCAL_HEADER;
@@ -195,7 +213,46 @@ fn locals(data: &[u8]) -> Vec<Entry> {
         }
     }
 
+    for index in 0..out.len() {
+        let bound = out.get(index + 1).map_or(data.len(), |next| next.offset);
+        let entry = &mut out[index];
+        if entry.streamed {
+            read_descriptor(data, entry, bound);
+        }
+    }
+
     out
+}
+
+/// Fills in a streamed entry's sizes from the descriptor that follows its data.
+///
+/// The signature is optional in the format and can occur in the data, so what settles
+/// it is the compressed size it carries matching how far away it sits. Searched only
+/// as far as the next header, so a file of these stays a single pass. A descriptor
+/// that cannot be found is no finding: the directory, when there is one, has the same
+/// numbers, and an entry only a local header names keeps what the header said.
+fn read_descriptor(data: &[u8], entry: &mut Entry, bound: usize) {
+    let Some(start) = entry.data_offset else {
+        return;
+    };
+    let region = data.get(start..bound).unwrap_or(&[]);
+
+    let mut from = 0usize;
+    while let Some(found) = bytes::find(region, from, DESCRIPTOR) {
+        let at = start + found;
+        if let (Some(crc), Some(compressed), Some(uncompressed)) = (
+            u32_at(data, at + 4),
+            u32_at(data, at + 8),
+            u32_at(data, at + 12),
+        ) && compressed as usize == found
+        {
+            entry.crc = crc;
+            entry.compressed = compressed as u64;
+            entry.uncompressed = uncompressed as u64;
+            return;
+        }
+        from = found + 4;
+    }
 }
 
 /// One record of the central directory: what it claims, and where it points.
@@ -247,14 +304,43 @@ fn central_at(data: &[u8], at: usize) -> Option<(Declared, usize)> {
     Some((record, comment_at + comment_len))
 }
 
-/// Every record of the central directory, walked from its first signature.
+/// Whether a signature sits at an offset the file itself gave, which can be anything.
+fn signature_at(data: &[u8], at: usize, signature: &[u8]) -> bool {
+    at.checked_add(signature.len())
+        .and_then(|end| data.get(at..end))
+        == Some(signature)
+}
+
+/// Where this archive's own directory starts, by what its end record says.
+///
+/// The first signature in the file is not good enough: a ZIP stored inside this
+/// one carries a directory of its own, which comes first. Measured back from the
+/// end record, so an archive with bytes in front of it still works, and falling
+/// back to the first signature when a doctored end record points at nothing.
+fn directory_start(data: &[u8]) -> Option<usize> {
+    let is_directory = |at: usize| signature_at(data, at, CENTRAL);
+
+    last_end(data)
+        .and_then(|end| {
+            let size = u32_at(data, end + 12)? as usize;
+            let offset = u32_at(data, end + 16)? as usize;
+            end.checked_sub(size)
+                .filter(|&at| is_directory(at))
+                .or(Some(offset).filter(|&at| is_directory(at)))
+        })
+        .or_else(|| bytes::find(data, 0, CENTRAL))
+}
+
+/// Every record of the central directory, walked from where it starts.
 fn declared(data: &[u8]) -> Vec<Declared> {
     let mut out = Vec::new();
-    let Some(mut at) = bytes::find(data, 0, CENTRAL) else {
+    let Some(mut at) = directory_start(data) else {
         return out;
     };
 
-    while let Some((record, next)) = central_at(data, at) {
+    while out.len() < MAX_ENTRIES
+        && let Some((record, next)) = central_at(data, at)
+    {
         out.push(record);
         at = next;
     }
@@ -262,19 +348,28 @@ fn declared(data: &[u8]) -> Vec<Declared> {
     out
 }
 
-/// The end-of-directory record: its comment, its claimed count, and where it
-/// finishes.
-fn ending(data: &[u8]) -> Option<(String, usize, usize)> {
-    // Searched from the back, because the signature can occur in file data and
-    // the real record is the last one.
+/// The last end-of-directory signature. The signature can occur in file data,
+/// and the real record is the last one.
+fn last_end(data: &[u8]) -> Option<usize> {
     let mut at = None;
     let mut from = 0usize;
     while let Some(found) = bytes::find(data, from, END) {
         at = Some(found);
         from = found + 4;
     }
+    at
+}
 
-    let at = at?;
+/// Bytes after the end-of-directory record, which no zip tool writes.
+pub fn trailing(data: &[u8]) -> Option<(usize, usize)> {
+    let (_, _, end) = ending(data)?;
+    (data.len() > end).then(|| (end, data.len() - end))
+}
+
+/// The end-of-directory record: its comment, its claimed count, and where it
+/// finishes.
+fn ending(data: &[u8]) -> Option<(String, usize, usize)> {
+    let at = last_end(data)?;
     let count = u16_at(data, at + 10)? as usize;
     let comment_len = u16_at(data, at + 20)? as usize;
     let comment_at = at + END_RECORD;
@@ -287,22 +382,26 @@ fn ending(data: &[u8]) -> Option<(String, usize, usize)> {
 }
 
 /// What the two descriptions disagree about, in the words a person would use.
+///
+/// A streamed header is meant to leave its sizes and checksum as zero, so a zero there
+/// says nothing either way. Anything else it says still counts.
 fn compare(local: &Entry, record: &Declared) -> Option<String> {
     let mut said = Vec::new();
+    let silent = |value: u64| local.streamed && value == 0;
 
-    if local.compressed != record.compressed {
+    if local.compressed != record.compressed && !silent(local.compressed) {
         said.push(format!(
             "compressed size {} here, {} in the directory",
             local.compressed, record.compressed
         ));
     }
-    if local.uncompressed != record.uncompressed {
+    if local.uncompressed != record.uncompressed && !silent(local.uncompressed) {
         said.push(format!(
             "uncompressed size {} here, {} in the directory",
             local.uncompressed, record.uncompressed
         ));
     }
-    if local.crc != record.crc {
+    if local.crc != record.crc && !silent(local.crc as u64) {
         said.push(format!(
             "checksum {:08x} here, {:08x} in the directory",
             local.crc, record.crc
@@ -314,8 +413,36 @@ fn compare(local: &Entry, record: &Declared) -> Option<String> {
             local.method, record.method
         ));
     }
+    if local.encrypted != record.encrypted {
+        let state = |encrypted: bool| if encrypted { "encrypted" } else { "not encrypted" };
+        said.push(format!(
+            "{} here, {} in the directory",
+            state(local.encrypted),
+            state(record.encrypted)
+        ));
+    }
 
     (!said.is_empty()).then(|| said.join("; "))
+}
+
+/// Whether an offset falls inside any of these spans, which are left sorted and merged
+/// so that thousands of entries do not each search thousands of spans.
+fn merged(mut spans: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    spans.sort_unstable();
+
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        match out.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out
+}
+
+fn covered(spans: &[(usize, usize)], offset: usize) -> bool {
+    let after = spans.partition_point(|&(start, _)| start <= offset);
+    after > 0 && offset < spans[after - 1].1
 }
 
 /// Reads an archive, or returns nothing when the file is not one.
@@ -332,14 +459,33 @@ pub fn read(data: &[u8]) -> Option<Archive> {
     let records = declared(data);
     let (comment, declared_count, ends_at) = ending(data).unwrap_or_default();
 
+    let mut at_offset: HashMap<usize, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.offset, index))
+        .collect();
+
     // Matched by where the directory points, since that is the only link the
     // format actually defines. Names are not unique and can be edited freely.
     for record in &records {
-        match entries.iter_mut().find(|e| e.offset == record.points_at) {
+        match at_offset.get(&record.points_at).map(|&index| &mut entries[index]) {
             Some(entry) => {
                 entry.undeclared = false;
                 entry.comment = record.comment.clone();
                 entry.disagreement = compare(entry, record);
+                entry.encrypted &= record.encrypted;
+                // What the header left out, the directory supplies.
+                if entry.streamed {
+                    if entry.compressed == 0 {
+                        entry.compressed = record.compressed;
+                    }
+                    if entry.uncompressed == 0 {
+                        entry.uncompressed = record.uncompressed;
+                    }
+                    if entry.crc == 0 {
+                        entry.crc = record.crc;
+                    }
+                }
                 // The directory's name is the one readers show, so a name that
                 // differs between the two is worth saying out loud.
                 if entry.name != record.name {
@@ -355,21 +501,39 @@ pub fn read(data: &[u8]) -> Option<Archive> {
             }
             // A directory record pointing at nothing. The offset is wrong, or
             // the data it named has been cut out.
-            None => entries.push(Entry {
-                name: record.name.clone(),
-                method: record.method,
-                compressed: record.compressed,
-                uncompressed: record.uncompressed,
-                crc: record.crc,
-                offset: record.points_at,
-                data_offset: None,
-                encrypted: record.encrypted,
-                comment: record.comment.clone(),
-                undeclared: false,
-                disagreement: Some("the directory points here, but there is no header".into()),
-            }),
+            None => {
+                at_offset.insert(record.points_at, entries.len());
+                entries.push(Entry {
+                    name: record.name.clone(),
+                    method: record.method,
+                    compressed: record.compressed,
+                    uncompressed: record.uncompressed,
+                    crc: record.crc,
+                    offset: record.points_at,
+                    data_offset: None,
+                    encrypted: record.encrypted,
+                    streamed: false,
+                    comment: record.comment.clone(),
+                    undeclared: false,
+                    disagreement: Some("the directory points here, but there is no header".into()),
+                });
+            }
         }
     }
+
+    // A header inside a listed file's stored data belongs to that file, such as a
+    // ZIP stored in a ZIP. It is not this archive hiding an entry.
+    let inside = merged(
+        entries
+            .iter()
+            .filter(|e| !e.undeclared && e.method == "stored")
+            .filter_map(|e| {
+                let start = e.data_offset?;
+                Some((start, start.saturating_add(e.compressed as usize)))
+            })
+            .collect(),
+    );
+    entries.retain(|e| !e.undeclared || !covered(&inside, e.offset));
 
     let prefix = entries.iter().map(|e| e.offset).min().unwrap_or(0);
     let trailing = data.len().saturating_sub(ends_at);

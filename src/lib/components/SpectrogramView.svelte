@@ -98,7 +98,7 @@
 
 {#if toneFindings.length > 0}
 	<ul class="tones" aria-label="Decoded audio tones">
-		{#each toneFindings as finding (finding.kind + finding.decoded)}
+		{#each toneFindings as finding, i (i)}
 			<li>
 				<span class="label">{finding.kind}</span>
 				<output class="mono">{finding.decoded}</output>
@@ -118,8 +118,8 @@
 {:else}
 	<div class="head">
 		<p class="lead">
-			Time runs left to right, frequency bottom to top. A payload drawn here is a picture, not a
-			statistic, so nothing below judges it. Look at it.
+			Time runs left to right and frequency bottom to top. Trawl can't judge a picture drawn into
+			sound, so this one is yours to read.
 		</p>
 
 		<div class="readout mono">
@@ -179,8 +179,7 @@
 	<p class="footnote">
 		{spectrogram.width.toLocaleString()} × {spectrogram.height} from a {spectrogram.window}-point
 		transform stepping {spectrogram.hop} samples at a time. Brightness is relative to the loudest bin
-		in this file, not to an absolute level, so a quiet recording is drawn at the same contrast as a loud
-		one.
+		in this file, so a quiet recording is drawn at the same contrast as a loud one.
 	</p>
 {/if}
 

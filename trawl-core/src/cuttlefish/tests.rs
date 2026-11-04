@@ -483,6 +483,40 @@ fn traversal_samples_drops_alpha_and_keeps_pixel_order() {
 }
 
 #[test]
+fn an_image_with_no_pixels_has_an_empty_wall() {
+    // Clamping the thumbnail between one and a width of zero is a panic, and a GIF can
+    // declare a width of zero.
+    for (width, height) in [(0, 5), (5, 0), (0, 0)] {
+        let (json, tw, th, thumbnails) = plane_wall(&[], width, height, 3, 220);
+        assert_eq!((tw, th), (0, 0));
+        assert!(thumbnails.is_empty());
+        assert!(crate::json::is_well_formed(&json), "{json}");
+    }
+}
+
+#[test]
+fn a_very_tall_image_gets_a_bounded_thumbnail() {
+    // One pixel wide and two million tall. The thumbnail used to be just as tall, with
+    // a counter per row for each of the thirty-two planes.
+    let (width, height) = (1, 2_000_000);
+    let rgba = vec![0u8; width * height * 4];
+    let (_, tw, th, thumbnails) = plane_wall(&rgba, width, height, 4, 220);
+
+    assert_eq!(tw, 1);
+    assert_eq!(th, MAX_THUMB_HEIGHT);
+    assert_eq!(thumbnails.len(), 32 * MAX_THUMB_HEIGHT);
+}
+
+#[test]
+fn scaling_a_coordinate_does_not_wrap_at_32_bits() {
+    // A row of an image past 2^27 rows, times a two-thousand row thumbnail, is past
+    // 2^32, which used to land it in the wrong cell or the wrong row altogether.
+    assert_eq!(scale(1 << 27, 2048, 1 << 27), 2048);
+    assert_eq!(scale(0, 2048, 1 << 27), 0);
+    assert_eq!(scale(7, 3, 0), 21, "a zero divisor is not a panic");
+}
+
+#[test]
 fn extract_named_rejects_a_channel_set_that_does_not_exist() {
     let cover = clean_cover(64, 1);
     assert!(extract_named(&cover, "xyz", 0, true, 16).is_none());

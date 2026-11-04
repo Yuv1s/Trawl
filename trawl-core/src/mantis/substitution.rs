@@ -19,7 +19,7 @@
 //! tells them apart, which is why this module is the one that needed the trigram
 //! census, and why it arrives after everything that did not.
 
-use super::ngram;
+use super::{ENGLISH, Rng, ngram};
 
 /// Ciphertext letters as numbers, nought for A. Case and punctuation carry no
 /// trigram evidence and are put back only at the end.
@@ -50,43 +50,12 @@ fn weight_under(cipher: &[u8], key: &[u8; 26]) -> u32 {
     total
 }
 
-/// xorshift64*, seeded from the ciphertext.
-///
-/// Climbing needs somewhere random to start, and a WASM build has no system
-/// entropy to draw on. Seeding from the input instead makes every solve
-/// reproducible: the same ciphertext always walks the same path, so a result
-/// that gets reported can also be re-derived.
-struct Rng(u64);
-
-impl Rng {
-    fn seeded(data: &[u8]) -> Self {
-        let mut hash = 0xcbf29ce484222325u64;
-        for &byte in data {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        Self(hash | 1)
-    }
-
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545f4914f6cdd1d)
-    }
-
-    fn shuffle(&mut self, key: &mut [u8; 26]) {
-        for i in (1..26).rev() {
-            key.swap(i, (self.next() % (i as u64 + 1)) as usize);
-        }
+/// A fresh key to climb from.
+fn shuffle(rng: &mut Rng, key: &mut [u8; 26]) {
+    for i in (1..26).rev() {
+        key.swap(i, (rng.next() % (i as u64 + 1)) as usize);
     }
 }
-
-/// English letter frequencies, in percent, a through z.
-const ENGLISH: [f32; 26] = [
-    8.167, 1.492, 2.782, 4.253, 12.702, 2.228, 2.015, 6.094, 6.966, 0.153, 0.772, 4.025, 2.406,
-    6.749, 7.507, 1.929, 0.095, 5.987, 6.327, 9.056, 2.758, 0.978, 2.360, 0.150, 1.974, 0.074,
-];
 
 /// A first key from letter counts: commonest ciphertext letter to E, and so on
 /// down.
@@ -223,6 +192,14 @@ const RESTARTS: usize = 100;
 /// swapped, which [`RESTARTS`] measures and cannot fix.
 const MIN_LETTERS: usize = 150;
 
+/// Most letters a climb reads.
+///
+/// A key has only 26 choices in it, and a couple of thousand letters is far more
+/// than it takes to settle them, while every swap of every restart reads all of them.
+/// Past this the climb only gets slower, reaching a minute on a long paste. The key it
+/// finds is then applied to the whole text.
+const MAX_CLIMBED: usize = 2048;
+
 /// How readable the result has to be before it is reported.
 ///
 /// Some key always wins, so without a bar this reports a solution for any text
@@ -261,16 +238,17 @@ pub fn solve(data: &[u8]) -> Option<Candidate> {
         return None;
     }
 
+    let cipher = &cipher[..cipher.len().min(MAX_CLIMBED)];
     let before = ngram::fitness(data);
-    let mut rng = Rng::seeded(&cipher);
-    let mut key = by_frequency(&cipher);
+    let mut rng = Rng::seeded(cipher);
+    let mut key = by_frequency(cipher);
 
-    let mut top = climb(&cipher, &mut key);
+    let mut top = climb(cipher, &mut key);
     let mut best = key;
 
     for _ in 1..RESTARTS {
-        rng.shuffle(&mut key);
-        let score = climb(&cipher, &mut key);
+        shuffle(&mut rng, &mut key);
+        let score = climb(cipher, &mut key);
 
         if score > top {
             top = score;

@@ -162,6 +162,15 @@ pub fn statistic(histogram: &[u64; 256]) -> (f64, usize) {
     (chi_square, used.saturating_sub(1))
 }
 
+/// Where the `step`-th of `steps` prefixes ends.
+///
+/// Counted in 64 bits. Three samples a pixel across a forty-five megapixel image times
+/// thirty-two steps is past what a 32-bit `usize` holds, and a wrapped end falls before
+/// the last one and slices backwards.
+fn prefix_end(total: usize, step: usize, steps: usize) -> usize {
+    ((total as u64 * step as u64 / steps as u64) as usize).max(1)
+}
+
 /// Runs the test over increasing prefixes of the sample sequence.
 ///
 /// @param samples 8-bit values in the order an embedder would traverse them
@@ -176,7 +185,7 @@ pub fn sweep(samples: &[u8], steps: usize) -> Vec<Point> {
     let mut cursor = 0usize;
 
     for step in 1..=steps {
-        let end = (samples.len() * step / steps).max(1);
+        let end = prefix_end(samples.len(), step, steps);
         for &value in &samples[cursor..end] {
             histogram[value as usize] += 1;
         }

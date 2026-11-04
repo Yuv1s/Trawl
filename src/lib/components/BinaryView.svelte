@@ -109,13 +109,13 @@
 		</ul>
 	{:else}
 		<p class="clear">
-			Every protection this format can declare is declared and on, and the symbol table is intact.
-			That is what a hardened build looks like.
+			Every protection this format can declare is on, and the symbol table is intact. This looks
+			like a hardened build.
 		</p>
 	{/if}
 
 	<div class="guards">
-		<h3 class="label">What the file declares about its own defences</h3>
+		<h3 class="label">Protections the file declares</h3>
 		<div class="rack">
 			{#each guards as guard (guard.label)}
 				<div class="guard" class:weak={guard.weak} class:unknown={guard.unknown}>
@@ -142,7 +142,7 @@
 		<div class="info">
 			<h3 class="label">Needs at run time</h3>
 			<ul class="chips">
-				{#each binary.needed as library (library)}
+				{#each binary.needed as library, i (i)}
 					<li class="mono chip">{library}</li>
 				{/each}
 			</ul>
@@ -160,7 +160,7 @@
 				>
 			</h3>
 			<ul class="chips">
-				{#each binary.imports as symbol (symbol.from ? `${symbol.from}/${symbol.name}` : symbol.name)}
+				{#each binary.imports as symbol, i (i)}
 					<li
 						class="mono chip"
 						title={symbol.from ? `${symbol.name} from ${symbol.from}` : symbol.name}
@@ -183,7 +183,7 @@
 				>
 			</h3>
 			<ul class="chips">
-				{#each binary.exports as symbol (symbol.name)}
+				{#each binary.exports as symbol, i (i)}
 					<li class="mono chip" title={symbol.name}>
 						{symbol.name} <span class="muted">{symbol.address}</span>
 					</li>
@@ -208,9 +208,9 @@
 			<tbody>
 				{#each binary.sections as section, index (index)}
 					<tr class:odd={section.flags.includes('execute') && section.flags.includes('write')}>
-						<td><span class="mono name">{section.name || '—'}</span></td>
+						<td><span class="mono name">{section.name || '-'}</span></td>
 						<td class="muted">{section.kind}</td>
-						<td class="muted">{section.flags || '—'}</td>
+						<td class="muted">{section.flags || '-'}</td>
 						<td class="mono muted">{section.address}</td>
 						<td class="mono num">{bytes(section.size)}</td>
 						<td class="mono muted">{hex(section.offset)}</td>
@@ -247,12 +247,11 @@
 	{/if}
 
 	<p class="footnote">
-		Every line here is a field in one of the file's own tables. Nothing is disassembled: what the
-		code does is a different question, and answering it needs a tool built around a session that
-		lasts longer than one file.
+		Every line here comes from one of the file's own tables. Trawl doesn't disassemble anything,
+		because working out what the code does needs a tool built for a session longer than one file.
 		{#if binary.format === 'PE' && binary.stripped}
-			A PE keeps its symbol names in a separate database rather than in the image, so the names here
-			are the imports and exports rather than anything local.
+			A PE keeps its symbol names in a separate database, so the only names here are its imports and
+			exports.
 		{/if}
 	</p>
 </div>

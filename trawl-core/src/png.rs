@@ -6,6 +6,8 @@
 
 use core::fmt;
 
+use crate::pixels::MAX_PIXELS;
+
 pub const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,9 +43,25 @@ impl Header {
     }
 
     pub fn stride(&self) -> Result<usize, PngError> {
-        let bits = self.width as usize * self.channels()? * self.bit_depth as usize;
-        Ok(bits.div_ceil(8))
+        stride_of(self.width as usize, self.channels()?, self.bit_depth)
     }
+
+    /// Width times height, once it is known to fit a decode.
+    fn pixels(&self) -> Result<usize, PngError> {
+        (self.width as usize)
+            .checked_mul(self.height as usize)
+            .filter(|&pixels| pixels <= MAX_PIXELS)
+            .ok_or(PngError::TooLarge)
+    }
+}
+
+/// Bytes in one row of `width` pixels, counted in 64 bits because a 32-bit `usize`
+/// wraps long before the widths a header can claim.
+fn stride_of(width: usize, channels: usize, bit_depth: u8) -> Result<usize, PngError> {
+    let bits = (width as u64)
+        .checked_mul(channels as u64 * bit_depth as u64)
+        .ok_or(PngError::TooLarge)?;
+    usize::try_from(bits.div_ceil(8)).map_err(|_| PngError::TooLarge)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +101,7 @@ pub enum PngError {
     PaletteIndexOutOfRange { index: u8, entries: usize },
     BadFilterType(u8),
     ShortPixelData { expected: usize, actual: usize },
+    TooLarge,
 }
 
 impl fmt::Display for PngError {
@@ -108,6 +127,7 @@ impl fmt::Display for PngError {
             Self::ShortPixelData { expected, actual } => {
                 write!(f, "inflated data is {actual} bytes, expected {expected}")
             }
+            Self::TooLarge => write!(f, "IHDR declares more pixels than Trawl will decode"),
         }
     }
 }
@@ -165,8 +185,10 @@ pub fn chunks(file: &[u8]) -> Vec<Chunk> {
 
         let kind_at = at + 4;
         let data_at = kind_at + 4;
-        let crc_at = data_at + length;
-        if crc_at + 4 > file.len() {
+        // A 32-bit length added to a 32-bit offset wraps in WASM, and a wrapped end
+        // looks like one that fits.
+        let Some(crc_at) = data_at.checked_add(length) else { break };
+        if crc_at.checked_add(4).is_none_or(|end| end > file.len()) {
             break;
         }
 
@@ -342,7 +364,10 @@ pub fn unfilter(
     bpp: usize,
     height: usize,
 ) -> Result<Vec<u8>, PngError> {
-    let expected = (stride + 1) * height;
+    let expected = stride
+        .checked_add(1)
+        .and_then(|row| row.checked_mul(height))
+        .ok_or(PngError::TooLarge)?;
     if filtered.len() < expected {
         return Err(PngError::ShortPixelData {
             expected,
@@ -350,6 +375,7 @@ pub fn unfilter(
         });
     }
 
+    // Fits, because it is smaller than `expected`, which the input has proved.
     let mut out = vec![0u8; stride * height];
 
     for y in 0..height {
@@ -478,7 +504,7 @@ fn expand(
     let width = header.width as usize;
     let height = header.height as usize;
     let stride = header.stride()?;
-    let mut rgba = vec![0u8; width * height * 4];
+    let mut rgba = vec![0u8; header.pixels()? * 4];
 
     for y in 0..height {
         let row = &samples[y * stride..(y + 1) * stride];
@@ -517,8 +543,34 @@ fn decode_interlaced(
     let height = header.height as usize;
     let channels = header.channels()?;
     let bpp = header.filter_bpp()?;
+    let pixels = header.pixels()?;
 
-    let mut rgba = vec![0u8; width * height * 4];
+    // What every pass together needs, measured before the canvas is allocated: a
+    // 45-byte file can declare a canvas of tens of gigabytes and never mention it
+    // again.
+    let mut total = 0usize;
+    for (x0, y0, dx, dy) in ADAM7 {
+        let pass_width = width.saturating_sub(x0).div_ceil(dx);
+        let pass_height = height.saturating_sub(y0).div_ceil(dy);
+        if pass_width == 0 || pass_height == 0 {
+            continue;
+        }
+
+        let stride = stride_of(pass_width, channels, header.bit_depth)?;
+        total = stride
+            .checked_add(1)
+            .and_then(|row| row.checked_mul(pass_height))
+            .and_then(|pass| pass.checked_add(total))
+            .ok_or(PngError::TooLarge)?;
+    }
+    if inflated.len() < total {
+        return Err(PngError::ShortPixelData {
+            expected: total,
+            actual: inflated.len(),
+        });
+    }
+
+    let mut rgba = vec![0u8; pixels * 4];
     let mut consumed = 0usize;
 
     for (x0, y0, dx, dy) in ADAM7 {
@@ -528,15 +580,9 @@ fn decode_interlaced(
             continue;
         }
 
-        let stride = (pass_width * channels * header.bit_depth as usize).div_ceil(8);
+        let stride = stride_of(pass_width, channels, header.bit_depth)?;
         let needed = (stride + 1) * pass_height;
-
-        let slice = inflated
-            .get(consumed..consumed + needed)
-            .ok_or(PngError::ShortPixelData {
-                expected: consumed + needed,
-                actual: inflated.len(),
-            })?;
+        let slice = &inflated[consumed..consumed + needed];
         consumed += needed;
 
         let samples = unfilter(slice, stride, bpp, pass_height)?;
@@ -586,6 +632,7 @@ pub fn decode(file: &[u8], inflated: &[u8]) -> Result<Vec<u8>, PngError> {
     if header.color_type == 3 && palette.is_empty() {
         return Err(PngError::MissingPalette);
     }
+    header.pixels()?;
 
     if header.interlace == 1 {
         return decode_interlaced(inflated, &header, palette, transparency);
@@ -699,12 +746,14 @@ fn itxt_is_compressed(file: &[u8], chunk: Chunk) -> bool {
 /// find: compressed bytes are close to uniform, so the shape turns up by chance
 /// across a large enough file. Suppressing those is the difference between a
 /// detector and a random number generator.
-fn region_of(file: &[u8], chunks: &[Chunk], offset: usize) -> (String, bool) {
-    for chunk in chunks {
-        if offset < chunk.data_offset || offset >= chunk.data_offset + chunk.length {
-            continue;
-        }
-
+fn region_of(file: &[u8], chunks: &[Chunk], trailing: Option<usize>, offset: usize) -> (String, bool) {
+    // Chunks are walked in file order, so the last one starting at or before this
+    // offset is the only one that can hold it. A file can carry a hundred thousand
+    // chunks and as many flags, which a linear search squares.
+    let holding = chunks.partition_point(|chunk| chunk.data_offset <= offset);
+    if let Some(chunk) = holding.checked_sub(1).map(|at| &chunks[at])
+        && offset < chunk.data_offset + chunk.length
+    {
         let kind = crate::json::latin1(&chunk.kind);
         let compressed = chunk.is(b"IDAT")
             || chunk.is(b"zTXt")
@@ -713,9 +762,7 @@ fn region_of(file: &[u8], chunks: &[Chunk], offset: usize) -> (String, bool) {
         return (format!("inside {kind}"), !compressed);
     }
 
-    if let Some((start, _)) = trailing_data(file)
-        && offset >= start
-    {
+    if trailing.is_some_and(|start| offset >= start) {
         return ("after IEND".to_string(), true);
     }
 
@@ -725,11 +772,12 @@ fn region_of(file: &[u8], chunks: &[Chunk], offset: usize) -> (String, bool) {
 /// Flag-shaped matches with the region they came from attached.
 pub fn located_flags(file: &[u8]) -> Vec<FlagHit> {
     let chunks = chunks(file);
+    let trailing = trailing_of(file, &chunks).map(|(start, _)| start);
 
     crate::bytes::flag_candidates(file)
         .into_iter()
         .map(|found| {
-            let (region, credible) = region_of(file, &chunks, found.offset);
+            let (region, credible) = region_of(file, &chunks, trailing, found.offset);
             FlagHit {
                 offset: found.offset,
                 text: found.text,
@@ -757,9 +805,12 @@ pub struct Palette {
 pub fn palette(file: &[u8], indices: Option<&[u8]>) -> Option<Palette> {
     let plte = chunk_payload(file, b"PLTE")?;
     let entries = plte.len() / 3;
+    // An index is one byte, so an entry past the 256th can never paint a pixel. The
+    // format forbids them and a doctored file can still carry a megabyte of them.
+    let reachable = entries.min(256);
 
     let mut seen: Vec<(&[u8], Vec<usize>)> = Vec::new();
-    for i in 0..entries {
+    for i in 0..reachable {
         let colour = &plte[i * 3..i * 3 + 3];
         match seen.iter_mut().find(|(c, _)| *c == colour) {
             Some((_, at)) => at.push(i),
@@ -781,27 +832,13 @@ pub fn palette(file: &[u8], indices: Option<&[u8]>) -> Option<Palette> {
     }
 
     let unused = if indices.is_some() {
-        (0..entries).filter(|&i| !used[i]).count()
+        (0..reachable).filter(|&i| !used[i]).count() + (entries - reachable)
     } else {
         0
     };
 
     // Each pixel painted with a duplicated colour can choose among its copies.
-    let capacity_bits = match indices {
-        Some(data) => seen
-            .iter()
-            .filter(|(_, at)| at.len() > 1)
-            .map(|(_, at)| {
-                let bits = (usize::BITS - (at.len() - 1).leading_zeros()) as usize;
-                let pixels = data
-                    .iter()
-                    .filter(|&&i| at.contains(&(i as usize)))
-                    .count();
-                bits * pixels
-            })
-            .sum(),
-        None => 0,
-    };
+    let capacity_bits = indices.map_or(0, |data| crate::cuttlefish::palette::capacity(plte, data));
 
     Some(Palette {
         entries,
@@ -818,12 +855,13 @@ pub fn palette_indices(file: &[u8], inflated: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
+    let pixels = header.pixels().ok()?;
     let stride = header.stride().ok()?;
     let samples = unfilter(inflated, stride, header.filter_bpp().ok()?, header.height as usize).ok()?;
     let width = header.width as usize;
     let per_byte = 8 / header.bit_depth as usize;
 
-    let mut out = Vec::with_capacity(width * header.height as usize);
+    let mut out = Vec::with_capacity(pixels);
     for y in 0..header.height as usize {
         let row = &samples[y * stride..(y + 1) * stride];
         for x in 0..width {
@@ -843,7 +881,11 @@ pub fn palette_indices(file: &[u8], inflated: &[u8]) -> Option<Vec<u8>> {
 /// Offset and length of anything after the IEND chunk. A PNG is complete at IEND,
 /// so bytes past it were put there deliberately.
 pub fn trailing_data(file: &[u8]) -> Option<(usize, usize)> {
-    let iend = chunks(file).into_iter().find(|c| c.is(b"IEND"))?;
+    trailing_of(file, &chunks(file))
+}
+
+fn trailing_of(file: &[u8], chunks: &[Chunk]) -> Option<(usize, usize)> {
+    let iend = chunks.iter().find(|c| c.is(b"IEND"))?;
     let end = iend.data_offset + iend.length + 4;
     (file.len() > end).then(|| (end, file.len() - end))
 }

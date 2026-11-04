@@ -27,6 +27,24 @@ fn hide(message: &[u8], channels: usize, channel: Option<usize>, bit: u8, msb_fi
 }
 
 #[test]
+fn an_hour_of_audio_is_not_all_read_for_tones() {
+    assert_eq!(tone_signal(&vec![0; 100], 2).len(), 50);
+    let long = vec![0i32; MAX_TONE_SAMPLES + 50];
+    assert_eq!(tone_signal(&long, 1).len(), MAX_TONE_SAMPLES);
+    assert!(tone_signal(&[], 0).is_empty());
+}
+
+#[test]
+fn a_huge_sample_rate_does_not_wrap_a_window_length() {
+    // The rate is a 32-bit field. Times forty it wraps a 32-bit usize to something
+    // small, which would pass for a real window.
+    assert_eq!(milliseconds(u32::MAX, 40), 171_798_691);
+    assert_eq!(milliseconds(8000, 10), 80);
+    assert_eq!(detect_dtmf(&[0; 64], 1, u32::MAX), None);
+    assert_eq!(detect_morse(&[0; 64], 1, u32::MAX), None);
+}
+
+#[test]
 fn finds_a_message_written_into_the_low_bit() {
     let samples = hide(b"flag{audio_lsb}", 1, None, 0, true);
     let found = sweep(&samples, 1, 4096);

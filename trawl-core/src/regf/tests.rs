@@ -111,7 +111,7 @@ impl Builder {
 
     /// Writes one cell and returns the offset it can be referenced by. A
     /// negative size is what marks a cell as in use rather than freed.
-    fn alloc(&mut self, body: &[u8]) -> u32 {
+    pub(crate) fn alloc(&mut self, body: &[u8]) -> u32 {
         let at = self.bins.len() as u32;
         let size = (4 + body.len()).div_ceil(8) * 8;
         self.bins
@@ -179,6 +179,20 @@ impl Builder {
         body[0x48..0x4a].copy_from_slice(&(key.name.len() as u16).to_le_bytes());
         body.extend_from_slice(key.name.as_bytes());
         self.alloc(&body)
+    }
+
+    /// Points a key that has already been written at a subkey list, which is how a
+    /// test draws a shape no honest writer would produce.
+    pub(crate) fn point_subkeys_at(&mut self, key: u32, list: u32) {
+        let field = key as usize + 4 + 0x1c;
+        self.bins[field..field + 4].copy_from_slice(&list.to_le_bytes());
+    }
+
+    /// Points a key that has already been written at a value list.
+    pub(crate) fn point_values_at(&mut self, key: u32, list: u32, count: u32) {
+        let field = key as usize + 4 + 0x24;
+        self.bins[field..field + 4].copy_from_slice(&count.to_le_bytes());
+        self.bins[field + 4..field + 8].copy_from_slice(&list.to_le_bytes());
     }
 
     /// Wraps the bins in a base block, which is what makes the whole thing a
@@ -432,6 +446,159 @@ fn survives_a_truncated_hive() {
     let hive = Hive::open(&file).unwrap();
     assert_eq!(hive.version, "1.5");
     assert!(hive.find("ControlSet001").is_none());
+}
+
+/// A hive whose root's subkey list is an `ri` naming itself over and over, which is
+/// what a limit on depth alone cannot stop: it is breadth to the power of the depth.
+fn self_pointing_ri_hive(entries: usize) -> Vec<u8> {
+    let mut builder = Builder::new();
+    let mut body = b"ri".to_vec();
+    body.extend_from_slice(&(entries as u16).to_le_bytes());
+    body.resize(4 + entries * 4, 0);
+    let list = builder.alloc(&body);
+    for index in 0..entries {
+        let at = list as usize + 4 + 4 + index * 4;
+        builder.bins[at..at + 4].copy_from_slice(&list.to_le_bytes());
+    }
+
+    let root = builder.write_key(&BuildKey::new("ROOT"));
+    let field = root as usize + 4 + 0x1c;
+    builder.bins[field..field + 4].copy_from_slice(&list.to_le_bytes());
+    builder.finish(root, "NTUSER.DAT")
+}
+
+#[test]
+fn an_ri_list_naming_itself_is_read_once() {
+    let file = self_pointing_ri_hive(64);
+    let hive = Hive::open(&file).unwrap();
+
+    let started = std::time::Instant::now();
+    assert!(hive.children(hive.root_offset()).is_empty());
+    assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+}
+
+#[test]
+fn two_ri_lists_naming_each_other_are_read_once_each() {
+    let mut builder = Builder::new();
+    let child = builder.write_key(&BuildKey::new("Child"));
+
+    let mut leaf = b"li".to_vec();
+    leaf.extend_from_slice(&1u16.to_le_bytes());
+    leaf.extend_from_slice(&child.to_le_bytes());
+    let leaf = builder.alloc(&leaf);
+
+    let mut body = b"ri".to_vec();
+    body.extend_from_slice(&2u16.to_le_bytes());
+    body.resize(4 + 2 * 4, 0);
+    let first = builder.alloc(&body);
+    let second = builder.alloc(&body);
+    for (list, entries) in [(first, [second, leaf]), (second, [first, leaf])] {
+        for (index, entry) in entries.iter().enumerate() {
+            let at = list as usize + 4 + 4 + index * 4;
+            builder.bins[at..at + 4].copy_from_slice(&entry.to_le_bytes());
+        }
+    }
+
+    let root = builder.write_key(&BuildKey::new("ROOT"));
+    let field = root as usize + 4 + 0x1c;
+    builder.bins[field..field + 4].copy_from_slice(&first.to_le_bytes());
+    let file = builder.finish(root, "NTUSER.DAT");
+
+    let hive = Hive::open(&file).unwrap();
+    let names: Vec<String> = hive
+        .children(hive.root_offset())
+        .into_iter()
+        .map(|(_, key)| key.name)
+        .collect();
+    assert_eq!(names, vec!["Child"]);
+}
+
+#[test]
+fn a_value_is_charged_for_what_it_keeps() {
+    // One value with a long name and a long string, listed five hundred times by each
+    // of three thousand keys. A quarter of a megabyte of file, and without a charge for
+    // what each one keeps the reads alone let the keys hold most of a gigabyte.
+    let mut builder = Builder::new();
+    let value = builder.write_value(&BuildValue::string(&"n".repeat(500), &"v".repeat(250)));
+    let list = builder.alloc(&value.to_le_bytes().repeat(500));
+
+    let mut subkeys = b"li".to_vec();
+    subkeys.extend_from_slice(&3000u16.to_le_bytes());
+    for _ in 0..3000 {
+        let key = builder.write_key(&BuildKey::new("k"));
+        builder.point_values_at(key, list, 500);
+        subkeys.extend_from_slice(&key.to_le_bytes());
+    }
+    let subkeys = builder.alloc(&subkeys);
+    let root = builder.write_key(&BuildKey::new("ROOT"));
+    builder.point_subkeys_at(root, subkeys);
+    let file = builder.finish(root, "x");
+    assert!(file.len() < 300 * 1024, "{}", file.len());
+
+    let hive = Hive::open(&file).unwrap();
+    let kept: usize = hive
+        .children(hive.root_offset())
+        .iter()
+        .flat_map(|(_, key)| &key.values)
+        .map(|value| value.name.len() + value.data.len())
+        .sum();
+
+    assert!(kept > 0);
+    assert!(kept <= MAX_VALUE_READS * BYTES_PER_READ, "kept {kept} bytes");
+}
+
+#[test]
+fn a_key_listed_many_times_is_one_subkey() {
+    let mut builder = Builder::new();
+    let child = builder.write_key(&BuildKey::new("Only"));
+    let mut list = b"li".to_vec();
+    list.extend_from_slice(&5000u16.to_le_bytes());
+    for _ in 0..5000 {
+        list.extend_from_slice(&child.to_le_bytes());
+    }
+    let list = builder.alloc(&list);
+    let root = builder.write_key(&BuildKey::new("ROOT"));
+    let field = root as usize + 4 + 0x1c;
+    builder.bins[field..field + 4].copy_from_slice(&list.to_le_bytes());
+    let file = builder.finish(root, "NTUSER.DAT");
+
+    let hive = Hive::open(&file).unwrap();
+    assert_eq!(hive.children(hive.root_offset()).len(), 1);
+}
+
+#[test]
+fn a_walk_stops_when_its_budget_is_spent() {
+    let file = system_hive();
+    let hive = Hive::open(&file).unwrap();
+    hive.keys_left.set(1);
+
+    assert!(hive.root().is_some(), "the one read the budget allows");
+    assert!(hive.root().is_none(), "and nothing after it");
+    assert!(hive.find("ControlSet001").is_none());
+}
+
+#[test]
+fn values_stop_when_their_budget_is_spent() {
+    let file = hive_of(
+        BuildKey::new("ROOT")
+            .value(BuildValue::dword("One", 1))
+            .value(BuildValue::dword("Two", 2)),
+        "NTUSER.DAT",
+    );
+    let hive = Hive::open(&file).unwrap();
+    hive.values_left.set(1);
+
+    assert_eq!(hive.root().unwrap().values.len(), 1);
+}
+
+#[test]
+fn a_very_long_name_is_cut_to_a_length_worth_copying() {
+    let long = "x".repeat(8000);
+    let file = hive_of(BuildKey::new("ROOT").child(BuildKey::new(&long)), "NTUSER.DAT");
+    let hive = Hive::open(&file).unwrap();
+
+    let children = hive.children(hive.root_offset());
+    assert_eq!(children[0].1.name.len(), MAX_NAME_BYTES);
 }
 
 #[test]

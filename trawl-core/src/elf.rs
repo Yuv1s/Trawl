@@ -74,13 +74,42 @@ impl Reader<'_> {
     }
 }
 
+/// Longest name kept. A string table with no terminators hands every symbol the rest
+/// of the table, so a thousand symbols and three megabytes of `A` is three gigabytes
+/// of names. Mangled C++ can run long, and the part past this reads no better.
+const MAX_NAME: usize = 4096;
+
+/// Longest section name kept. A header size of zero has all sixty-five thousand sections
+/// read the same header, which at the longest name above is a quarter of a gigabyte out
+/// of a few kilobytes of file. Real ones run to a few dozen characters.
+const MAX_SECTION_NAME: usize = 256;
+
+/// Symbols walked across every table. The section table can name the same symbol
+/// table sixty-five thousand times over, and the biggest real binaries hold a few
+/// million.
+const MAX_SYMBOLS_WALKED: usize = 1 << 22;
+
+/// A file offset or size from the headers. Those are 64 bits wide in a 64-bit file,
+/// and cast down to a WASM `usize` they keep their low half and point somewhere real.
+/// Saturated instead, so a value too large to address fails the bounds checks it
+/// meets next.
+fn address(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
 /// A null-terminated name out of a string table, held to that table's own
 /// bounds so a corrupt offset reads nothing rather than the rest of the file.
 fn string_at(data: &[u8], table: (usize, usize), offset: u32) -> Option<String> {
+    string_within(data, table, offset, MAX_NAME)
+}
+
+/// [`string_at`], kept to a given length.
+fn string_within(data: &[u8], table: (usize, usize), offset: u32, limit: usize) -> Option<String> {
     let (start, size) = table;
     let end = start.checked_add(size)?;
     let at = start.checked_add(offset as usize)?;
     let slice = data.get(at..end)?;
+    let slice = &slice[..slice.len().min(limit)];
     let stop = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
     Some(crate::json::latin1(&slice[..stop]))
 }
@@ -98,7 +127,7 @@ fn machine_name(value: u16) -> &'static str {
         62 => "x86-64",
         183 => "AArch64",
         243 => "RISC-V",
-        _ => "an architecture this does not name",
+        _ => "an unrecognised architecture",
     }
 }
 
@@ -225,16 +254,16 @@ pub fn read(data: &[u8]) -> Option<Binary> {
     let shnum = r.u16(after + 12)? as usize;
     let shstrndx = r.u16(after + 14)? as usize;
 
-    let raw_sections = read_section_headers(&r, shoff as usize, shentsize, shnum);
+    let raw_sections = read_section_headers(&r, address(shoff), shentsize, shnum);
     let shstrtab = raw_sections
         .get(shstrndx)
-        .map(|s| (s.offset as usize, s.size as usize));
+        .map(|s| (address(s.offset), address(s.size)));
 
     let sections: Vec<Section> = raw_sections
         .iter()
         .map(|s| Section {
             name: shstrtab
-                .and_then(|table| string_at(data, table, s.name_offset))
+                .and_then(|table| string_within(data, table, s.name_offset, MAX_SECTION_NAME))
                 .unwrap_or_default(),
             kind: section_kind(s.kind).to_string(),
             address: s.address,
@@ -244,15 +273,16 @@ pub fn read(data: &[u8]) -> Option<Binary> {
         })
         .collect();
 
-    let segments = read_program_headers(&r, phoff as usize, phentsize, phnum);
+    let segments = read_program_headers(&r, address(phoff), phentsize, phnum);
 
     let interpreter = segments
         .iter()
         .find(|s| s.kind == "INTERP")
         .and_then(|s| {
-            let start = s.offset as usize;
-            let end = start.checked_add(s.file_size as usize)?;
+            let start = address(s.offset);
+            let end = start.checked_add(address(s.file_size))?;
             let slice = data.get(start..end)?;
+            let slice = &slice[..slice.len().min(MAX_NAME)];
             let stop = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
             Some(crate::json::latin1(&slice[..stop]))
         })
@@ -264,6 +294,7 @@ pub fn read(data: &[u8]) -> Option<Binary> {
     let mut export_count = 0usize;
     let mut canary = false;
     let mut fortify = false;
+    let mut symbols_left = MAX_SYMBOLS_WALKED;
 
     // Both symbol tables are walked, not just the dynamic one: a statically
     // linked binary has no `.dynsym` at all, and its guard symbols live in
@@ -271,14 +302,19 @@ pub fn read(data: &[u8]) -> Option<Binary> {
     for table in raw_sections.iter().filter(|s| s.kind == 2 || s.kind == 11) {
         let strings = raw_sections
             .get(table.link as usize)
-            .map(|s| (s.offset as usize, s.size as usize));
+            .map(|s| (address(s.offset), address(s.size)));
         let Some(strings) = strings else { continue };
 
-        let stride = if wide { 24 } else { 16 };
-        let count = (table.size as usize) / stride.max(1);
+        let stride: usize = if wide { 24 } else { 16 };
+        let count = address(table.size) / stride;
 
         for index in 0..count {
-            let at = (table.offset as usize).saturating_add(index * stride);
+            if symbols_left == 0 {
+                break;
+            }
+            symbols_left -= 1;
+
+            let at = address(table.offset).saturating_add(index.saturating_mul(stride));
             let Some(name_offset) = r.u32(at) else { break };
 
             let (info, shndx, value) = if wide {
@@ -435,6 +471,9 @@ fn read_program_headers(
     (0..phnum)
         .filter_map(|index| {
             let at = phoff.checked_add(index.checked_mul(phentsize)?)?;
+            if at >= r.data.len() {
+                return None;
+            }
             // The flags word sits right after the type in a 64-bit header
             // and all the way past the sizes in a 32-bit one, which is the
             // one place the two layouts disagree on order rather than width.
@@ -485,24 +524,27 @@ fn read_dynamic(r: &Reader, sections: &[RawSection]) -> (Vec<String>, Option<Str
     };
     let Some(strings) = sections
         .get(dynamic.link as usize)
-        .map(|s| (s.offset as usize, s.size as usize))
+        .map(|s| (address(s.offset), address(s.size)))
     else {
         return (needed, runpath, bind_now);
     };
 
     let stride = r.word() * 2;
-    let count = (dynamic.size as usize) / stride.max(1);
+    let count = address(dynamic.size) / stride;
 
     for index in 0..count {
-        let at = (dynamic.offset as usize).saturating_add(index * stride);
-        let (Some(tag), Some(value)) = (r.addr(at), r.addr(at + r.word())) else {
+        let at = address(dynamic.offset).saturating_add(index.saturating_mul(stride));
+        let (Some(tag), Some(value)) = (r.addr(at), r.addr(at.saturating_add(r.word()))) else {
             break;
         };
 
         match tag {
             DT_NULL => break,
             DT_NEEDED => {
-                if let Some(name) = string_at(r.data, strings, value as u32) {
+                // The same name a million times over is still only a table this long.
+                if needed.len() < MAX_SYMBOLS
+                    && let Some(name) = string_at(r.data, strings, value as u32)
+                {
                     needed.push(name);
                 }
             }

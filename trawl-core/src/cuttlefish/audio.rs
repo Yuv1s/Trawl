@@ -78,6 +78,23 @@ fn strongest(samples: &[f32], sample_rate: u32, frequencies: &[f32]) -> (usize, 
     (first.0, first.1, ranked.get(1).map_or(0.0, |value| value.1))
 }
 
+/// Samples read for tones. Every frame is several filters over a window, so an hour of
+/// audio is minutes of work, and a Morse or DTMF message is seconds long and at the
+/// start of a file.
+const MAX_TONE_SAMPLES: usize = 1 << 23;
+
+/// Every channel averaged, as far as tones are looked for.
+fn tone_signal(samples: &[i32], channels: usize) -> Vec<f32> {
+    let frames = samples.len().min(MAX_TONE_SAMPLES.saturating_mul(channels.max(1)));
+    mono(&samples[..frames], channels)
+}
+
+/// Samples in a span of time. The rate is a 32-bit field the file sets, so this is
+/// counted wider than a WASM `usize` before it is divided back down.
+fn milliseconds(sample_rate: u32, span: u64) -> usize {
+    usize::try_from(sample_rate as u64 * span / 1000).unwrap_or(usize::MAX)
+}
+
 pub fn detect_dtmf(samples: &[i32], channels: usize, sample_rate: u32) -> Option<ToneFinding> {
     const LOW: [f32; 4] = [697.0, 770.0, 852.0, 941.0];
     const HIGH: [f32; 4] = [1209.0, 1336.0, 1477.0, 1633.0];
@@ -88,8 +105,8 @@ pub fn detect_dtmf(samples: &[i32], channels: usize, sample_rate: u32) -> Option
         ['*', '0', '#', 'D'],
     ];
 
-    let signal = mono(samples, channels);
-    let window = ((sample_rate as usize * 40) / 1000).max(64);
+    let signal = tone_signal(samples, channels);
+    let window = milliseconds(sample_rate, 40).max(64);
     let hop = window / 2;
     if signal.len() < window || hop == 0 {
         return None;
@@ -152,10 +169,10 @@ fn morse_char(code: &str) -> Option<char> {
 }
 
 pub fn detect_morse(samples: &[i32], channels: usize, sample_rate: u32) -> Option<ToneFinding> {
-    let signal = mono(samples, channels);
-    let window = ((sample_rate as usize * 10) / 1000).max(32);
+    let signal = tone_signal(samples, channels);
+    let window = milliseconds(sample_rate, 10).max(32);
     let hop = window;
-    if signal.len() < window * 8 || hop == 0 {
+    if signal.len() < window.saturating_mul(8) || hop == 0 {
         return None;
     }
 

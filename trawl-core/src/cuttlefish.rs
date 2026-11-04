@@ -132,7 +132,7 @@ pub fn extract_columns(
         msb_first,
         max_bytes,
         |step| (step % height) * width + step / height,
-        width * height,
+        rgba.len() / 4,
     )
 }
 
@@ -193,6 +193,18 @@ pub fn sweep(
     has_alpha: bool,
     max_bytes: usize,
 ) -> Vec<Candidate> {
+    sweep_naming(rgba, width, height, has_alpha, max_bytes, &[])
+}
+
+/// [`sweep`], with configured flag tags let past what an unnamed flag has to look like.
+pub fn sweep_naming(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    has_alpha: bool,
+    max_bytes: usize,
+    tags: &[String],
+) -> Vec<Candidate> {
     let mut out = Vec::new();
 
     for (label, channels) in CHANNEL_SETS {
@@ -209,7 +221,7 @@ pub fn sweep(
                     extract(rgba, channels, bit, msb_first, max_bytes)
                 };
 
-                let flags: Vec<String> = bytes::flag_candidates(&stream)
+                let flags: Vec<String> = bytes::flag_candidates_naming(&stream, tags)
                     .into_iter()
                     .map(|f| f.text)
                     .collect();
@@ -258,9 +270,21 @@ pub fn sweep_json(
     has_alpha: bool,
     max_bytes: usize,
 ) -> String {
+    sweep_json_naming(rgba, width, height, has_alpha, max_bytes, &[])
+}
+
+/// [`sweep_json`], with configured flag tags.
+pub fn sweep_json_naming(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    has_alpha: bool,
+    max_bytes: usize,
+    tags: &[String],
+) -> String {
     use crate::json::{push_bool, push_field, push_number, push_string};
 
-    let found = sweep(rgba, width, height, has_alpha, max_bytes);
+    let found = sweep_naming(rgba, width, height, has_alpha, max_bytes, tags);
     let mut out = String::from("{");
 
     push_number(&mut out, "pixels", rgba.len() / 4);
@@ -338,6 +362,17 @@ pub fn plane_full(rgba: &[u8], channel: usize, bit: u8) -> Vec<u8> {
         .collect()
 }
 
+/// Tallest thumbnail the wall will make. An image a pixel wide and millions tall
+/// would otherwise get a thumbnail just as tall, with a counter for every one of its
+/// thirty-two planes at every row.
+const MAX_THUMB_HEIGHT: usize = 2048;
+
+/// `a * b / c`, counted in 64 bits. Pixel coordinates and thumbnail sizes multiply
+/// past what a 32-bit `usize` holds long before the image gets unreasonable.
+fn scale(a: usize, b: usize, c: usize) -> usize {
+    (a as u64 * b as u64 / c.max(1) as u64) as usize
+}
+
 /// Every plane downsampled for the wall, plus the statistics that rank them.
 ///
 /// One pass over the image fills every plane's accumulator at once, because
@@ -345,7 +380,8 @@ pub fn plane_full(rgba: &[u8], channel: usize, bit: u8) -> Vec<u8> {
 /// the memory traffic for the same arithmetic.
 ///
 /// Returns the stats as JSON and the thumbnails as one grayscale block, ordered
-/// channel-major then bit ascending.
+/// channel-major then bit ascending. An image with no pixels has an empty wall, and
+/// clamping a thumbnail between one and a width of zero is a panic.
 pub fn plane_wall(
     rgba: &[u8],
     width: usize,
@@ -353,8 +389,12 @@ pub fn plane_wall(
     channels: usize,
     target_width: usize,
 ) -> (String, usize, usize, Vec<u8>) {
+    if width == 0 || height == 0 {
+        return (stats_json(&[], 0, 0, channels, width, height), 0, 0, Vec::new());
+    }
+
     let tw = target_width.clamp(1, width);
-    let th = (height * tw / width).max(1);
+    let th = scale(height, tw, width).clamp(1, MAX_THUMB_HEIGHT);
     let cells = tw * th;
     let planes = channels * 8;
 
@@ -366,11 +406,11 @@ pub fn plane_wall(
     let mut previous_row = vec![0u8; width * channels];
 
     for y in 0..height {
-        let ty = (y * th / height).min(th - 1);
+        let ty = scale(y, th, height).min(th - 1);
         let mut previous = [0u8; 4];
 
         for x in 0..width {
-            let tx = (x * tw / width).min(tw - 1);
+            let tx = scale(x, tw, width).min(tw - 1);
             let cell = ty * tw + tx;
             counts[cell] += 1;
 
@@ -401,12 +441,15 @@ pub fn plane_wall(
     for plane in 0..planes {
         for cell in 0..cells {
             let count = counts[cell].max(1);
-            thumbnails[plane * cells + cell] = ((sums[plane * cells + cell] * 255) / count) as u8;
+            // Widened, because a cell can hold more set bits than times 255 fits.
+            let share = sums[plane * cells + cell] as u64 * 255 / count as u64;
+            thumbnails[plane * cells + cell] = share as u8;
         }
     }
 
-    let pairs =
-        (width.saturating_sub(1) * height + width * height.saturating_sub(1)).max(1) as f32;
+    let pairs = (width.saturating_sub(1) as f64 * height as f64
+        + width as f64 * height.saturating_sub(1) as f64)
+        .max(1.0) as f32;
     let stats: Vec<PlaneStat> = (0..planes)
         .map(|p| PlaneStat {
             channel: p / 8,

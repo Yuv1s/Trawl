@@ -18,6 +18,7 @@ pub enum GifError {
     NoImage,
     BadCode,
     DimensionOverflow,
+    ZeroDimension,
     FrameLimit,
     WorkLimit,
 }
@@ -30,8 +31,9 @@ impl fmt::Display for GifError {
             Self::NoImage => write!(f, "no image descriptor before the trailer"),
             Self::BadCode => write!(f, "the compressed data contains an impossible code"),
             Self::DimensionOverflow => write!(f, "frame dimensions overflow logical screen"),
+            Self::ZeroDimension => write!(f, "the header declares a zero width or height"),
             Self::FrameLimit => write!(f, "too many frames for automatic analysis"),
-            Self::WorkLimit => write!(f, "composited pixel budget exceeded"),
+            Self::WorkLimit => write!(f, "the canvas is larger than Trawl will composite"),
         }
     }
 }
@@ -40,7 +42,29 @@ pub fn has_signature(file: &[u8]) -> bool {
     file.starts_with(b"GIF87a") || file.starts_with(b"GIF89a")
 }
 
+/// How long one frame shows and what happens to it afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timing {
+    /// Hundredths of a second.
+    pub delay: u16,
+    pub disposal: u8,
+}
+
+impl Timing {
+    /// The method's name, in the words the frame list reads. Values above three are
+    /// reserved by the format, so one is worth showing rather than hiding.
+    pub fn disposal_name(&self) -> &'static str {
+        match self.disposal {
+            0 => "none",
+            1 => "doNotDispose",
+            2 => "background",
+            3 => "previous",
+            _ => "reserved",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
     pub width: usize,
     pub height: usize,
@@ -48,6 +72,8 @@ pub struct Header {
     pub declared_frames: usize,
     pub interlaced: bool,
     pub palette_entries: usize,
+    /// One per frame analysed, in order.
+    pub timings: Vec<Timing>,
 }
 
 /// One image descriptor plus the Graphic Control Extension it belongs to, and
@@ -112,7 +138,15 @@ const PASSES: [(usize, usize); 4] = [(0, 8), (4, 8), (2, 4), (1, 2)];
 
 /// Work budgets. A valid animation over these is reported as capped, not an error.
 const MAX_FRAMES: usize = 128;
-const MAX_PIXELS_PER_FRAME: usize = 16_000_000;
+
+/// Largest canvas worth compositing. Unlike the two others this one is refused
+/// outright, because even a single frame has to be painted onto all of it.
+const MAX_CANVAS_PIXELS: usize = 16_000_000;
+
+/// Canvas pixels across every frame kept. Each frame costs a whole canvas however
+/// little of it the frame paints, and its difference from the last costs another, so
+/// a 1x1 frame on a 4000x4000 screen is 128 MB and 128 of them fit in two kilobytes
+/// of file.
 const MAX_COMPOSITED_PIXELS: usize = 64_000_000;
 
 /// GIF's LZW: codes are packed least significant bit first, and the code width
@@ -139,7 +173,7 @@ fn lzw(min_code_size: u8, data: &[u8], limit: usize) -> Result<Vec<u8>, GifError
     let mut stack = Vec::with_capacity(4096);
 
     let mut bit = 0usize;
-    let total_bits = data.len() * 8;
+    let total_bits = data.len().saturating_mul(8);
 
     while bit + width as usize <= total_bits {
         let mut code = 0u16;
@@ -222,6 +256,11 @@ fn parse(file: &[u8]) -> Result<Parsed, GifError> {
 
     let screen_width = u16_at(file, 6).ok_or(GifError::Truncated)?;
     let screen_height = u16_at(file, 8).ok_or(GifError::Truncated)?;
+    // No canvas to paint and no pixels to hand on, and every tool downstream divides
+    // by these.
+    if screen_width == 0 || screen_height == 0 {
+        return Err(GifError::ZeroDimension);
+    }
     let background_index = *file.get(11).ok_or(GifError::Truncated)? as usize;
     let global_palette = colour_table(file, 13, global_entries);
     let background = if global_entries > 0 {
@@ -321,7 +360,11 @@ fn parse(file: &[u8]) -> Result<Parsed, GifError> {
     }
 }
 
-fn compose(parsed: &Parsed) -> Result<List, GifError> {
+/// Paints frames onto the canvas in order, keeping each result.
+///
+/// @param frame_limit how many frames to go as far as, which is one for a caller that
+///        only wants the first picture and has no use for the rest being decoded
+fn compose(parsed: &Parsed, frame_limit: usize) -> Result<List, GifError> {
     let Parsed {
         screen_width: w,
         screen_height: h,
@@ -330,12 +373,17 @@ fn compose(parsed: &Parsed) -> Result<List, GifError> {
         frames,
     } = parsed;
     let global_palette = global_palette.as_slice();
-    let canvas_size = w.checked_mul(*h).ok_or(GifError::DimensionOverflow)? * 4;
+    // Sixty-five thousand squared fits 32 bits, and that times four does not.
+    let canvas_pixels = w
+        .checked_mul(*h)
+        .filter(|&pixels| pixels <= MAX_CANVAS_PIXELS)
+        .ok_or(GifError::WorkLimit)?;
+    let canvas_size = canvas_pixels * 4;
 
     let mut list = List {
-        displayed: Vec::with_capacity(frames.len()),
-        differences: Vec::with_capacity(frames.len()),
-        analysed: 0,
+        displayed: Vec::new(),
+        differences: Vec::new(),
+        timings: Vec::new(),
     };
     let mut canvas = vec![0u8; canvas_size];
     if let Some([r, g, b]) = background {
@@ -347,28 +395,28 @@ fn compose(parsed: &Parsed) -> Result<List, GifError> {
         }
     }
 
-    let pixel_count = |frame: &FrameInfo| frame.width * frame.height;
     let mut total = 0usize;
 
     for frame in frames {
-        if list.analysed >= MAX_FRAMES {
+        if list.timings.len() >= frame_limit {
             break;
         }
-        let pixels = pixel_count(frame);
-        if pixels > MAX_PIXELS_PER_FRAME {
-            break;
-        }
-        total += pixels;
+        total += canvas_pixels;
         if total > MAX_COMPOSITED_PIXELS {
             break;
         }
-        list.analysed += 1;
+        list.timings.push(Timing {
+            delay: frame.delay,
+            disposal: frame.disposal,
+        });
 
         let palette = frame.local_palette.as_deref().unwrap_or(global_palette);
 
-        // Keep the pre-frame canvas for disposal 3.
-        let saved = canvas.clone();
+        // Keep the pre-frame canvas for disposal 3, and only for disposal 3.
+        let saved = (frame.disposal == 3).then(|| canvas.clone());
 
+        // Inside the canvas, as `parse` checked, so inside the canvas budget too.
+        let pixels = frame.width * frame.height;
         let indices = lzw(frame.min_code_size, &frame.data, pixels)?;
 
         let width = *w;
@@ -428,7 +476,11 @@ fn compose(parsed: &Parsed) -> Result<List, GifError> {
                     }
                 }
             }
-            3 => canvas = saved,
+            3 => {
+                if let Some(saved) = saved {
+                    canvas = saved;
+                }
+            }
             _ => {}
         }
     }
@@ -443,11 +495,26 @@ fn difference(a: &[u8], b: &[u8]) -> Vec<u8> {
 }
 
 /// What an animation decoded to: the displayed frames, the consecutive
-/// differences between them, and how many frames made it under the budget.
+/// differences between them, and the timing of each frame that made it under the
+/// budget.
 struct List {
     displayed: Vec<Vec<u8>>,
     differences: Vec<Vec<u8>>,
-    analysed: usize,
+    timings: Vec<Timing>,
+}
+
+impl List {
+    fn header(&mut self, parsed: &Parsed) -> Header {
+        Header {
+            width: parsed.screen_width,
+            height: parsed.screen_height,
+            frames: self.timings.len(),
+            declared_frames: parsed.frames.len(),
+            interlaced: false,
+            palette_entries: parsed.global_palette.len(),
+            timings: core::mem::take(&mut self.timings),
+        }
+    }
 }
 
 /// Return type of `decode_frames`, factored to satisfy clippy's type complexity.
@@ -460,26 +527,193 @@ type DecodedFrames = (Header, Vec<Vec<u8>>, Vec<Vec<u8>>, bool);
 /// the walk before the file's frames were exhausted.
 pub fn decode_frames(file: &[u8]) -> Result<DecodedFrames, GifError> {
     let parsed = parse(file)?;
-    let list = compose(&parsed)?;
-    let capped = list.analysed < parsed.frames.len();
+    let mut list = compose(&parsed, MAX_FRAMES)?;
+    let capped = list.timings.len() < parsed.frames.len();
 
-    let header = Header {
-        width: parsed.screen_width,
-        height: parsed.screen_height,
-        frames: list.analysed,
-        declared_frames: parsed.frames.len(),
-        interlaced: false,
-        palette_entries: parsed.global_palette.len(),
-    };
+    let header = list.header(&parsed);
     Ok((header, list.displayed, list.differences, capped))
 }
 
-/// Decodes the first composited display frame to non-premultiplied RGBA8.
-/// Kept for backwards compatibility with `pixels::decode()`.
+/// Decodes the first composited display frame to non-premultiplied RGBA8, which is
+/// all `pixels::decode()` wants. Each pixel tool asks for it afresh, so the rest of
+/// the animation stays undecoded here.
 pub fn decode(file: &[u8]) -> Result<(Header, Vec<u8>), GifError> {
-    let (header, displayed, ..) = decode_frames(file)?;
-    let first = displayed.first().cloned().ok_or(GifError::NoImage)?;
-    Ok((header, first))
+    let parsed = parse(file)?;
+    let mut list = compose(&parsed, 1)?;
+    let first = list.displayed.pop().ok_or(GifError::NoImage)?;
+    Ok((list.header(&parsed), first))
+}
+
+/// Runs the pixel detectors over one frame or difference, as the fields of a source.
+fn push_detectors(
+    out: &mut String,
+    rgba: &[u8],
+    header: &Header,
+    tags: &[String],
+    max_bytes: usize,
+    chi_steps: usize,
+) {
+    use crate::cuttlefish;
+    use crate::json::push_string;
+
+    push_string(out, "lsb");
+    out.push(':');
+    out.push_str(&cuttlefish::sweep_json_naming(
+        rgba,
+        header.width,
+        header.height,
+        false,
+        max_bytes,
+        tags,
+    ));
+    out.push(',');
+
+    push_string(out, "chi");
+    out.push(':');
+    out.push_str(&cuttlefish::chi_square_json(rgba, chi_steps));
+    out.push(',');
+
+    push_string(out, "rs");
+    out.push(':');
+    let estimate = cuttlefish::rs::analyse(rgba, header.width, header.height, 3);
+    out.push_str(&cuttlefish::rs::json(&estimate));
+}
+
+/// Every displayed frame and consecutive difference through the pixel detectors, as
+/// JSON. The raw pixels and plane walls stay behind.
+///
+/// Null for a file that is not a GIF, and an object carrying `error` for one this
+/// reader refuses, so a person is told why rather than that it was never a GIF.
+pub fn analysis_json(file: &[u8], tags: &[String], max_bytes: usize, chi_steps: usize) -> String {
+    use crate::json::{push_bool, push_field, push_number, push_string};
+
+    if !has_signature(file) {
+        return "null".to_string();
+    }
+
+    let mut out = String::from("{");
+    let (header, frames, differences, capped) = match decode_frames(file) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            push_number(&mut out, "width", u16_at(file, 6).unwrap_or(0));
+            out.push(',');
+            push_number(&mut out, "height", u16_at(file, 8).unwrap_or(0));
+            out.push(',');
+            push_number(&mut out, "declaredFrames", 0);
+            out.push(',');
+            push_number(&mut out, "analysedFrames", 0);
+            out.push(',');
+            push_bool(&mut out, "capped", false);
+            out.push(',');
+            push_field(&mut out, "error", &error.to_string());
+            out.push(',');
+            push_string(&mut out, "sources");
+            out.push_str(":[]}");
+            return out;
+        }
+    };
+
+    push_number(&mut out, "width", header.width);
+    out.push(',');
+    push_number(&mut out, "height", header.height);
+    out.push(',');
+    push_number(&mut out, "declaredFrames", header.declared_frames);
+    out.push(',');
+    push_number(&mut out, "analysedFrames", frames.len());
+    out.push(',');
+    push_bool(&mut out, "capped", capped);
+    out.push(',');
+    push_string(&mut out, "error");
+    out.push_str(":null,");
+    push_string(&mut out, "sources");
+    out.push_str(":[");
+
+    for (index, frame) in frames.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let timing = header.timings[index];
+        out.push('{');
+        push_field(&mut out, "kind", "frame");
+        out.push(',');
+        push_number(&mut out, "from", index + 1);
+        out.push(',');
+        push_string(&mut out, "to");
+        out.push_str(":null,");
+        push_number(&mut out, "delay", timing.delay as usize);
+        out.push(',');
+        push_field(&mut out, "disposal", timing.disposal_name());
+        out.push(',');
+        push_detectors(&mut out, frame, &header, tags, max_bytes, chi_steps);
+        out.push('}');
+    }
+
+    for (index, difference) in differences.iter().enumerate() {
+        out.push(',');
+        out.push('{');
+        push_field(&mut out, "kind", "difference");
+        out.push(',');
+        push_number(&mut out, "from", index + 1);
+        out.push(',');
+        push_number(&mut out, "to", index + 2);
+        out.push(',');
+        // A difference between two frames has no timing of its own.
+        push_string(&mut out, "delay");
+        out.push_str(":null,");
+        push_string(&mut out, "disposal");
+        out.push_str(":null,");
+        push_detectors(&mut out, difference, &header, tags, max_bytes, chi_steps);
+        out.push('}');
+    }
+
+    out.push_str("]}");
+    out
+}
+
+/// Bytes after the trailer, which a viewer never reads.
+pub fn trailing(file: &[u8]) -> Option<(usize, usize)> {
+    if !has_signature(file) {
+        return None;
+    }
+
+    let packed = *file.get(10)?;
+    let global_entries = if packed & 0x80 != 0 {
+        2usize << (packed & 0x07)
+    } else {
+        0
+    };
+    let mut at = 13 + global_entries * 3;
+    loop {
+        match *file.get(at)? {
+            0x3b => {
+                let end = at + 1;
+                return (file.len() > end).then(|| (end, file.len() - end));
+            }
+            0x21 => at = skip_sub_blocks(file, at + 2)?,
+            0x2c => {
+                let packed = *file.get(at + 9)?;
+                let local_entries = if packed & 0x80 != 0 {
+                    2usize << (packed & 0x07)
+                } else {
+                    0
+                };
+                at = skip_sub_blocks(file, at + 10 + local_entries * 3 + 1)?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Where a run of sub-blocks ends, without keeping what is in them.
+fn skip_sub_blocks(file: &[u8], mut at: usize) -> Option<usize> {
+    loop {
+        let len = *file.get(at)? as usize;
+        at += 1;
+        if len == 0 {
+            return Some(at);
+        }
+        at += len;
+    }
 }
 
 /// Comment blocks, which hold plain text and are a common hiding place.

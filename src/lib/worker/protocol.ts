@@ -334,6 +334,9 @@ export type SqliteTable = {
 /** What a SQLite database holds, read from the file rather than queried: its
  *  tables and rows, and the rows that were deleted but never left the file. */
 export type SqliteDatabase = {
+	/** Flags read cell by cell, filled in by the worker. A scan of the raw file can
+	 *  miss them, because neighbouring columns run together there. */
+	flags?: { text: string; table: string; deleted: boolean }[];
 	pageSize: number;
 	pageCount: number;
 	encoding: string;
@@ -910,6 +913,7 @@ export type AnalysisRequest =
 			msbFirst: boolean;
 	  }
 	| { kind: 'withKey'; id: number; text: string; key: string; flagTags: string }
+	| { kind: 'patchIhdr'; id: number; name: string; width: number; height: number }
 	| {
 			kind: 'extractAudio';
 			id: number;
@@ -923,6 +927,8 @@ export type AnalysisResponse =
 	| {
 			id: number;
 			status: 'ok';
+			/** Readers that crashed on this file, so their results are missing. */
+			crashed: string[];
 			name: string;
 			size: number;
 			survey: Survey;
@@ -965,6 +971,7 @@ export type AnalysisResponse =
 	| { id: number; status: 'keyed'; key: string; attempts: KeyAttempt[] }
 	| { id: number; status: 'plane'; channel: number; bit: number; pixels: Uint8Array }
 	| { id: number; status: 'extract'; label: string; bytes: Uint8Array }
+	| { id: number; status: 'patched'; name: string; bytes: Uint8Array }
 	| { id: number; status: 'error'; name: string; size: number; detail: string };
 
 export const CHANNEL_NAMES = ['R', 'G', 'B', 'A'];

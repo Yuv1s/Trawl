@@ -46,7 +46,7 @@ fn decode_names_the_format_it_used() {
 fn decode_refuses_a_format_it_cannot_read() {
     let jpeg = [0xff, 0xd8, 0xff, 0xe0, 0, 16];
     let error = decode(&jpeg, &[]).unwrap_err();
-    assert!(error.contains("no decoder"), "{error}");
+    assert!(error.contains("can't decode"), "{error}");
 
     assert!(decode(&[], &[]).is_err());
 }

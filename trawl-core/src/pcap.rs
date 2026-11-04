@@ -29,6 +29,10 @@ const MAX_PACKETS: usize = 500_000;
 const MAX_SEGMENTS: usize = 200_000;
 const MAX_STREAMS: usize = 48;
 const MAX_STREAM_BYTES: usize = 256 * 1024;
+/// Reassembled bytes across every stream. A two-packet connection can claim a whole
+/// stream's worth of gap between its segments, so a capture of many such connections
+/// would otherwise ask for far more than it holds.
+const MAX_REASSEMBLED: usize = 64 << 20;
 const MAX_CONVERSATIONS: usize = 40;
 const MAX_DNS: usize = 120;
 const PREVIEW_BYTES: usize = 4096;
@@ -183,7 +187,7 @@ fn parse_pcap(data: &[u8]) -> Option<(Vec<Frame>, u16, usize, bool)> {
             break;
         }
 
-        capture_bytes += orig;
+        capture_bytes = capture_bytes.saturating_add(orig);
         truncated |= orig > incl;
         frames.push(Frame {
             link_type,
@@ -197,6 +201,71 @@ fn parse_pcap(data: &[u8]) -> Option<(Vec<Frame>, u16, usize, bool)> {
     Some((frames, link_type, capture_bytes, truncated))
 }
 
+/// How many timestamp ticks an interface counts per second.
+///
+/// The `if_tsresol` option says, in one byte: a power of ten when the top bit is
+/// clear, a power of two when it is set. Microseconds when it is absent, which is
+/// the format's default and the wrong answer for the nanosecond captures tcpdump
+/// and Wireshark often write, where a second would read as a quarter of an hour.
+fn ticks_per_second(data: &[u8], options: usize, end: usize, le: bool) -> f64 {
+    const END_OF_OPTIONS: u16 = 0;
+    const IF_TSRESOL: u16 = 9;
+
+    let mut at = options;
+    while at + 4 <= end {
+        let (Some(code), Some(length)) = (u16_at(data, at, le), u16_at(data, at + 2, le)) else {
+            break;
+        };
+        if code == END_OF_OPTIONS {
+            break;
+        }
+        if code == IF_TSRESOL
+            && length == 1
+            && let Some(&raw) = data.get(at + 4)
+        {
+            let exponent = (raw & 0x7f) as i32;
+            return if raw & 0x80 != 0 {
+                2f64.powi(exponent)
+            } else {
+                10f64.powi(exponent)
+            };
+        }
+        // Option values are padded to a four-byte boundary.
+        at += 4 + (length as usize).next_multiple_of(4);
+    }
+
+    1e6
+}
+
+/// The frame an Enhanced Packet Block holds, and its original length, or nothing
+/// when the block is too short to hold what it claims.
+fn enhanced_packet(
+    data: &[u8],
+    body: usize,
+    block_end: usize,
+    le: bool,
+    interfaces: &[(u16, f64)],
+) -> Option<(Frame, usize)> {
+    let interface = u32_at(data, body, le)? as usize;
+    let ts_high = u32_at(data, body + 4, le)? as u64;
+    let ts_low = u32_at(data, body + 8, le)? as u64;
+    let incl = u32_at(data, body + 12, le)? as usize;
+    let orig = u32_at(data, body + 16, le)? as usize;
+    let frame_at = body + 20;
+    if frame_at.checked_add(incl)? > block_end {
+        return None;
+    }
+
+    let (link_type, ticks) = interfaces.get(interface).copied().unwrap_or((1, 1e6));
+    let frame = Frame {
+        link_type,
+        offset: frame_at,
+        len: incl,
+        timestamp: ((ts_high << 32) | ts_low) as f64 / ticks,
+    };
+    Some((frame, orig))
+}
+
 /// Reads the frames out of a pcapng file: a chain of typed blocks, each a type,
 /// a total length, a body, and the total length again. Only the interface and
 /// packet blocks carry frames; the rest are skipped by their length.
@@ -205,67 +274,67 @@ fn parse_pcapng(data: &[u8]) -> Option<(Vec<Frame>, u16, usize, bool)> {
         return None;
     }
     // The Section Header Block's byte-order magic settles the whole section's
-    // endianness. Read at offset 8; little-endian if it comes back as expected.
-    let le = u32_at(data, 8, true)? == 0x1a2b3c4d;
+    // endianness. A value that reads neither way round is not this format.
+    let le = match u32_at(data, 8, true)? {
+        0x1a2b_3c4d => true,
+        0x4d3c_2b1a => false,
+        _ => return None,
+    };
 
     let mut frames = Vec::new();
-    let mut link_types: Vec<u16> = Vec::new();
+    let mut interfaces: Vec<(u16, f64)> = Vec::new();
     let mut capture_bytes = 0usize;
     let mut truncated = false;
     let mut at = 0usize;
 
     while at + 12 <= data.len() && frames.len() < MAX_PACKETS {
-        let block_type = u32_at(data, at, le)?;
-        let total = u32_at(data, at + 4, le)? as usize;
+        let Some(block_type) = u32_at(data, at, le) else { break };
+        let Some(total) = u32_at(data, at + 4, le) else { break };
+        let total = total as usize;
         // Every block is at least the two lengths plus a type, and padded to a
-        // four-byte boundary. Anything else is a desync; stop.
-        if total < 12 || !total.is_multiple_of(4) || at + total > data.len() {
+        // four-byte boundary. Anything else is a desync; stop. The sum wraps in
+        // WASM, and a wrapped end sends the walk back round the same blocks forever.
+        let Some(next) = at.checked_add(total).filter(|&next| next <= data.len()) else {
+            break;
+        };
+        if total < 12 || !total.is_multiple_of(4) {
             break;
         }
         let body = at + 8;
+        // The total length is repeated in the block's last four bytes.
+        let block_end = next - 4;
 
         match block_type {
-            // Interface Description Block: link type, then a snap length.
+            // Interface Description Block: link type, a reserved field, a snap
+            // length, then options.
             0x0000_0001 => {
-                if let Some(lt) = u16_at(data, body, le) {
-                    link_types.push(lt);
+                if let Some(link_type) = u16_at(data, body, le) {
+                    interfaces.push((link_type, ticks_per_second(data, body + 8, block_end, le)));
                 }
             }
             // Enhanced Packet Block: interface id, timestamp, captured len,
             // original len, then the frame.
             0x0000_0006 => {
-                let interface = u32_at(data, body, le)? as usize;
-                let ts_high = u32_at(data, body + 4, le)? as u64;
-                let ts_low = u32_at(data, body + 8, le)? as u64;
-                let incl = u32_at(data, body + 12, le)? as usize;
-                let orig = u32_at(data, body + 16, le)? as usize;
-                let frame_at = body + 20;
-                if frame_at + incl <= at + total {
-                    capture_bytes += orig;
-                    truncated |= orig > incl;
-                    frames.push(Frame {
-                        link_type: link_types.get(interface).copied().unwrap_or(1),
-                        offset: frame_at,
-                        len: incl,
-                        // Microsecond units, the default when no resolution
-                        // option is read.
-                        timestamp: ((ts_high << 32) | ts_low) as f64 / 1e6,
-                    });
+                if let Some((frame, orig)) = enhanced_packet(data, body, block_end, le, &interfaces) {
+                    capture_bytes = capture_bytes.saturating_add(orig);
+                    truncated |= orig > frame.len;
+                    frames.push(frame);
                 }
             }
             // Simple Packet Block: an original length, then the frame filling the
             // rest of the block.
             0x0000_0003 => {
-                let orig = u32_at(data, body, le)? as usize;
+                let Some(orig) = u32_at(data, body, le) else { break };
+                let orig = orig as usize;
                 let frame_at = body + 4;
                 // Block bytes minus type, both lengths and the original-length
                 // field give what was captured.
                 let incl = total.saturating_sub(16).min(orig);
-                if frame_at + incl <= at + total {
-                    capture_bytes += orig;
+                if frame_at + incl <= block_end {
+                    capture_bytes = capture_bytes.saturating_add(orig);
                     truncated |= orig > incl;
                     frames.push(Frame {
-                        link_type: link_types.first().copied().unwrap_or(1),
+                        link_type: interfaces.first().map_or(1, |&(link_type, _)| link_type),
                         offset: frame_at,
                         len: incl,
                         timestamp: 0.0,
@@ -275,10 +344,10 @@ fn parse_pcapng(data: &[u8]) -> Option<(Vec<Frame>, u16, usize, bool)> {
             _ => {}
         }
 
-        at += total;
+        at = next;
     }
 
-    let link_type = link_types.first().copied().unwrap_or(1);
+    let link_type = interfaces.first().map_or(1, |&(link_type, _)| link_type);
     Some((frames, link_type, capture_bytes, truncated))
 }
 
@@ -438,6 +507,7 @@ fn decode(file: &[u8], frame: &Frame) -> Option<Decoded> {
             let src = ipv4(bytes, l3 + 12);
             let dst = ipv4(bytes, l3 + 16);
             let (t, sp, dp, pay, seq) = transport(bytes, proto, l3 + ihl);
+            let end = packet_end(bytes.len(), l3, be16(bytes, l3 + 2));
             Some(Decoded {
                 src_ip: src,
                 dst_ip: dst,
@@ -445,7 +515,7 @@ fn decode(file: &[u8], frame: &Frame) -> Option<Decoded> {
                 dst_port: dp,
                 transport: t,
                 payload_at: frame.offset + pay,
-                payload_len: bytes.len().saturating_sub(pay),
+                payload_len: end.saturating_sub(pay),
                 seq,
             })
         }
@@ -454,6 +524,8 @@ fn decode(file: &[u8], frame: &Frame) -> Option<Decoded> {
             let src = ipv6(bytes, l3 + 8);
             let dst = ipv6(bytes, l3 + 24);
             let (t, sp, dp, pay, seq) = transport(bytes, proto, l3 + 40);
+            // IPv6 counts its payload alone, leaving out the fixed header.
+            let end = packet_end(bytes.len(), l3 + 40, be16(bytes, l3 + 4));
             Some(Decoded {
                 src_ip: src,
                 dst_ip: dst,
@@ -461,11 +533,25 @@ fn decode(file: &[u8], frame: &Frame) -> Option<Decoded> {
                 dst_port: dp,
                 transport: t,
                 payload_at: frame.offset + pay,
-                payload_len: bytes.len().saturating_sub(pay),
+                payload_len: end.saturating_sub(pay),
                 seq,
             })
         }
         _ => None,
+    }
+}
+
+/// Where a packet stops inside its frame, by its own length field.
+///
+/// Ethernet pads a short frame to sixty bytes, so whatever follows the packet is not
+/// part of it. Read as payload, the padding on a keep-alive becomes data, and since a
+/// keep-alive deliberately carries a sequence number one behind, that data lands on
+/// the end of what came before. A length of zero is what a capture shows when the
+/// card was left to fill it in, and says nothing.
+fn packet_end(frame_len: usize, from: usize, declared: Option<u16>) -> usize {
+    match declared {
+        Some(length) if length != 0 => from.saturating_add(length as usize).min(frame_len),
+        _ => frame_len,
     }
 }
 
@@ -540,30 +626,50 @@ fn printable_fraction(data: &[u8]) -> f32 {
 
 /// Lays one direction's segments back down in sequence order.
 ///
-/// The lowest sequence number is the start of the direction's data. Every
-/// segment is placed at its distance from that start, so a retransmission lands
-/// where it already sits and an out-of-order segment lands where it belongs.
-/// Anything beyond the display cap, including a segment left far away by
-/// sequence-number wrap, is dropped.
-fn reassemble(file: &[u8], segments: &Segments) -> Vec<u8> {
-    let Some(base) = segments.parts.iter().map(|&(seq, _, _)| seq).min() else {
+/// Sequence numbers are modular, so "lowest" is only meaningful as a signed distance:
+/// a stream that crosses zero has its start at 0xfffffff8 and its end at 16, and the
+/// plain minimum would call the end the start and drop everything before it. So each
+/// is measured from the first segment seen, either way round, and the earliest of
+/// those is where the direction's data starts.
+///
+/// Every segment is then placed at its distance from that start, so an out-of-order
+/// segment lands where it belongs. The first copy of a byte is the one kept: a
+/// retransmission carries the same bytes anyway, and a keep-alive probe carries one
+/// junk byte a position behind the data it follows, which must not overwrite it.
+/// Anything beyond the limit is dropped.
+fn reassemble(file: &[u8], segments: &Segments, limit: usize) -> Vec<u8> {
+    let Some(&(first, _, _)) = segments.parts.first() else {
         return Vec::new();
     };
+    let earliest = segments
+        .parts
+        .iter()
+        .map(|&(seq, _, _)| seq.wrapping_sub(first) as i32)
+        .min()
+        .unwrap_or(0);
+    let base = first.wrapping_add(earliest as u32);
 
     let mut buf: Vec<u8> = Vec::new();
+    let mut written: Vec<bool> = Vec::new();
     for &(seq, at, len) in &segments.parts {
         let offset = seq.wrapping_sub(base) as usize;
-        if offset > MAX_STREAM_BYTES {
+        if offset >= limit {
             continue;
         }
-        let take = len.min(MAX_STREAM_BYTES - offset);
+        let take = len.min(limit - offset);
         let Some(bytes) = file.get(at..at + take) else {
             continue;
         };
         if offset + take > buf.len() {
             buf.resize(offset + take, 0);
+            written.resize(offset + take, false);
         }
-        buf[offset..offset + take].copy_from_slice(bytes);
+        for (i, &byte) in bytes.iter().enumerate() {
+            if !written[offset + i] {
+                buf[offset + i] = byte;
+                written[offset + i] = true;
+            }
+        }
     }
     buf
 }
@@ -700,31 +806,44 @@ pub fn read(data: &[u8], tags: &[String]) -> Option<Capture> {
         }
     }
 
-    // Reassemble every directional flow, keep the ones that carried payload.
-    let mut streams: Vec<Stream> = tcp
+    // Every directional flow here carried payload, whether or not it gets read.
+    let stream_count = tcp.len();
+
+    // Biggest first, so the budget goes on the streams with the most in them, and in
+    // a fixed order, so the same file reads the same way twice.
+    let mut flows: Vec<_> = tcp
         .into_iter()
-        .filter_map(|((src_ip, sp, dst_ip, dp), segments)| {
-            let buf = reassemble(data, &segments);
-            if buf.is_empty() {
-                return None;
-            }
-            let flags = bytes::flag_candidates_for_tags(&buf, tags)
-                .into_iter()
-                .map(|f| f.text)
-                .collect();
-            let embedded_file = (buf.len() >= 8).then(|| bytes::identify(&buf)).flatten();
-            Some(Stream {
-                src: endpoint(&src_ip, sp),
-                dst: endpoint(&dst_ip, dp),
-                bytes: buf.len(),
-                text: preview(&buf),
-                printable: printable_fraction(&buf),
-                embedded_file,
-                flags,
-            })
+        .map(|(key, segments)| {
+            let carried: usize = segments.parts.iter().map(|&(_, _, len)| len).sum();
+            (carried, key, segments)
         })
         .collect();
-    let stream_count = streams.len();
+    flows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut budget = MAX_REASSEMBLED;
+    let mut streams: Vec<Stream> = Vec::new();
+    for (_, (src_ip, sp, dst_ip, dp), segments) in flows {
+        let buf = reassemble(data, &segments, MAX_STREAM_BYTES.min(budget));
+        if buf.is_empty() {
+            continue;
+        }
+        budget -= buf.len();
+
+        let flags = bytes::flag_candidates_for_tags(&buf, tags)
+            .into_iter()
+            .map(|f| f.text)
+            .collect();
+        let embedded_file = (buf.len() >= 8).then(|| bytes::identify(&buf)).flatten();
+        streams.push(Stream {
+            src: endpoint(&src_ip, sp),
+            dst: endpoint(&dst_ip, dp),
+            bytes: buf.len(),
+            text: preview(&buf),
+            printable: printable_fraction(&buf),
+            embedded_file,
+            flags,
+        });
+    }
 
     // A stream carrying a flag or a whole file leads; then the largest.
     streams.sort_by(|a, b| {

@@ -54,6 +54,14 @@ fn the_key_advances_only_on_letters() {
 }
 
 #[test]
+fn a_long_run_of_one_letter_measures_as_one() {
+    // Past 65,536 of a letter its count squared wraps 32 bits, and this came out as
+    // whatever the low half happened to be.
+    let letters = vec![b'a'; 100_000];
+    assert_eq!(index_of_coincidence(&letters), 1.0);
+}
+
+#[test]
 fn measures_english_as_lumpier_than_random() {
     // Natural prose, not a pangram. A pangram is deliberately flat, which is
     // the opposite of the property being measured here.
@@ -409,6 +417,80 @@ fn a_flag_shape_settles_a_key_no_counting_could_reach() {
         String::from_utf8_lossy(&found[at].plaintext).contains("flag{"),
         "the crib lost the tag it pinned"
     );
+}
+
+#[test]
+fn many_brace_shapes_do_not_take_minutes() {
+    // 192 bytes of something like a stylesheet. Six sites, every fragment at every place
+    // in each, every key length at each of those.
+    let mut text = String::new();
+    for i in 0..6 {
+        text.push_str(&format!("widget{{color:#{}a{}b0c;margin:{i}px}}", (i * 37) % 10, i % 10));
+    }
+
+    let started = std::time::Instant::now();
+    let _ = derive(text.as_bytes());
+    assert!(started.elapsed().as_secs() < 20, "took {:?}", started.elapsed());
+}
+
+#[test]
+fn a_long_run_before_a_brace_does_not_multiply_the_work() {
+    // Every offset of every fragment along this many letters was a separate attack.
+    let text = "x".repeat(5000) + "{abcd}";
+
+    let started = std::time::Instant::now();
+    let _ = from_crib(text.as_bytes(), &[]);
+    assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+}
+
+#[test]
+fn a_flag_still_gets_its_key_past_a_run_of_decoys() {
+    // The budget goes on a tag against a brace first, whichever brace that is, and on
+    // keys short enough to try outright before any long search, so the real one is not
+    // starved by the shapes in front of it.
+    let plain = format!(
+        "{} the treasure is under the old oak tree at the north end of the field flag{{hello_human}}",
+        "widget{a} ".repeat(20)
+    );
+    let found = from_crib(&encipher(plain.as_bytes(), b"bghf"), &[]);
+
+    assert!(
+        found.iter().any(|(key, _, _)| key == b"bghf"),
+        "the key never came out of the crib"
+    );
+}
+
+#[test]
+fn a_configured_tag_is_not_tried_twice_when_it_is_also_built_in() {
+    let tags = crib_tags(&["flag".to_string(), "CTF".to_string(), "event".to_string()]);
+    assert_eq!(tags.iter().filter(|tag| *tag == "flag").count(), 1);
+    assert_eq!(tags.iter().filter(|tag| *tag == "ctf").count(), 1);
+    assert_eq!(tags[0], "event", "configured tags lead");
+}
+
+#[test]
+fn a_hundred_letters_do_not_read_words_for_every_long_key() {
+    let mut state = 0x9e37_79b9u32;
+    let text: Vec<u8> = (0..118)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            b'a' + (state % 26) as u8
+        })
+        .collect();
+
+    // Every length reading all it wanted came to several times the budget. Going over
+    // by the last length's final climb is expected, since a climb is not stopped part way.
+    let numbered = indices(&text);
+    let mut rng = Rng::seeded(&numbered);
+    let read = core::cell::Cell::new(0);
+    for length in 1..=MAX_KEY.min(numbered.len() / COUNTABLE) {
+        best_of_length(&text, &numbered, length, &mut rng, &read);
+    }
+    assert!(read.get() >= WORDS_BUDGET, "this text never reached the budget: {}", read.get());
+    assert!(read.get() < WORDS_BUDGET + WORDS_BUDGET / 2, "read {}", read.get());
+    assert!(!derive(&text).is_empty());
 }
 
 #[test]

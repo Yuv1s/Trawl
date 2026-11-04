@@ -31,9 +31,8 @@
 	</p>
 {:else if !rs.reliable}
 	<p class="clear">
-		The model did not fit this image, so no estimate is offered. That happens on images with too
-		little local texture for the test to read, and a number here would be invented rather than
-		measured.
+		The model didn't fit this image, so Trawl gives no estimate. This happens on images with too
+		little local texture for the test to read.
 	</p>
 {:else}
 	<div class="verdict" class:detected={rs.detected}>
@@ -51,7 +50,7 @@
 		<p class="cross" class:disagree={!crossCheck.agree}>
 			{#if crossCheck.agree}
 				Chi-square independently estimates {percent(chi?.embeddedFraction ?? 0)}. Two different
-				mechanisms agreeing is the strongest evidence this tool can offer.
+				methods agreeing is the strongest evidence this tool can give.
 			{:else}
 				Chi-square estimates {percent(chi?.embeddedFraction ?? 0)}, a gap of
 				{percent(crossCheck.gap)}. They disagree, which usually means the payload sits in one part

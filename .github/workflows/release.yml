@@ -52,7 +52,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build the scanner
-        run: cargo build --release --target ${{ matrix.target }} --manifest-path trawl-scan/Cargo.toml
+        run: cargo build --release --locked --target ${{ matrix.target }} --manifest-path trawl-scan/Cargo.toml
 
       - name: Name the binary
         shell: bash

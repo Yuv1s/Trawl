@@ -33,7 +33,7 @@
 <div class="sqlite">
 	{#if deletedTotal > 0}
 		<ul class="findings">
-			{#each db.tables.filter((t) => t.deleted.length > 0) as table (table.name)}
+			{#each db.tables.filter((t) => t.deleted.length > 0) as table, t (t)}
 				<li class="flagged">
 					{table.deleted.length} row{table.deleted.length === 1 ? '' : 's'} deleted from
 					<span class="mono">{table.name}</span>, still in the file's free space
@@ -42,8 +42,8 @@
 		</ul>
 	{:else}
 		<p class="clear">
-			Every row in every table is one a query would still return, and no deleted row is left in the
-			free space. That is what an untouched database looks like.
+			Every row here is one a query would still return, and the free space holds no deleted rows.
+			This looks like an untouched database.
 		</p>
 	{/if}
 
@@ -59,7 +59,7 @@
 		</dl>
 	</div>
 
-	{#each db.tables as table (table.name)}
+	{#each db.tables as table, t (t)}
 		{@const width = Math.max(
 			table.columns.length,
 			table.rows[0]?.length ?? 0,
@@ -99,9 +99,10 @@
 							</tr>
 						{/each}
 						{#each table.deleted as row, r (`d${r}`)}
+							{@const lostColumns = width - row.length}
 							<tr class="deleted">
 								{#each cells as c (c)}
-									{@const value = row[c]}
+									{@const value = row[c - lostColumns]}
 									<td class="mono" class:muted={!value || value.kind === 'null'}>
 										{value ? cellText(value) : ''}
 									</td>
@@ -120,10 +121,9 @@
 	{/each}
 
 	<p class="footnote">
-		A row shown in the accent was deleted and is still in the file: SQLite unlinks a deleted row
-		from its page but leaves the bytes in the free space until something reuses them. Recovered from
-		that space, so it can be a row a query would never return. Anything the freeblock header
-		overwrote, usually the id, is gone.
+		A row in the accent colour was deleted but is still in the file. SQLite unlinks a deleted row
+		from its page and leaves the bytes in the free space until something reuses them, so a query
+		would never return it. Anything the freeblock header overwrote, usually the id, is gone.
 	</p>
 </div>
 

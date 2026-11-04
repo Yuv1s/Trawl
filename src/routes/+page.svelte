@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { getScannerToken, getTourChoice, setTourChoice } from '$lib';
+	import { onMount, tick } from 'svelte';
+	import { getScannerToken, getTourChoice, SCANNER_URL, setTourChoice, takeAddress } from '$lib';
 	import { flagTagsParameter, matchesFlagTag, readFlagTags, writeFlagTags } from '$lib/flag-config';
 	import { writeupMarkdown } from '$lib/analysis/writeup';
 	import AnalysisWorker from '$lib/worker/analysis.worker?worker';
@@ -40,23 +40,36 @@
 	import ExifView from '$lib/components/ExifView.svelte';
 	import PaletteView from '$lib/components/PaletteView.svelte';
 	import JpegView from '$lib/components/JpegView.svelte';
-	import { flagsOf, nestedFindings, PLANNED, tools, WRITTEN_BY_HAND } from '$lib/analysis/tools';
+	import {
+		chiStands,
+		flagsOf,
+		nestedFindings,
+		PLANNED,
+		tools,
+		WRITTEN_BY_HAND
+	} from '$lib/analysis/tools';
 	import { buildSolvePaths } from '$lib/analysis/solve-path';
 	import {
 		COLOR_TYPES,
 		isHeaderError,
 		isJpegError,
+		type AnalysisRequest,
 		type AnalysisResponse,
 		type KeyAttempt,
 		type PeelResult
 	} from '$lib/worker/protocol';
 
-	/** Plane, extract and peel responses update a panel or open their own view;
-	 *  none of them become the file-analysis state. */
+	/** Plane, extract, peel and patch responses update a panel or start something
+	 *  else; none of them become the file-analysis state. */
 	type Analysis = Exclude<
 		AnalysisResponse,
-		{ status: 'plane' } | { status: 'extract' } | { status: 'peel' } | { status: 'keyed' }
+		| { status: 'plane' }
+		| { status: 'extract' }
+		| { status: 'peel' }
+		| { status: 'keyed' }
+		| { status: 'patched' }
 	>;
+	type Finished = Extract<Analysis, { status: 'ok' }>;
 
 	type View =
 		| { phase: 'idle' }
@@ -86,9 +99,89 @@
 		return flagTagsParameter(flagTags);
 	}
 
+	/** A format label with its article: "a PNG image", "an ELF binary". */
+	function described(format: string | null, otherwise: string): string {
+		if (!format) return otherwise;
+		return `${/^[aeiou]/i.test(format) ? 'an' : 'a'} ${format}`;
+	}
+
 	let worker: Worker | null = null;
 	let ticket = 0;
-	let pending: Promise<Uint8Array> = Promise.resolve(new Uint8Array());
+	let loaded = new Uint8Array();
+	/** Whether the worker is on a job that could hang, as anything reading a file can. */
+	let running = false;
+	let watchdog: ReturnType<typeof setTimeout> | undefined;
+
+	/** Far longer than any honest file takes, and short enough to notice a hang. */
+	const TIME_LIMIT = 180_000;
+
+	function stopWorker() {
+		clearTimeout(watchdog);
+		running = false;
+		worker?.terminate();
+		worker = null;
+	}
+
+	function jobDone() {
+		clearTimeout(watchdog);
+		running = false;
+	}
+
+	function showFailure(name: string, detail: string) {
+		view = {
+			phase: 'done',
+			result: { id: ticket, status: 'error', name, size: 0, detail },
+			bytes: new Uint8Array()
+		};
+	}
+
+	/** The tool to open first: whichever found something, most conclusive first. An
+	 *  audio file with nothing else to show lands on the spectrogram, since that is
+	 *  the one panel a person has to read themselves. */
+	function openingTool(analysis: Finished): string {
+		const { survey, structure, jpeg } = analysis;
+
+		if (flagsOf(survey, structure).some((f) => f.credible)) return 'flags';
+		if (analysis.aes.length) return 'aes';
+		if (analysis.zip?.entries.some((e) => (e.flags?.length ?? 0) > 0)) return 'archive';
+		// A hive that remembers a device is as specific a finding as a flag in an
+		// archive, and it is the only reason to open a hive at all.
+		if (analysis.hive?.devices.length) return 'hive';
+		// A row deleted from a database and still in the file is the same kind of
+		// find: a query would never return it.
+		if (analysis.sqlite?.tables.some((t) => t.deleted.length > 0)) return 'sqlite';
+		// A flag reassembled from a TCP stream, or a file carried whole over one, is
+		// a find no scan of the bytes on disk could make.
+		if (analysis.pcap?.streams.some((s) => s.flags.length > 0 || s.embeddedFile !== null))
+			return 'pcap';
+		if (analysis.pdf?.objects.some((o) => o.orphaned || (o.flags?.length ?? 0) > 0)) return 'pdf';
+		if (analysis.sweep?.candidates.length) return 'lsb';
+		if (analysis.audio?.candidates.length) return 'audio-lsb';
+		if (jpeg && !isJpegError(jpeg) && jpeg.candidates.length) return 'jsteg';
+		if (analysis.paletteStego?.candidates.length) return 'palette';
+		if (
+			(survey.exif ?? []).some(
+				(e) => e.textual && WRITTEN_BY_HAND.has(e.name) && e.value.trim() !== ''
+			)
+		)
+			return 'exif';
+		if (survey.jpegComments.length) return 'jpeg';
+		if (analysis.gif?.sources.some((s) => s.lsb.candidates.length > 0)) return 'gif';
+		if (jpeg && !isJpegError(jpeg) && jpeg.chi.detected) return 'jpeg-chi';
+		if (chiStands(analysis.chi, analysis.rs)) return 'chi';
+		if (analysis.rs?.detected) return 'rs';
+		// Nothing stood out, so open the panel that reads this kind of file. An archive
+		// goes first, because everything it holds also shows up as an embedded file.
+		if (analysis.zip) return 'archive';
+		if (survey.magic.some((m) => m.embedded)) return 'magic';
+		if (analysis.wav !== null) return 'spectrogram';
+		if (analysis.pdf) return 'pdf';
+		if (analysis.binary) return 'binary';
+		if (analysis.hive) return 'hive';
+		if (analysis.sqlite) return 'sqlite';
+		if (analysis.pcap) return 'pcap';
+		return structure ? 'chunks' : 'strings';
+	}
 
 	function ensureWorker(): Worker {
 		if (!worker) {
@@ -98,11 +191,19 @@
 				if (result.id !== ticket) return;
 
 				if (result.status === 'keyed') {
+					jobDone();
 					keyed = { key: result.key, attempts: result.attempts };
 					return;
 				}
 
+				if (result.status === 'patched') {
+					jobDone();
+					analyseBytes(result.bytes, result.name);
+					return;
+				}
+
 				if (result.status === 'peel') {
+					jobDone();
 					// RSA runs here rather than in the worker: it needs bignum
 					// arithmetic, and the platform's BigInt is the only one there is.
 					view = {
@@ -134,114 +235,87 @@
 					return;
 				}
 
-				const analysis: Analysis = result;
-				pending.then((bytes) => {
-					view = { phase: 'done', result: analysis, bytes };
-					openPlane = null;
-					extracted = null;
-					if (analysis.status !== 'ok') return;
+				jobDone();
+				view = { phase: 'done', result, bytes: loaded };
+				openPlane = null;
+				extracted = null;
+				if (result.status !== 'ok') return;
 
-					selectedChunk = analysis.structure?.chunks[0]?.offset ?? -1;
-					const flags = flagsOf(analysis.survey, analysis.structure);
-					const written = (analysis.survey.exif ?? []).some(
-						(e) => e.textual && WRITTEN_BY_HAND.has(e.name) && e.value.trim() !== ''
+				selectedChunk = result.structure?.chunks[0]?.offset ?? -1;
+				activeTool = openingTool(result);
+			});
+
+			// The worker script itself failed, so no response will ever come. Drop it
+			// so the next attempt starts a fresh one.
+			worker.addEventListener('error', () => {
+				stopWorker();
+				if (view.phase === 'working') {
+					showFailure(
+						view.name,
+						'The analysis engine could not start. Check your connection, reload the page and try again.'
 					);
-
-					const isWav = analysis.wav !== null;
-
-					// Open whichever tool found something, most conclusive first. An
-					// audio file with nothing else to show lands on the spectrogram,
-					// since that is the one panel a person has to read themselves.
-					const zipFlagged = analysis.zip?.entries.some((e) => (e.flags?.length ?? 0) > 0);
-
-					// A hive that remembers a device is as specific a finding as a
-					// flag inside an archive, and the panel that shows it is the
-					// only reason to open a hive at all.
-					const hiveDevices = (analysis.hive?.devices.length ?? 0) > 0;
-
-					// A row deleted from a database and still in the file is the
-					// same kind of find: a query would never return it.
-					const sqliteDeleted = (analysis.sqlite?.tables ?? []).some((t) => t.deleted.length > 0);
-
-					// A flag reassembled from a TCP stream, or a file carried whole
-					// over one, is a find no scan of the bytes on disk could make.
-					const pcapFinding = (analysis.pcap?.streams ?? []).some(
-						(s) => s.flags.length > 0 || s.embeddedFile !== null
-					);
-
-					activeTool = flags.some((f) => f.credible)
-						? 'flags'
-						: analysis.aes.length
-							? 'aes'
-							: zipFlagged
-								? 'archive'
-								: hiveDevices
-									? 'hive'
-									: sqliteDeleted
-										? 'sqlite'
-										: pcapFinding
-											? 'pcap'
-											: analysis.sweep?.candidates.length
-												? 'lsb'
-												: analysis.audio?.candidates.length
-													? 'audio-lsb'
-													: analysis.jpeg &&
-														  !isJpegError(analysis.jpeg) &&
-														  analysis.jpeg.candidates.length
-														? 'jsteg'
-														: analysis.paletteStego?.candidates.length
-															? 'palette'
-															: written
-																? 'exif'
-																: analysis.survey.jpegComments.length
-																	? 'jpeg'
-																	: analysis.chi?.detected
-																		? 'chi'
-																		: analysis.rs?.detected
-																			? 'rs'
-																			: analysis.survey.magic.some((m) => m.embedded)
-																				? 'magic'
-																				: isWav
-																					? 'spectrogram'
-																					: analysis.structure
-																						? 'chunks'
-																						: 'strings';
-				});
+				}
 			});
 		}
 		return worker;
+	}
+
+	function post(request: AnalysisRequest) {
+		const long =
+			request.kind === 'analyse' ||
+			request.kind === 'peel' ||
+			request.kind === 'withKey' ||
+			request.kind === 'patchIhdr';
+		// The job still running may be hung, and the worker would never reach this one.
+		if (long && running) stopWorker();
+
+		ensureWorker().postMessage(request);
+		if (!long) return;
+
+		running = true;
+		clearTimeout(watchdog);
+		watchdog = setTimeout(() => {
+			if (request.id !== ticket) return;
+			stopWorker();
+			if (view.phase === 'working') {
+				showFailure(
+					view.name,
+					'This took more than three minutes, so Trawl stopped. A file can be built to make the analysis run forever.'
+				);
+			}
+		}, TIME_LIMIT);
 	}
 
 	function acceptText(text: string) {
 		const id = ++ticket;
 		keyed = null;
 		view = { phase: 'working', name: 'pasted text' };
-		const req = {
-			kind: 'peel',
-			id,
-			text,
-			flagTags: flagTagsString()
-		} satisfies import('$lib/worker/protocol').AnalysisRequest;
-		ensureWorker().postMessage(req);
+		post({ kind: 'peel', id, text, flagTags: flagTagsString() });
 	}
 
 	/** Applies a key the reader already has, which no amount of text would give up. */
 	function requestKey(key: string) {
 		if (view.phase !== 'text') return;
 		keyed = null;
-		const req = {
-			kind: 'withKey',
-			id: ticket,
-			text: view.input,
-			key,
-			flagTags: flagTagsString()
-		} satisfies import('$lib/worker/protocol').AnalysisRequest;
-		ensureWorker().postMessage(req);
+		post({ kind: 'withKey', id: ticket, text: view.input, key, flagTags: flagTagsString() });
 	}
 
 	async function accept(file: File) {
-		const buffer = await file.arrayBuffer();
-		analyseBytes(new Uint8Array(buffer), file.name);
+		const id = ++ticket;
+		if (file.size === 0) {
+			showFailure(file.name, 'This file is empty, so there is nothing to analyse.');
+			return;
+		}
+
+		view = { phase: 'working', name: file.name };
+		try {
+			const buffer = await file.arrayBuffer();
+			if (id === ticket) analyseBytes(new Uint8Array(buffer), file.name);
+		} catch {
+			if (id === ticket) {
+				showFailure(file.name, 'The browser could not read this file. Folders cannot be analysed.');
+			}
+		}
 	}
 
 	/**
@@ -253,30 +327,65 @@
 		const id = ++ticket;
 		view = { phase: 'working', name };
 
-		const copy = bytes.slice();
-		pending = Promise.resolve(copy);
-		const req = {
-			kind: 'analyse',
-			id,
-			name,
-			bytes: copy.buffer,
-			flagTags: flagTagsString()
-		} satisfies import('$lib/worker/protocol').AnalysisRequest;
-		ensureWorker().postMessage(req);
+		loaded = bytes.slice();
+		post({ kind: 'analyse', id, name, bytes: loaded.buffer, flagTags: flagTagsString() });
 	}
 
-	/** Where the scanner listens, for a tab opened to analyse a target's image. */
-	const SCANNER_URL = (import.meta.env.VITE_SCANNER_URL ?? 'http://localhost:8099').replace(
-		/\/$/,
-		''
-	);
+	/** The last part of a URL's path, readable, for naming what it points at. */
+	function fileNameOf(address: string): string {
+		const last = address.split('/').pop()?.split('?')[0] || 'image';
+		try {
+			return decodeURIComponent(last);
+		} catch {
+			return last;
+		}
+	}
 
 	/**
-	 * A tab opened by Remora's "Check with Trawl" carries the image's address in
-	 * `?analyse=`. This fetches it through the scanner, the one thing that can
-	 * reach the target, and runs it through the offline tools like a dropped file,
-	 * so the recon list is left untouched in the tab it came from.
+	 * A tab opened by Remora's "Check with Trawl" carries a one-time code in
+	 * `?analyse=`. This fetches the image it stands for through the scanner, the one
+	 * thing that can reach the target, and runs it through the offline tools like a
+	 * dropped file, so the recon list is left untouched in the tab it came from.
 	 */
+	async function analyseFromScanner(code: string) {
+		const address = takeAddress(code);
+		// Reloading the tab, or following someone else's link, lands here.
+		if (!address) {
+			view = { phase: 'idle' };
+			return;
+		}
+
+		const name = fileNameOf(address);
+		const id = ++ticket;
+		view = { phase: 'working', name };
+
+		const token = getScannerToken();
+		if (!token) {
+			showFailure(
+				name,
+				'This browser is not paired with a scanner. Start one from Web exploration.'
+			);
+			return;
+		}
+
+		try {
+			const res = await fetch(`${SCANNER_URL}/fetch?url=${encodeURIComponent(address)}`, {
+				headers: { Authorization: `Bearer ${token}` }
+			});
+			if (id !== ticket) return;
+			if (res.ok) {
+				const cut = res.headers.get('X-Trawl-Truncated') === '1';
+				analyseBytes(new Uint8Array(await res.arrayBuffer()), cut ? `${name} · first 32 MB` : name);
+			} else {
+				showFailure(name, `The scanner could not fetch this image: ${await res.text()}`);
+			}
+		} catch {
+			if (id === ticket) {
+				showFailure(name, 'Could not reach the scanner. Check it is still running and try again.');
+			}
+		}
+	}
+
 	function startTour() {
 		setTourChoice('tour');
 		showTourPrompt = false;
@@ -315,82 +424,79 @@
 		{
 			target: '[data-tour="identity"]',
 			title: 'One file, every tool at once',
-			body: 'This is a sample image with a flag hidden in its low bits. Every tool in the rack already ran against it before you saw the page.'
+			body: 'This sample image has a flag hidden in its low bits. Every tool in the rack had already run on it when this page appeared.'
 		},
 		{
 			target: '[data-tour="recovered"]',
-			title: 'Anything credible floats to the top',
-			body: 'A flag shows up here the moment any tool finds one, no matter which tool it was. This one came out of the red channel.'
+			title: 'Finds collect at the top',
+			body: 'A flag shows up here as soon as any tool finds one. This one came out of the red channel.'
 		},
 		{
 			target: '[data-tour="rack"]',
 			title: 'Every tool that ran',
-			body: "Tools that hit are marked. Tools that don't apply to this file say why instead of just disappearing. Click through any of them.",
+			body: "Tools that found something are marked. Tools that don't apply to this file say why. Click any of them to see its output.",
 			onenter: () => (activeTool = 'lsb')
 		},
 		{
 			target: '[data-tour="pane"]',
 			title: 'LSB sweep',
-			body: 'It tries every channel, bit position and order at once: the whole space a hidden message could sit in. Hit Extract on any result to turn it into text.',
+			body: 'This tries every channel, bit position and bit order at once. Press Extract everything on a result to read all of it as text.',
 			onenter: () => (activeTool = 'lsb')
 		},
 		{
 			target: '[data-tour="pane"]',
 			title: 'Chi-square attack',
-			body: "This one doesn't read the message. It estimates how much of the image carries a payload, so a flat trace just means nothing at this scale, not that nothing is hidden.",
+			body: 'This one estimates how much of the image carries a payload without reading it. A flat trace means nothing shows at this scale, and a short message can still be hiding.',
 			onenter: () => (activeTool = 'chi')
 		},
 		{
 			target: '[data-tour="pane"]',
 			title: 'Bit-plane wall',
-			body: 'Every bit plane of every channel, drawn as its own picture. A hidden payload usually looks like noise where the image should have structure, or the reverse.',
+			body: 'Every bit plane of every channel, drawn as its own picture. A hidden payload usually looks like noise where the image should have structure, or structure where it should have noise.',
 			onenter: () => (activeTool = 'planes')
 		},
 		{
 			target: '[data-tour="theme-github"]',
 			title: 'Theme and source',
-			body: 'Switch between light and dark from here, or open the repository on GitHub.'
+			body: 'Switch between light and dark here, or open the repository on GitHub.'
 		},
 		{
 			target: '[data-tour="new-file"]',
 			title: 'New file',
-			body: "This clears the current file and takes you back to the start screen, the same place you can drop a file, paste a string, or scan a live site. Finish up and we'll leave a couple more sample files for you to try, each one hiding its flag somewhere different."
+			body: 'This clears the current file and goes back to the start screen, where you can drop a file, paste a string or scan a live site. When you finish the tour, the sample library opens so you can try more files.'
 		}
 	];
 
 	onMount(() => {
 		flagTags = readFlagTags();
-		const address = new URLSearchParams(window.location.search).get('analyse');
-		if (!address) {
-			if (getTourChoice() === null) showTourPrompt = true;
-			return;
-		}
+		// Started now so the worker and the wasm are already loaded if the network
+		// goes away, which is what keeps an open tab working offline.
+		ensureWorker();
 
-		const name = decodeURIComponent(address.split('/').pop()?.split('?')[0] || 'image');
-		view = { phase: 'working', name };
-
-		void (async () => {
-			try {
-				const token = getScannerToken();
-				if (!token) throw new Error('scanner is not paired');
-				const res = await fetch(`${SCANNER_URL}/fetch?url=${encodeURIComponent(address)}`, {
-					headers: { Authorization: `Bearer ${token}` }
-				});
-				if (!res.ok) throw new Error('fetch failed');
-				analyseBytes(new Uint8Array(await res.arrayBuffer()), name);
-			} catch {
-				view = { phase: 'idle' };
-			}
-		})();
+		const code = new URLSearchParams(window.location.search).get('analyse');
+		if (code) void analyseFromScanner(code);
+		else if (getTourChoice() === null) showTourPrompt = true;
 	});
 
 	function updateFlagTags(tags: string[]) {
 		flagTags = writeFlagTags(tags);
 	}
 
+	let toolOutput = $state<HTMLElement>();
+
+	/** On a phone the output sits below the whole rack, and without this, picking a
+	 *  tool would look like it did nothing. */
+	async function selectTool(id: string) {
+		activeTool = id;
+		if (!window.matchMedia('(max-width: 860px)').matches) return;
+		await tick();
+		toolOutput?.scrollIntoView({ block: 'start' });
+		toolOutput?.focus({ preventScroll: true });
+	}
+
 	function requestPlane(channel: number, bit: number) {
 		openPlane = { channel, bit, pixels: null };
-		ensureWorker().postMessage({ kind: 'plane', id: ticket, channel, bit });
+		post({ kind: 'plane', id: ticket, channel, bit });
 	}
 
 	function repairIhdr() {
@@ -401,7 +507,7 @@
 		const name = `${view.result.name} · repaired`;
 		const id = ++ticket;
 		view = { phase: 'working', name };
-		ensureWorker().postMessage({
+		post({
 			kind: 'patchIhdr',
 			id,
 			name,
@@ -412,17 +518,17 @@
 
 	function requestExtract(channels: string, bit: number, msbFirst: boolean) {
 		extracted = null;
-		ensureWorker().postMessage({ kind: 'extract', id: ticket, channels, bit, msbFirst });
+		post({ kind: 'extract', id: ticket, channels, bit, msbFirst });
 	}
 
 	function requestExtractPalette(msbFirst: boolean) {
 		extracted = null;
-		ensureWorker().postMessage({ kind: 'extractPalette', id: ticket, msbFirst });
+		post({ kind: 'extractPalette', id: ticket, msbFirst });
 	}
 
 	function requestExtractJpeg(includeDc: boolean, msbFirst: boolean) {
 		extracted = null;
-		ensureWorker().postMessage({ kind: 'extractJpeg', id: ticket, includeDc, msbFirst });
+		post({ kind: 'extractJpeg', id: ticket, includeDc, msbFirst });
 	}
 
 	function requestExtractAudio(
@@ -432,25 +538,26 @@
 		msbFirst: boolean
 	) {
 		extracted = null;
-		ensureWorker().postMessage({
-			kind: 'extractAudio',
-			id: ticket,
-			label,
-			channelIndex,
-			bit,
-			msbFirst
-		});
+		post({ kind: 'extractAudio', id: ticket, label, channelIndex, bit, msbFirst });
 	}
 
 	function reset() {
+		// Anything still running belongs to the file being left behind.
+		ticket += 1;
+		if (running) {
+			stopWorker();
+			ensureWorker();
+		}
 		keyed = null;
+		openPlane = null;
+		extracted = null;
 		view = { phase: 'idle' };
 	}
 
 	/** Hands the current analysis off as Markdown, to the clipboard or as a file. */
 	async function exportWriteup(action: 'copy' | 'download'): Promise<void> {
 		if (view.phase !== 'done' || view.result.status !== 'ok') return;
-		const markdown = writeupMarkdown(view.result, allFlags, sweepFlags);
+		const markdown = writeupMarkdown(view.result, credibleFlags, sweepFlags);
 
 		if (action === 'copy') {
 			await navigator.clipboard.writeText(markdown);
@@ -473,96 +580,52 @@
 		input.value = '';
 	}
 
+	/** The start screen takes its own drops and pastes. Everywhere else lands here,
+	 *  and without this a dropped file would navigate the tab away from the app. */
 	function droppedFile(event: DragEvent) {
 		event.preventDefault();
+		if (view.phase === 'idle') return;
 		const file = event.dataTransfer?.files?.[0];
 		if (file) accept(file);
 	}
 
 	function pastedFile(event: ClipboardEvent) {
+		if (view.phase === 'idle') return;
 		const target = event.target as HTMLElement | null;
 		if (target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA') return;
 		const file = event.clipboardData?.files?.[0];
 		if (file) accept(file);
 	}
 
-	const survey = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.survey : null
-	);
-	const structure = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.structure : null
+	const finished = $derived(
+		view.phase === 'done' && view.result.status === 'ok' ? view.result : null
 	);
 
-	const sweep = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.sweep : null
-	);
-	const wall = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.wall : null
-	);
-	const chi = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.chi : null
-	);
-	const rs = $derived(view.phase === 'done' && view.result.status === 'ok' ? view.result.rs : null);
-	const pixelError = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.pixelError : null
-	);
-
-	const wav = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.wav : null
-	);
-	const audio = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.audio : null
-	);
-	const spectrogram = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.spectrogram : null
-	);
-	const jpegRaw = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.jpeg : null
-	);
+	const survey = $derived(finished?.survey ?? null);
+	const structure = $derived(finished?.structure ?? null);
+	const sweep = $derived(finished?.sweep ?? null);
+	const wall = $derived(finished?.wall ?? null);
+	const chi = $derived(finished?.chi ?? null);
+	const rs = $derived(finished?.rs ?? null);
+	const pixelError = $derived(finished?.pixelError ?? null);
+	const wav = $derived(finished?.wav ?? null);
+	const audio = $derived(finished?.audio ?? null);
+	const spectrogram = $derived(finished?.spectrogram ?? null);
+	const jpegRaw = $derived(finished?.jpeg ?? null);
 	const jpeg = $derived(jpegRaw && !isJpegError(jpegRaw) ? jpegRaw : null);
 	const jpegError = $derived(jpegRaw && isJpegError(jpegRaw) ? jpegRaw.error : null);
+	const paletteStego = $derived(finished?.paletteStego ?? null);
+	const zip = $derived(finished?.zip ?? null);
+	const pdf = $derived(finished?.pdf ?? null);
+	const binary = $derived(finished?.binary ?? null);
+	const hive = $derived(finished?.hive ?? null);
+	const sqlite = $derived(finished?.sqlite ?? null);
+	const pcap = $derived(finished?.pcap ?? null);
+	const nested = $derived(finished?.nested ?? null);
+	const gif = $derived(finished?.gif ?? null);
+	const aes = $derived(finished?.aes ?? []);
 
-	const paletteStego = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.paletteStego : null
-	);
-
-	const zip = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.zip : null
-	);
-
-	const pdf = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.pdf : null
-	);
-
-	const binary = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.binary : null
-	);
-
-	const hive = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.hive : null
-	);
-
-	const sqlite = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.sqlite : null
-	);
-
-	const pcap = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.pcap : null
-	);
-
-	const nested = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.nested : null
-	);
-
-	const gif = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.gif : null
-	);
-
-	const aes = $derived(view.phase === 'done' && view.result.status === 'ok' ? view.result.aes : []);
-
-	const audioError = $derived(
-		view.phase === 'done' && view.result.status === 'ok' ? view.result.audioError : null
-	);
+	const audioError = $derived(finished?.audioError ?? null);
 
 	/** The decoder knows the size for every format; the PNG header only for one. */
 	const dimensions = $derived.by(() => {
@@ -593,7 +656,8 @@
 					pcap,
 					aes,
 					nested,
-					gif
+					gif,
+					pixelError
 				})
 			: []
 	);
@@ -601,10 +665,13 @@
 
 	const allFlags = $derived(survey ? flagsOf(survey, structure) : []);
 	const credibleFlags = $derived(
-		allFlags.filter((f) => f.credible && matchesFlagTag(f.text, flagTags))
+		uniqueByText(allFlags.filter((f) => f.credible && matchesFlagTag(f.text, flagTags)))
+	);
+	/** Shaped like a flag, but with a tag that isn't in the person's formats. */
+	const otherShapes = $derived(
+		uniqueByText(allFlags.filter((f) => f.credible && !matchesFlagTag(f.text, flagTags)))
 	);
 	const suppressedFlags = $derived(allFlags.filter((f) => !f.credible));
-	/** Every sweep find, each carrying the name of the sweep that turned it up. */
 	/** One line per distinct flag in the cod-end. The same flag read two ways, a
 	 *  GIF frame and the difference that also carries it, collapses to the first. */
 	function uniqueByText<T extends { text: string }>(items: T[]): T[] {
@@ -613,6 +680,7 @@
 		return out;
 	}
 
+	/** Every sweep find, each carrying the name of the sweep that turned it up. */
 	const sweepFlags = $derived(
 		uniqueByText(
 			[
@@ -653,6 +721,12 @@
 						origin: `from object ${o.number}, inside the PDF stream`
 					}))
 				) ?? []),
+				...(sqlite?.flags ?? []).map((found) => ({
+					text: found.text,
+					origin: found.deleted
+						? `from a deleted row in ${found.table}`
+						: `from a row in ${found.table}`
+				})),
 				...(pcap?.streams.flatMap((s) =>
 					s.flags.map((text) => ({
 						text,
@@ -663,15 +737,19 @@
 					text: found.text,
 					origin: `from ${found.origin}`
 				}))
-			].filter((found) => matchesFlagTag(found.text, flagTags))
+			].filter(
+				(found) =>
+					matchesFlagTag(found.text, flagTags) &&
+					!credibleFlags.some((flag) => flag.text === found.text)
+			)
 		)
 	);
 
 	/** For each recovered flag, the route it was reached by, shown in the Cod-end. */
 	const solvePaths = $derived(
-		view.phase === 'done' && view.result.status === 'ok'
+		finished
 			? buildSolvePaths({
-					fileName: view.result.name,
+					fileName: finished.name,
 					survey,
 					structure,
 					sweep,
@@ -682,6 +760,7 @@
 					aes,
 					zip,
 					pdf,
+					sqlite,
 					pcap,
 					nested
 				})
@@ -781,7 +860,11 @@
 	const PANE_BARS = [90, 72, 96, 65, 84, 58, 92, 70, 78, 62];
 </script>
 
-<svelte:window onpaste={pastedFile} />
+<svelte:window
+	onpaste={pastedFile}
+	ondragover={(event) => event.preventDefault()}
+	ondrop={droppedFile}
+/>
 
 <svelte:head>
 	<title>Trawl</title>
@@ -824,19 +907,15 @@
 		onreset={reset}
 	/>
 {:else}
-	<div
-		class="shell"
-		role="region"
-		aria-label="Analysis"
-		ondrop={droppedFile}
-		ondragover={(e) => e.preventDefault()}
-	>
+	<div class="shell" role="region" aria-label="Analysis">
 		<header>
 			<div class="identity" data-tour="identity">
 				<button type="button" class="home" onclick={reset} aria-label="Back to Trawl">
 					<Logo size={22} />
 				</button>
-				<span class="name">{view.phase === 'working' ? view.name : view.result.name}</span>
+				<span class="name"
+					>{view.phase === 'working' ? view.name : view.result.name || 'Trawl'}</span
+				>
 				{#if view.phase === 'done'}
 					<span class="meta mono">{view.result.size.toLocaleString()} B</span>
 					{#if summary}
@@ -874,7 +953,7 @@
 					<div class="skeleton" aria-hidden="true">
 						{#each RACK_BARS as width, i (i)}<span style="width: {width}%"></span>{/each}
 					</div>
-					<p class="working label">Reading container</p>
+					<p class="working label">Reading the file</p>
 				</aside>
 				<main class="pane">
 					<div class="skeleton" aria-hidden="true">
@@ -893,6 +972,14 @@
 				<p class="hint">Dropping or pasting one works too.</p>
 			</div>
 		{:else if survey}
+			{#if finished?.crashed.length}
+				<p class="crashed" role="status">
+					Trawl's {finished.crashed.join(', ')}
+					{finished.crashed.length === 1 ? 'reader' : 'readers'} crashed on this file, so those results
+					are missing. That is a bug in Trawl.
+				</p>
+			{/if}
+
 			{#if credibleFlags.length > 0 || sweepFlags.length > 0}
 				<div data-tour="recovered">
 					<Recovered
@@ -907,15 +994,16 @@
 
 			<div class="body">
 				<aside class="rack-pane" data-tour="rack">
-					<ToolRack
-						{built}
-						planned={PLANNED}
-						active={activeTool}
-						onselect={(id) => (activeTool = id)}
-					/>
+					<ToolRack {built} planned={PLANNED} active={activeTool} onselect={selectTool} />
 				</aside>
 
-				<main class="pane" aria-label="Tool output" data-tour="pane">
+				<main
+					class="pane"
+					aria-label="Tool output"
+					data-tour="pane"
+					tabindex="-1"
+					bind:this={toolOutput}
+				>
 					{#if current}
 						<div class="pane-head">
 							<h2>{current.name}</h2>
@@ -926,29 +1014,31 @@
 					{#if current?.status === 'pending' && current.scope === 'png' && !structure}
 						<p class="clear">
 							This tool reads the PNG container, and this file is
-							{survey.format ? `a ${survey.format}` : 'not a PNG'}. The byte-level tools ran
-							normally.
+							{described(survey.format, 'not a PNG')}. The byte-level tools ran normally.
 						</p>
 					{:else if current?.status === 'pending' && current.scope === 'pixels'}
 						<p class="clear">
-							This tool needs pixels, and there is no decoder for
-							{survey.format ? `a ${survey.format}` : 'this format'} yet. PNG, BMP and GIF all decode.
-							{pixelError ?? ''}
+							{#if pixelError}
+								This tool needs pixels, and this file's could not be decoded: {pixelError}
+							{:else}
+								This tool needs pixels, and Trawl can't decode {described(
+									survey.format,
+									'this format'
+								)} yet. It decodes PNG, BMP and GIF.
+							{/if}
 						</p>
 					{:else if current?.status === 'pending' && current.scope === 'audio' && !wav}
 						<p class="clear">
-							This tool reads sound, and this file is
-							{survey.format ? `a ${survey.format}` : 'not audio'}. WAV is the format it reads. The
-							byte-level tools ran normally.
+							This tool reads WAV audio, and this file is
+							{described(survey.format, 'not audio')}. The byte-level tools ran normally.
 						</p>
 					{:else if current?.status === 'pending' && current.scope === 'jpeg'}
 						<p class="clear">
 							This tool reads the numbers a JPEG stores after compression, and
 							{jpegError
 								? `this file could not be read: ${jpegError}`
-								: survey.format
-									? `this file is a ${survey.format}`
-									: 'this file is not a JPEG'}. The byte-level tools ran normally.
+								: `this file is ${described(survey.format, 'not a JPEG')}`}. The byte-level tools
+							ran normally.
 						</p>
 					{:else if activeTool === 'jsteg'}
 						<SweepView
@@ -1016,7 +1106,7 @@
 							<BinaryView {binary} />
 						{:else}
 							<p class="clear">
-								This file is not an executable this reads, so there is nothing to read.
+								This file is not an ELF or PE binary, so there is nothing to read.
 							</p>
 						{/if}
 					{:else if activeTool === 'gif'}
@@ -1024,16 +1114,16 @@
 					{:else if activeTool === 'aes'}
 						{#if aes.length === 0}
 							<p class="clear">
-								Nothing here forms a key, an IV and a payload that decrypt to anything readable. AES
-								needs all three, and a wrong key turns it into noise, so a file that is not carrying
-								its own key reads as nothing. When one is, the key and IV are usually hex in the
-								metadata and the payload is base64 nearby.
+								Nothing here forms a key, an IV and a payload that decrypt to readable text. AES
+								needs all three, and a wrong key produces noise, so a file without its own key shows
+								nothing here. When a file does carry one, the key and IV are usually hex in the
+								metadata, with the payload in base64 nearby.
 							</p>
 						{:else}
 							<ul class="findings">
 								{#each aes as solved, i (solved.keyHex + solved.ivHex + i)}
 									<li>
-										{#each solved.flags as flag (flag)}
+										{#each new Set(solved.flags) as flag (flag)}
 											<span class="mono big flagged">{flag}</span>
 										{/each}
 										<div class="aes-meta">
@@ -1052,9 +1142,8 @@
 								{/each}
 							</ul>
 							<p class="scale-note">
-								A wrong key makes AES print random bytes, so a decryption is only shown when its
-								result reads as text. That filter is what lets this run on every file without
-								turning up noise.
+								A wrong key makes AES output random bytes, so Trawl only shows a decryption that
+								reads as text. That lets this tool run on every file without reporting noise.
 							</p>
 						{/if}
 					{:else if activeTool === 'magic'}
@@ -1081,7 +1170,7 @@
 							marker={structure?.trailing?.offset ?? null}
 						/>
 					{:else if activeTool === 'chi'}
-						<ChiTrace {chi} error={pixelError} />
+						<ChiTrace {chi} error={pixelError} disputed={!!chi?.detected && !chiStands(chi, rs)} />
 					{:else if activeTool === 'rs'}
 						<RsView {rs} {chi} error={pixelError} />
 					{:else if activeTool === 'planes'}
@@ -1106,14 +1195,26 @@
 						/>
 						{#if sweep?.candidates.length && chi && !chi.detected}
 							<p class="scale-note">
-								Chi-square and RS stayed quiet on this file, which is consistent rather than
-								contradictory. They estimate what fraction of the image carries a payload, and a
-								short message occupies a tiny fraction of one. Below roughly 5% of the low bits
-								there is nothing for them to measure, so the sweep is the tool that finds small
-								payloads and they are the tools that size large ones.
+								Chi-square and RS stayed quiet on this file, which is what you would expect. They
+								estimate what fraction of the image carries a payload, and a short message takes up
+								very little of it. Below roughly 5% of the low bits they have nothing to measure, so
+								the sweep finds small payloads and those two size large ones.
 							</p>
 						{/if}
 					{:else if activeTool === 'crc' && structure}
+						{@const mismatched = structure.chunks.filter((c) => !c.crcOk)}
+						{#if mismatched.length > 0}
+							<ul class="findings mismatches">
+								{#each mismatched as bad (bad.offset)}
+									<li>
+										<span class="mono flagged">{bad.kind}</span>
+										<span class="mono muted">
+											at 0x{bad.offset.toString(16)} does not match its stored checksum
+										</span>
+									</li>
+								{/each}
+							</ul>
+						{/if}
 						{#if structure.ihdrRepair}
 							{@const repair = structure.ihdrRepair}
 							<div class="repair-callout">
@@ -1125,25 +1226,25 @@
 											: `${repair.declaredHeight} → ${repair.recoveredHeight}px high`}
 									</h3>
 									<p>
-										The stored IHDR checksum matches those recovered dimensions exactly. Apply them
-										to the bytes and run every tool again.
+										The stored IHDR checksum matches those dimensions exactly. Apply them and run
+										every tool again.
 									</p>
 								</div>
 								<button type="button" onclick={repairIhdr}>Repair and re-analyse</button>
 							</div>
-						{:else}
-							<p class="clear">Every PNG chunk agrees with its stored checksum.</p>
+						{:else if mismatched.length === 0}
+							<p class="clear">Every PNG chunk matches its stored checksum.</p>
 						{/if}
 					{:else if activeTool === 'flags'}
-						{#if credibleFlags.length === 0}
+						{#if credibleFlags.length === 0 && otherShapes.length === 0}
 							<p class="clear">
 								No <code>tag&lbrace;payload&rbrace;</code> shape outside the compressed streams. This
-								tool only reads the file as it sits on disk, so a payload written into pixel low bits
-								is invisible here by construction. The LSB sweep is what reads those.
+								tool reads the file as it sits on disk, so it can't see a payload written into pixel low
+								bits. The LSB sweep reads those.
 							</p>
 						{:else}
 							<ul class="findings">
-								{#each credibleFlags as found (found.offset)}
+								{#each credibleFlags as found (found.text)}
 									{@const window = contextAround(found.offset, found.text.length)}
 									<li>
 										<span class="mono big flagged">{found.text}</span>
@@ -1160,18 +1261,36 @@
 							</ul>
 						{/if}
 
+						{#if otherShapes.length > 0}
+							<details class="suppressed" open={credibleFlags.length === 0}>
+								<summary class="label">{otherShapes.length} in other formats</summary>
+								<p class="clear">
+									These look like flags, but their tags don't end in any of your flag formats, so
+									they stay out of the Cod-end. Add the tag under Flag formats if one is yours.
+								</p>
+								<ul class="quiet mono">
+									{#each otherShapes as found (found.text)}
+										<li>
+											<span>{found.text}</span>
+											<span class="muted">0x{found.offset.toString(16)} · {found.region}</span>
+										</li>
+									{/each}
+								</ul>
+							</details>
+						{/if}
+
 						{#if suppressedFlags.length > 0}
 							<details class="suppressed">
 								<summary class="label">
 									{suppressedFlags.length} suppressed
 								</summary>
 								<p class="clear">
-									These matched the shape but sit inside a deflate stream, where compressed bytes
-									are close to uniform and the shape turns up by chance. Reporting them as finds
-									would make the detector a random number generator.
+									These match the flag shape but sit inside a deflate stream, where compressed bytes
+									are close to random and the shape turns up by chance, so Trawl doesn't count them
+									as finds.
 								</p>
 								<ul class="quiet mono">
-									{#each suppressedFlags as found (found.offset)}
+									{#each suppressedFlags as found, i (i)}
 										<li>
 											<span>{found.text}</span>
 											<span class="muted">0x{found.offset.toString(16)} · {found.region}</span>
@@ -1184,23 +1303,29 @@
 						{#if structure.trailing}
 							<p class="lead">
 								{structure.trailing.length.toLocaleString()} bytes sit past IEND, starting at
-								<span class="mono">0x{structure.trailing.offset.toString(16)}</span>. A PNG is
-								complete at IEND, so nothing put these here by accident.
+								<span class="mono">0x{structure.trailing.offset.toString(16)}</span>. A PNG ends at
+								IEND, so these bytes didn't get there by accident.
 							</p>
 							<HexView bytes={trailingBytes} baseOffset={structure.trailing.offset} />
 						{:else}
-							<p class="clear">The file ends at IEND. Nothing is appended.</p>
+							<p class="clear">
+								{structure.chunks.some((c) => c.kind === 'IEND')
+									? 'The file ends at IEND. Nothing is appended.'
+									: 'The file has no IEND chunk, so it is cut short or a chunk length is wrong.'}
+							</p>
 						{/if}
 					{:else if activeTool === 'text' && structure}
 						{#if structure.text.length === 0}
 							<p class="clear">No tEXt, zTXt or iTXt chunks.</p>
 						{:else}
 							<ul class="findings">
-								{#each structure.text as text (text.kind + text.keyword)}
+								{#each structure.text as text, i (i)}
 									<li>
 										<span class="keyword mono">{text.kind} · {text.keyword || 'no keyword'}</span>
 										{#if text.compressed}
-											<span class="muted">Compressed, not yet inflated. Content unread.</span>
+											<span class="muted">
+												Compressed, and inflating it failed{text.error ? `: ${text.error}` : '.'}
+											</span>
 										{:else}
 											<span class="mono big">{text.text}</span>
 										{/if}
@@ -1231,13 +1356,12 @@
 						/>
 					{:else if activeTool === 'pixels'}
 						<p class="lead">
-							Pixels decode through a hand-written PNG decoder rather than the browser, because a
-							canvas readback premultiplies alpha and destroys bit 0. On this file that is
-							{summary ?? 'unavailable'}.
+							Trawl decodes pixels itself because reading them back from a browser canvas
+							premultiplies alpha and destroys bit 0.{summary ? ` This file is ${summary}.` : ''}
 						</p>
 						<p class="clear">
 							{sweep
-								? `The LSB sweep and the bit-plane wall both read those pixels. Chi-square and RS analysis are next.`
+								? 'The LSB sweep, the bit-plane wall, chi-square and RS analysis all read these pixels.'
 								: `Decoding failed on this file, so no pixel tool can run. ${pixelError ?? ''}`}
 						</p>
 					{:else if structure}
@@ -1277,8 +1401,8 @@
 <style>
 	.shell {
 		height: 100dvh;
-		display: grid;
-		grid-template-rows: auto auto minmax(0, 1fr);
+		display: flex;
+		flex-direction: column;
 	}
 
 	header {
@@ -1325,7 +1449,7 @@
 	.name {
 		font-weight: 600;
 		font-size: var(--t-mid);
-		max-width: 40ch;
+		max-width: min(40ch, 100%);
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
@@ -1338,8 +1462,10 @@
 
 	.right {
 		display: flex;
+		flex-wrap: wrap;
 		align-items: center;
-		gap: var(--s4);
+		gap: var(--s2) var(--s4);
+		min-width: 0;
 	}
 
 	.tally {
@@ -1370,6 +1496,7 @@
 	}
 
 	.body {
+		flex: 1 1 0;
 		display: grid;
 		grid-template-columns: minmax(280px, 26rem) minmax(0, 1fr);
 		min-height: 0;
@@ -1386,6 +1513,10 @@
 		padding: var(--s4) var(--s5) var(--s6);
 		overflow: auto;
 		min-height: 0;
+	}
+
+	.pane:focus {
+		outline: none;
 	}
 
 	.pane-head {
@@ -1475,6 +1606,10 @@
 		user-select: all;
 	}
 
+	.mismatches {
+		margin-bottom: var(--s4);
+	}
+
 	.repair-callout {
 		display: grid;
 		grid-template-columns: minmax(0, 1fr) auto;
@@ -1548,7 +1683,7 @@
 	}
 
 	.suppressed[open] summary::before {
-		content: '– ';
+		content: '− ';
 	}
 
 	.suppressed .clear {
@@ -1562,7 +1697,7 @@
 		display: grid;
 		gap: var(--s2);
 		font-size: var(--t-data);
-		opacity: 0.6;
+		color: var(--muted);
 	}
 
 	.quiet li {
@@ -1643,6 +1778,15 @@
 		color: var(--muted);
 	}
 
+	.crashed {
+		margin: 0;
+		padding: var(--s2) var(--s5);
+		border-bottom: 1px solid var(--rule);
+		background: var(--panel-deep);
+		color: var(--signal);
+		font-size: var(--t-label);
+	}
+
 	.notice {
 		padding: var(--s6) var(--s5);
 		max-width: 60ch;
@@ -1696,12 +1840,16 @@
 			min-height: 100dvh;
 		}
 
-		.body {
-			grid-template-columns: 1fr;
+		header {
+			position: static;
 		}
 
-		.rack-pane,
-		.pane {
+		.body {
+			flex: 1 1 auto;
+			grid-template-columns: minmax(0, 1fr);
+		}
+
+		.rack-pane {
 			overflow: visible;
 		}
 
@@ -1712,6 +1860,7 @@
 
 		.pane {
 			padding: var(--s4);
+			overflow: auto visible;
 		}
 
 		.repair-callout {

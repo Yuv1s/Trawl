@@ -278,7 +278,15 @@ pub fn html_entities(data: &[u8]) -> Option<Vec<u8>> {
             continue;
         }
 
-        let Some(end) = data[i..].iter().position(|&b| b == b';').map(|p| i + p) else {
+        // Generous, for leading zeros. Searching further for each ampersand makes a text
+        // of them quadratic.
+        const LONGEST_ENTITY: usize = 32;
+        let Some(end) = data[i..]
+            .iter()
+            .take(LONGEST_ENTITY)
+            .position(|&b| b == b';')
+            .map(|p| i + p)
+        else {
             out.push(data[i]);
             i += 1;
             continue;
@@ -415,8 +423,12 @@ const BASE58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwx
 /// Leading zero bytes are the exception, because a number does not remember how
 /// many zeroes preceded it. They are carried separately, as leading `1`s.
 pub fn base58(data: &[u8]) -> Option<Vec<u8>> {
+    // Dividing one long number back down is quadratic in its length, and base58 is for
+    // keys and addresses rather than documents.
+    const LONGEST: usize = 32 * 1024;
+
     let clean = unwrap_lines(data);
-    if clean.len() < MIN_LENGTH || !looks_encoded(&clean) {
+    if clean.len() < MIN_LENGTH || clean.len() > LONGEST || !looks_encoded(&clean) {
         return None;
     }
 

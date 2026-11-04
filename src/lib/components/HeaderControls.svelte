@@ -39,7 +39,7 @@
 
 	let open = $state(false);
 	let tagsOpen = $state(false);
-	let copied = $state(false);
+	let exportState = $state<'idle' | 'copied' | 'failed'>('idle');
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let firstItem: HTMLButtonElement | undefined = $state();
 	let addInput: HTMLInputElement | undefined = $state();
@@ -68,14 +68,15 @@
 
 	async function pick(action: 'copy' | 'download') {
 		open = false;
-		if (action === 'download') {
-			await onExport?.('download');
-			return;
+		try {
+			await onExport?.(action);
+			if (action === 'download') return;
+			exportState = 'copied';
+		} catch {
+			exportState = 'failed';
 		}
-		await onExport?.('copy');
-		copied = true;
 		clearTimeout(timer);
-		timer = setTimeout(() => (copied = false), 1600);
+		timer = setTimeout(() => (exportState = 'idle'), 1600);
 	}
 </script>
 
@@ -117,9 +118,13 @@
 				aria-haspopup="menu"
 				aria-expanded={open}
 				onclick={() => (open = !open)}
-				aria-label={copied ? 'Writeup copied' : 'Export a writeup'}
+				aria-label={exportState === 'copied'
+					? 'Writeup copied'
+					: exportState === 'failed'
+						? 'Could not copy the writeup'
+						: 'Export a writeup'}
 			>
-				{#if copied}
+				{#if exportState === 'copied'}
 					<svg viewBox="0 0 18 18" width="16" height="16" fill="none" aria-hidden="true">
 						<path
 							d="M4 9.2l3.2 3.2L14 6.2"
@@ -152,7 +157,13 @@
 						/>
 					</svg>
 				{/if}
-				<span class="ctrl-label">{copied ? 'Copied' : 'Writeup'}</span>
+				<span class="ctrl-label">
+					{exportState === 'copied'
+						? 'Copied'
+						: exportState === 'failed'
+							? 'Copy failed'
+							: 'Writeup'}
+				</span>
 			</button>
 
 			{#if open}
@@ -188,7 +199,7 @@
 			<button
 				type="button"
 				class="ctrl"
-				aria-haspopup="menu"
+				aria-haspopup="dialog"
 				aria-expanded={tagsOpen}
 				onclick={() => (tagsOpen = !tagsOpen)}
 				aria-label="Configure flag formats"
@@ -206,7 +217,7 @@
 			</button>
 
 			{#if tagsOpen}
-				<div class="menu wide" role="menu" aria-label="Flag format presets">
+				<div class="menu wide" role="dialog" aria-label="Flag formats">
 					<FlagTagEditor tags={flagTags ?? []} onchange={(tags) => onFlagTags?.(tags)} />
 				</div>
 				<button
@@ -264,8 +275,17 @@
 </div>
 
 <style>
+	@media (pointer: coarse) {
+		.ctrl {
+			min-height: 44px;
+			min-width: 44px;
+			justify-content: center;
+		}
+	}
+
 	.controls {
 		display: flex;
+		flex-wrap: wrap;
 		align-items: center;
 		gap: var(--s2);
 	}

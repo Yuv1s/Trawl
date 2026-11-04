@@ -5,12 +5,42 @@
 //! we can walk would be withholding work already done.
 
 use crate::json::{push_bool, push_field, push_number, push_string};
-use crate::{bytes, exif, jpeg, png};
+use crate::{bytes, exif, gif, jpeg, png, wav, zip};
 
 const STRING_MIN: usize = 6;
 const STRING_SAMPLE: usize = 300;
 const ENTROPY_POINTS: usize = 256;
 const FLAG_RADIUS: usize = 512;
+
+/// Where a format's own data stops, when anything follows it.
+///
+/// Whatever follows was put there by something else, and has nothing to do with the
+/// compressed bytes it happens to sit beside.
+fn format_end(data: &[u8]) -> Option<usize> {
+    let trailing = if jpeg::has_signature(data) {
+        // A file whose segments do not walk has no end the walk can name, and the last
+        // end-of-image marker is the best evidence left.
+        jpeg::trailing(data).or_else(|| {
+            let at = data.windows(2).rposition(|pair| pair == [0xff, 0xd9])? + 2;
+            (data.len() > at).then(|| (at, data.len() - at))
+        })
+    } else if png::has_signature(data) {
+        png::trailing_data(data)
+    } else if gif::has_signature(data) {
+        gif::trailing(data)
+    } else if wav::has_signature(data) {
+        wav::parse(data).ok().and_then(|parsed| parsed.trailing)
+    } else if data.starts_with(b"%PDF-") {
+        let at = data.windows(5).rposition(|run| run == b"%%EOF")? + 5;
+        (data.len() > at).then(|| (at, data.len() - at))
+    } else if data.starts_with(b"PK\x03\x04") {
+        zip::trailing(data)
+    } else {
+        None
+    };
+
+    trailing.map(|(at, _)| at)
+}
 
 /// Judges a flag-shaped match by the neighbourhood it was found in.
 ///
@@ -18,8 +48,19 @@ const FLAG_RADIUS: usize = 512;
 /// there by chance across a large enough file. This is the general form of the
 /// rule the PNG walker applies structurally, and it works on formats whose
 /// structure we cannot read.
-fn credible(data: &[u8], offset: usize) -> (String, bool) {
-    let entropy = bytes::local_entropy(data, offset, FLAG_RADIUS);
+///
+/// A match past the end of the format is judged on what lies past the end. A flag
+/// appended to a JPEG sits right after half a kilobyte of compressed scan data, and
+/// averaging that in called it noise. The match only has to finish out there, since
+/// the letters of `%%EOF` read as part of a tag that follows them directly.
+fn credible(data: &[u8], found: &bytes::Found, end: Option<usize>) -> (String, bool) {
+    let finish = found.offset + found.text.len();
+    let entropy = match end {
+        Some(end) if finish > end => {
+            bytes::local_entropy(&data[end..], found.offset.saturating_sub(end), FLAG_RADIUS)
+        }
+        _ => bytes::local_entropy(data, found.offset, FLAG_RADIUS),
+    };
 
     if entropy > bytes::COMPRESSED_ENTROPY {
         (format!("high-entropy region, {entropy:.1} bits/byte"), false)
@@ -78,15 +119,21 @@ pub fn json(data: &[u8]) -> String {
         out.push('}');
     };
 
+    let end = format_end(data);
     for found in bytes::flag_candidates(data) {
-        let (region, ok) = credible(data, found.offset);
+        let (region, ok) = credible(data, &found, end);
         emit_flag(&mut out, found.offset, &found.text, &region, ok);
     }
 
     // A flag written as UTF-16LE has a null between every character, so the
     // byte-level scan walks straight past it. Search the decoded text as well.
+    let mut left = bytes::MAX_FLAGS;
     for wide in bytes::utf16le_strings(data, STRING_MIN) {
         for found in bytes::flag_candidates(wide.text.as_bytes()) {
+            if left == 0 {
+                break;
+            }
+            left -= 1;
             emit_flag(
                 &mut out,
                 wide.offset + found.offset * 2,

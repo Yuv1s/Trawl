@@ -58,7 +58,10 @@ fn reads_a_rot13_comment() {
 
 #[test]
 fn reads_css_hex_escapes() {
-    let css = format!(".x::after {{ content: \"{}\"; }}", css_escapes("flag{css_escapes}"));
+    let css = format!(
+        ".x::after {{ content: \"{}\"; }}",
+        css_escapes("flag{css_escapes}")
+    );
     assert!(found(css.as_bytes()).contains(&"flag{css_escapes}".to_string()));
 }
 
@@ -80,7 +83,10 @@ fn reverses_an_etag_before_decoding_it() {
 
 #[test]
 fn xors_an_integer_array_against_the_right_byte() {
-    let js = format!("const driftVector = {};", xor_array("flag{xored_vectors}", 0x2d));
+    let js = format!(
+        "const driftVector = {};",
+        xor_array("flag{xored_vectors}", 0x2d)
+    );
     let result = harvest(js.as_bytes());
     assert!(
         result
@@ -114,7 +120,10 @@ fn one_flag_is_reported_once_even_if_two_readings_find_it() {
     let js = format!("x = \"{value}\";");
     let values = found(js.as_bytes());
     assert_eq!(
-        values.iter().filter(|v| *v == "flag{seen_only_once}").count(),
+        values
+            .iter()
+            .filter(|v| *v == "flag{seen_only_once}")
+            .count(),
         1
     );
 }

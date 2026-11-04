@@ -52,10 +52,10 @@
 
 <p class="footnote">
 	Each touching pair is one term of the chi-square test. A photograph's counts fall away from zero,
-	so the two bars in a pair are plainly different heights. Replacing low bits averages them, and a
-	row of level pairs is what the test is reading when it fires. Zero is excluded here along with
-	one, because JSteg never writes to either: there are
-	{zero.toLocaleString()} zero coefficients in this file, out of {jpeg.blocks.toLocaleString()} blocks.
+	so the two bars in a pair have clearly different heights. Replacing low bits evens them out, and a
+	row of level pairs is what makes the test fire. Zero and one are left out because JSteg never
+	writes to either. This file has
+	{zero.toLocaleString()} zero coefficients across {jpeg.blocks.toLocaleString()} blocks.
 </p>
 
 <style>

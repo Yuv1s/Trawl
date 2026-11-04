@@ -10,6 +10,8 @@
 
 use core::fmt;
 
+use crate::pixels::MAX_PIXELS;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BmpError {
     NotBmp,
@@ -17,6 +19,7 @@ pub enum BmpError {
     UnsupportedDepth(u16),
     UnsupportedCompression(u32),
     ZeroDimension,
+    TooLarge,
 }
 
 impl fmt::Display for BmpError {
@@ -30,6 +33,7 @@ impl fmt::Display for BmpError {
                 "compression method {c} is not supported; only uncompressed BMP decodes"
             ),
             Self::ZeroDimension => write!(f, "the header declares a zero width or height"),
+            Self::TooLarge => write!(f, "the header declares more pixels than Trawl will decode"),
         }
     }
 }
@@ -87,11 +91,14 @@ pub fn header(file: &[u8]) -> Result<Header, BmpError> {
         return Err(BmpError::ZeroDimension);
     }
 
+    // Capped at what a pixel can index. The field is 32 bits, and walking four
+    // billion entries that are mostly past the end of the file is a hang.
     let palette_entries = if bits_per_pixel <= 8 {
+        let reachable = 1usize << bits_per_pixel;
         if declared_colours > 0 {
-            declared_colours
+            declared_colours.min(reachable)
         } else {
-            1usize << bits_per_pixel
+            reachable
         }
     } else {
         0
@@ -115,16 +122,27 @@ pub fn palette(file: &[u8]) -> Option<Vec<[u8; 3]>> {
     }
 
     let dib_size = u32_at(file, 14)? as usize;
-    let start = 14 + dib_size;
+    let start = dib_size.checked_add(14)?;
 
     Some(
         (0..header.palette_entries)
             .filter_map(|i| {
-                let e = file.get(start + i * 4..start + i * 4 + 3)?;
+                let at = start.checked_add(i * 4)?;
+                let e = file.get(at..at.checked_add(3)?)?;
                 Some([e[2], e[1], e[0]])
             })
             .collect(),
     )
+}
+
+/// Bytes of pixel data the geometry needs, or nothing when the number does not fit.
+///
+/// Counted without wrapping. 65536 by 65536 at 32 bits is 2^34 bytes, which is zero
+/// in a 32-bit `usize`, and zero bytes needed passes every check that follows.
+fn pixel_bytes(header: &Header) -> Option<(usize, usize)> {
+    let row_bits = (header.width as u64).checked_mul(header.bits_per_pixel as u64)?;
+    let stride = usize::try_from(row_bits.div_ceil(32).checked_mul(4)?).ok()?;
+    Some((stride, stride.checked_mul(header.height)?))
 }
 
 /// Decodes to non-premultiplied RGBA8.
@@ -132,16 +150,26 @@ pub fn decode(file: &[u8]) -> Result<(Header, Vec<u8>), BmpError> {
     let header = header(file)?;
     let table = palette(file).unwrap_or_default();
 
-    let stride = ((header.width * header.bits_per_pixel as usize).div_ceil(32)) * 4;
+    // A file cannot hold what a number too large to count asks for, so a geometry
+    // that overflows is a truncated file like any other that asks for too much.
+    let (stride, body) = pixel_bytes(&header).ok_or(BmpError::Truncated)?;
     let needed = header
         .data_offset
-        .checked_add(stride * header.height)
+        .checked_add(body)
         .ok_or(BmpError::Truncated)?;
     if file.len() < needed {
         return Err(BmpError::Truncated);
     }
 
-    let mut rgba = vec![0u8; header.width * header.height * 4];
+    // The file has paid for its rows, but at one bit per pixel that still buys 32
+    // bytes of RGBA per byte of file.
+    let pixels = header
+        .width
+        .checked_mul(header.height)
+        .filter(|&pixels| pixels <= MAX_PIXELS)
+        .ok_or(BmpError::TooLarge)?;
+
+    let mut rgba = vec![0u8; pixels * 4];
     // 32-bit BI_RGB leaves the fourth byte undefined, and plenty of encoders
     // write zero there. Treating that as fully transparent would blank the
     // image, so alpha is only honoured when something actually set it.

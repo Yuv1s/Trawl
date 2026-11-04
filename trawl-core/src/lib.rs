@@ -85,6 +85,15 @@ pub fn chi_square(file: &[u8], inflated: &[u8], steps: usize) -> Result<String, 
     Ok(cuttlefish::chi_square_json(&raster.rgba, steps))
 }
 
+/// The comma-separated flag tags the worker passes across the boundary.
+fn tag_list(tags: &str) -> Vec<String> {
+    tags.split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Flag-shaped matches in a byte run, as JSON.
 ///
 /// Exposed so the worker can re-scan text it decompressed itself, using the same
@@ -114,13 +123,7 @@ pub fn find_flags(data: &[u8]) -> String {
 
 #[wasm_bindgen]
 pub fn find_flags_for_tags(data: &[u8], tags: &str) -> String {
-    let tags: Vec<String> = tags
-        .split(',')
-        .map(str::trim)
-        .filter(|tag| !tag.is_empty())
-        .map(str::to_string)
-        .collect();
-    flags_json(&bytes::flag_candidates_for_tags(data, &tags))
+    flags_json(&bytes::flag_candidates_for_tags(data, &tag_list(tags)))
 }
 
 /// Palette findings for an indexed image, as JSON. Null when there is no PLTE.
@@ -241,13 +244,7 @@ pub fn peel_encodings(data: &[u8]) -> String {
 /// that recover keys underneath an enciphered flag.
 #[wasm_bindgen]
 pub fn peel_encodings_for_tags(data: &[u8], tags: &str) -> String {
-    let tags: Vec<String> = tags
-        .split(',')
-        .map(str::trim)
-        .filter(|tag| !tag.is_empty())
-        .map(str::to_string)
-        .collect();
-    mantis::json_for_tags(data, &tags)
+    mantis::json_for_tags(data, &tag_list(tags))
 }
 
 /// Packed Mantis pass for the worker's alternating loop.
@@ -259,14 +256,7 @@ pub fn peel_encodings_for_tags(data: &[u8], tags: &str) -> String {
 /// share one six-layer budget.
 #[wasm_bindgen]
 pub fn mantis_packed_pass(data: &[u8], tags: &str, remaining_depth: usize) -> Vec<u8> {
-    let tags: Vec<String> = tags
-        .split(',')
-        .map(str::trim)
-        .filter(|tag| !tag.is_empty())
-        .map(str::to_string)
-        .collect();
-
-    let peel = mantis::peel_with_depth(data, &tags, remaining_depth);
+    let peel = mantis::peel_with_depth(data, &tag_list(tags), remaining_depth);
     let json = mantis::json_from_peel(&peel);
     let json_bytes = json.as_bytes();
     let result_bytes = &peel.result;
@@ -357,13 +347,7 @@ pub fn sqlite_database(file: &[u8]) -> String {
 /// back together reveals it. The caller's flag tags steer that scan.
 #[wasm_bindgen]
 pub fn pcap_capture(file: &[u8], tags: &str) -> String {
-    let tags: Vec<String> = tags
-        .split(',')
-        .map(str::trim)
-        .filter(|tag| !tag.is_empty())
-        .map(str::to_string)
-        .collect();
-    pcap::json(file, &tags)
+    pcap::json(file, &tag_list(tags))
 }
 
 /// Applies a key somebody already has, across every cipher that takes one.
@@ -381,13 +365,7 @@ pub fn mantis_with_key(data: &[u8], key: &str) -> String {
 /// `mantis_with_key`, with the caller's configured flag tags steering the cribs.
 #[wasm_bindgen]
 pub fn mantis_with_key_for_tags(data: &[u8], key: &str, tags: &str) -> String {
-    let tags: Vec<String> = tags
-        .split(',')
-        .map(str::trim)
-        .filter(|tag| !tag.is_empty())
-        .map(str::to_string)
-        .collect();
-    mantis::keyed::json(&mantis::keyed::with_key_for_tags(data, key, &tags))
+    mantis::keyed::json(&mantis::keyed::with_key_for_tags(data, key, &tag_list(tags)))
 }
 
 /// JPEG coefficient analysis as JSON: the chi-square attack, the coefficient
@@ -531,131 +509,9 @@ pub fn wav_spectrogram(
 /// For each displayed frame and each consecutive difference, runs the existing
 /// Cuttlefish detectors (sweep, chi-square, RS) on the RGBA pixels. Returns a
 /// compact JSON summary with findings; the raw pixels and plane walls stay behind.
-/// The packed binary tail is unnecessary — we only need metadata and detector results.
+/// The packed binary tail is unnecessary, since only metadata and detector results
+/// are wanted. The caller's flag tags steer what the sweep calls a flag.
 #[wasm_bindgen]
-pub fn gif_frame_analysis(
-	file: &[u8],
-	_tags: &str,
-	max_bytes: usize,
-	chi_steps: usize,
-) -> Result<String, JsError> {
-	if !gif::has_signature(file) {
-		return Ok("null".to_string());
-	}
-
-	let (header, frames, differences, capped) = gif::decode_frames(file)
-		.map_err(|e| JsError::new(&e.to_string()))?;
-
-	use crate::json::{push_bool, push_field, push_number, push_string};
-
-	let mut out = String::from("{");
-	push_number(&mut out, "width", header.width);
-	out.push(',');
-	push_number(&mut out, "height", header.height);
-	out.push(',');
-	push_number(&mut out, "declaredFrames", header.declared_frames);
-	out.push(',');
-	push_number(&mut out, "analysedFrames", frames.len());
-	out.push(',');
-	push_bool(&mut out, "capped", capped);
-	out.push(',');
-	push_string(&mut out, "error");
-	out.push_str(":null");
-	out.push(',');
-	push_string(&mut out, "sources");
-	out.push_str(":[");
-
-	let mut source_index = 0;
-
-	// Analyze each displayed frame
-	for (frame_idx, frame) in frames.iter().enumerate() {
-		if source_index > 0 {
-			out.push(',');
-		}
-		source_index += 1;
-
-		out.push('{');
-		push_field(&mut out, "kind", "frame");
-		out.push(',');
-		push_number(&mut out, "from", frame_idx + 1); // one-based
-		out.push(',');
-		push_string(&mut out, "to");
-		out.push_str(":null");
-		out.push(',');
-		push_number(&mut out, "delay", 0);
-		out.push(',');
-		push_string(&mut out, "disposal");
-		out.push_str(":null");
-		out.push(',');
-
-		// Run detectors on this frame
-		let sweep_json = cuttlefish::sweep_json(frame, header.width, header.height, false, max_bytes);
-		let chi_json = cuttlefish::chi_square_json(frame, chi_steps);
-		let rs_json = cuttlefish::rs::analyse(frame, header.width, header.height, 3);
-		let rs_json_str = cuttlefish::rs::json(&rs_json);
-
-		push_string(&mut out, "lsb");
-		out.push(':');
-		out.push_str(&sweep_json);
-		out.push(',');
-
-		push_string(&mut out, "chi");
-		out.push(':');
-		// Parse chi JSON and extract just detected/embeddedFraction
-		// For simplicity, include the full chi result
-		out.push_str(&chi_json);
-		out.push(',');
-
-		push_string(&mut out, "rs");
-		out.push(':');
-		out.push_str(&rs_json_str);
-
-		out.push('}');
-	}
-
-	// Analyze each consecutive difference
-	for (diff_idx, diff) in differences.iter().enumerate() {
-		if source_index > 0 {
-			out.push(',');
-		}
-		source_index += 1;
-
-		out.push('{');
-		push_field(&mut out, "kind", "difference");
-		out.push(',');
-		push_number(&mut out, "from", diff_idx + 1); // one-based
-		out.push(',');
-		push_number(&mut out, "to", diff_idx + 2); // the later frame
-		out.push(',');
-		push_number(&mut out, "delay", 0);
-		out.push(',');
-		push_string(&mut out, "disposal");
-		out.push_str(":null");
-		out.push(',');
-
-		// Run detectors on this difference
-		let sweep_json = cuttlefish::sweep_json(diff, header.width, header.height, false, max_bytes);
-		let chi_json = cuttlefish::chi_square_json(diff, chi_steps);
-		let rs_json = cuttlefish::rs::analyse(diff, header.width, header.height, 3);
-		let rs_json_str = cuttlefish::rs::json(&rs_json);
-
-		push_string(&mut out, "lsb");
-		out.push(':');
-		out.push_str(&sweep_json);
-		out.push(',');
-
-		push_string(&mut out, "chi");
-		out.push(':');
-		out.push_str(&chi_json);
-		out.push(',');
-
-		push_string(&mut out, "rs");
-		out.push(':');
-		out.push_str(&rs_json_str);
-
-		out.push('}');
-	}
-
-	out.push_str("]}");
-	Ok(out)
+pub fn gif_frame_analysis(file: &[u8], tags: &str, max_bytes: usize, chi_steps: usize) -> String {
+    gif::analysis_json(file, &tag_list(tags), max_bytes, chi_steps)
 }

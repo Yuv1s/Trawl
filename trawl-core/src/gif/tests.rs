@@ -589,6 +589,160 @@ fn empty_global_palette_reads_as_black_opaque() {
     assert_eq!(pixel(&rgba, 2, 1, 0), [0, 0, 0, 255]);
 }
 
+/// A screen of any size carrying `frames` copies of a 1x1 frame, which is how little
+/// file a big canvas takes.
+fn tiny_frames_on(width: u16, height: u16, frames: usize) -> Vec<u8> {
+    let mut out = b"GIF89a".to_vec();
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(&[0, 0, 0]);
+    for _ in 0..frames {
+        out.push(0x2c);
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.push(0);
+        out.push(2);
+        out.extend_from_slice(&[2, 0x44, 0x01, 0]);
+    }
+    out.push(0x3b);
+    out
+}
+
+#[test]
+fn a_canvas_too_large_to_composite_is_refused_before_it_is_allocated() {
+    // 29 bytes declaring 65535 x 65535. Times four it wraps a 32-bit usize, and it
+    // was sixteen gigabytes of canvas on anything else.
+    let file = tiny_frames_on(65_535, 65_535, 1);
+    assert_eq!(file.len(), 29);
+    assert_eq!(decode_frames(&file).unwrap_err(), GifError::WorkLimit);
+    assert_eq!(decode(&file).unwrap_err(), GifError::WorkLimit);
+}
+
+#[test]
+fn the_budget_counts_the_canvas_and_not_the_little_a_frame_paints() {
+    // Two kilobytes of file. Counted by what each frame painted this was 128 pixels
+    // and 16 gigabytes of canvases, so most of it has to stay undecoded.
+    let file = tiny_frames_on(4000, 4000, 128);
+    assert!(file.len() < 2048);
+
+    let (header, displayed, differences, capped) = decode_frames(&file).unwrap();
+    assert!(capped);
+    assert_eq!(displayed.len(), MAX_COMPOSITED_PIXELS / (4000 * 4000));
+    assert_eq!(differences.len(), displayed.len() - 1);
+    assert_eq!(header.frames, displayed.len());
+    assert_eq!(header.declared_frames, 128);
+}
+
+#[test]
+fn the_first_frame_alone_does_not_decode_the_rest() {
+    // A pixel tool wants one picture. A broken later frame is no reason to refuse it,
+    // and building every canvas first is no way to get it.
+    let mut file = tiny_frames_on(2, 2, 2);
+    let last_code_size = file.len() - 6;
+    file[last_code_size] = 1;
+
+    assert!(decode_frames(&file).is_err(), "the fixture should break frame two");
+    assert_eq!(decode(&file).unwrap().1.len(), 2 * 2 * 4);
+}
+
+#[test]
+fn a_zero_sized_screen_is_refused() {
+    let file = tiny_frames_on(0, 5, 0);
+    assert_eq!(decode(&file).unwrap_err(), GifError::ZeroDimension);
+    assert_eq!(decode_frames(&tiny_frames_on(5, 0, 0)).unwrap_err(), GifError::ZeroDimension);
+    assert_eq!(decode(&tiny_frames_on(0, 0, 1)).unwrap_err(), GifError::ZeroDimension);
+}
+
+#[test]
+fn frame_timing_is_carried_through() {
+    let file = build_multi(
+        &GLOBAL,
+        0,
+        vec![
+            Frame {
+                delay: 7,
+                disposal: 2,
+                ..Frame::full(2, 1, vec![0, 1])
+            },
+            Frame {
+                delay: 250,
+                disposal: 3,
+                ..Frame::full(2, 1, vec![0, 2])
+            },
+        ],
+    );
+
+    let (header, ..) = decode_frames(&file).unwrap();
+    assert_eq!(header.timings[0], Timing { delay: 7, disposal: 2 });
+    assert_eq!(header.timings[1].delay, 250);
+    assert_eq!(header.timings[1].disposal_name(), "previous");
+
+    let json = analysis_json(&file, &[], 256, 4);
+    assert!(crate::json::is_well_formed(&json), "{json}");
+    assert!(json.contains("\"delay\":7"), "{json}");
+    assert!(json.contains("\"disposal\":\"background\""), "{json}");
+    assert!(json.contains("\"delay\":250"), "{json}");
+    assert!(json.contains("\"kind\":\"difference\""), "{json}");
+    assert!(json.contains("\"to\":2,\"delay\":null,\"disposal\":null"), "{json}");
+}
+
+#[test]
+fn a_gif_this_reader_refuses_says_why() {
+    let json = analysis_json(&tiny_frames_on(65_535, 65_535, 1), &[], 256, 4);
+    assert!(crate::json::is_well_formed(&json), "{json}");
+    assert!(json.contains("\"error\":\"the canvas is larger"), "{json}");
+    assert!(json.contains("\"width\":65535"), "{json}");
+    assert!(json.contains("\"sources\":[]"), "{json}");
+
+    assert_eq!(analysis_json(b"not a gif", &[], 256, 4), "null");
+}
+
+#[test]
+fn configured_tags_reach_the_frame_sweep() {
+    // A two-letter tag is outside what an unnamed shape may be. The tags were accepted
+    // and thrown away, so no frame could ever report one.
+    let message = b"HV{hidden_in_a_frame}";
+    let bits: Vec<u8> = message
+        .iter()
+        .flat_map(|byte| (0..8).rev().map(move |shift| (byte >> shift) & 1))
+        .collect();
+    let width = 16usize;
+    let height = bits.len().div_ceil(3).div_ceil(width);
+
+    let mut indices = vec![0u8; width * height];
+    for (i, chunk) in bits.chunks(3).enumerate() {
+        // Colours whose low bits spell the three bits this pixel carries.
+        indices[i] = chunk.iter().fold(0, |acc, bit| (acc << 1) | bit) << (3 - chunk.len());
+    }
+    let table: Vec<[u8; 3]> = (0..8)
+        .map(|i| [((i >> 2) & 1) as u8, ((i >> 1) & 1) as u8, (i & 1) as u8])
+        .collect();
+    let file = build_multi(&table, 0, vec![Frame::full(width, height, indices)]);
+
+    let named = analysis_json(&file, &["HV".to_string()], 256, 4);
+    assert!(named.contains("\"flags\":[\"HV{hidden_in_a_frame}\"]"), "{named}");
+    assert!(crate::json::is_well_formed(&named), "{named}");
+
+    let unnamed = analysis_json(&file, &[], 256, 4);
+    assert!(!unnamed.contains("\"flags\":[\"HV{hidden_in_a_frame}\"]"), "{unnamed}");
+}
+
+#[test]
+fn bytes_after_the_trailer_are_found() {
+    let mut file = build(simple(4, 4, vec![0u8; 16]));
+    assert_eq!(trailing(&file), None);
+
+    let end = file.len();
+    file.extend_from_slice(b"appended");
+    assert_eq!(trailing(&file), Some((end, 8)));
+
+    assert_eq!(trailing(b"not a gif"), None);
+    for cut in 0..end {
+        assert_eq!(trailing(&file[..cut]), None, "cut at {cut}");
+    }
+}
+
 #[test]
 fn over_the_frame_budget_reports_capped() {
     // The frame budget is 128; 200 declared frames trip the work cap so the

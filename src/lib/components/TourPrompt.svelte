@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import Logo from '$lib/components/Logo.svelte';
+	import { trapFocus } from '$lib/focus';
 
 	let { ontour, onskip }: { ontour: () => void; onskip: () => void } = $props();
 
@@ -24,6 +25,7 @@
 <div class="scrim" role="presentation" onclick={onScrimClick}>
 	<div
 		class="dialog"
+		{@attach trapFocus}
 		tabindex="-1"
 		role="dialog"
 		aria-modal="true"
@@ -33,9 +35,9 @@
 		<Logo size={28} />
 		<h2 id="tour-title">New here?</h2>
 		<p id="tour-body">
-			Takes about two minutes. It loads a sample file with a flag already hidden in it and walks
-			through what each tool turns up. Or skip it and drop your own file straight away. Nothing you
-			analyse here ever leaves this tab.
+			The tour takes about two minutes. It loads a sample file with a flag hidden in it and walks
+			through what each tool finds. You can also skip it and drop your own file. Nothing you analyse
+			leaves this tab.
 		</p>
 		<div class="actions">
 			<button type="button" class="primary" bind:this={primary} onclick={ontour}>

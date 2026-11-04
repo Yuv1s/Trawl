@@ -56,10 +56,12 @@
 		reason.includes('flag shape') || reason.includes('signature');
 
 	const flags = $derived([
-		...peel.steps
-			.filter((step) => step.reason.startsWith('flag shape, '))
-			.map((step) => step.reason.slice('flag shape, '.length)),
-		...peel.xor.flatMap((c) => c.flags)
+		...new Set([
+			...peel.steps
+				.filter((step) => step.reason.startsWith('flag shape, '))
+				.map((step) => step.reason.slice('flag shape, '.length)),
+			...peel.xor.flatMap((c) => c.flags)
+		])
 	]);
 
 	/** True when the peel alone got nowhere and the cipher attack found nothing. */
@@ -105,29 +107,34 @@
 	const PREVIEW = 240;
 	const clip = (text: string) => (text.length > PREVIEW ? `${text.slice(0, PREVIEW)}…` : text);
 
-	let copied = $state(false);
+	let copyLabel = $state('Copy');
 	let timer: ReturnType<typeof setTimeout> | undefined;
 
 	$effect(() => () => clearTimeout(timer));
 
-	function copy() {
-		navigator.clipboard.writeText(peel.result).then(() => {
-			copied = true;
-			clearTimeout(timer);
-			timer = setTimeout(() => (copied = false), 1600);
-		});
+	async function copy() {
+		try {
+			await navigator.clipboard.writeText(peel.result);
+			copyLabel = 'Copied';
+		} catch {
+			copyLabel = 'Copy failed';
+		}
+		clearTimeout(timer);
+		timer = setTimeout(() => (copyLabel = 'Copy'), 1600);
 	}
 </script>
 
 {#snippet offer()}
 	{#if peel.shortlist.length > 0}
 		<section class="offer">
-			<h3 class="label">{peel.shortlist.length} readings, since it could not choose</h3>
+			<h3 class="label">
+				{peel.shortlist.length} possible reading{peel.shortlist.length === 1 ? '' : 's'}
+			</h3>
 			<p class="clear">
-				Every rotation Mantis knows, laid out. It picks answers by what they read like, and a token
-				or a key reads like nothing, so on this it cannot pick for you. What it can do is lead with
-				the rotations that decode onward into something printable. Plenty of these can be forced
-				through a decoder; almost none come out the other side as text.
+				Every rotation Mantis knows. It ranks answers by how much they read like text, and a token
+				or a key doesn't, so it can't pick one for you. The rotations that decode further into
+				printable text come first. Plenty of these can be forced through a decoder, but almost none
+				come out as text.
 			</p>
 
 			<ul class="readings">
@@ -154,10 +161,10 @@
 	<section class="keying">
 		<h3 class="label">Try a key</h3>
 		<p class="clear">
-			Type a key and Mantis applies it, showing every result whether or not it reads, because your
-			answer may be a token and a token reads like nothing. If you have no key, it will work out
-			what your text suggests: Vigenère only commits to a key when it can stand behind one, and
-			short text never gets there, but the working is still worth reading.
+			Type a key and Mantis applies it. It shows every result, even ones that don't read as text,
+			because your answer may be a token. If you have no key, Mantis can suggest some from your
+			text. Vigenère only commits to a key it can support, and short text never gets there, but the
+			suggestions are still worth a look.
 		</p>
 
 		<form class="key-form" onsubmit={tryKey}>
@@ -185,13 +192,13 @@
 		{#if browsing}
 			<div class="suggestions">
 				<p class="clear">
-					Not a list of common keys. Each of these was worked out of your text: split the letters
-					into that many columns, and every column was enciphered by one key letter, so counting the
-					letters in a column gives that letter back. The number is how many letters each column had
-					to work from. Around twelve that is reliable, at two it is a coin toss.
+					These come from your text. For each key length, Mantis splits the letters into that many
+					columns. Every column was enciphered by one key letter, so counting the letters in a
+					column gives that key letter back. The number is how many letters each column had to work
+					from. Around twelve is reliable, and two is a coin toss.
 				</p>
 				<ul class="keylist">
-					{#each peel.derivedKeys as derived (derived.key)}
+					{#each peel.derivedKeys as derived, i (i)}
 						<li>
 							<button
 								type="button"
@@ -215,7 +222,7 @@
 					<li class:found={attempt.flags.length > 0}>
 						<div class="reading-head">
 							<span class="mono how">{attempt.cipher}</span>
-							{#each attempt.flags as flag (flag)}
+							{#each new Set(attempt.flags) as flag (flag)}
 								<span class="mono chip flagged">{flag}</span>
 							{/each}
 						</div>
@@ -226,15 +233,16 @@
 						{#if attempt.next.length > 0}
 							<details class="deeper">
 								<summary class="label"
-									>Still enciphered, {attempt.next.length} keys for the layer under it</summary
+									>Still enciphered: {attempt.next.length} key{attempt.next.length === 1 ? '' : 's'} for
+									the next layer</summary
 								>
 								<p class="clear">
-									Two keys applied in turn are one cipher with a longer key, so nothing could have
-									recovered them separately from the text alone. With the first one off, the second
-									is an ordinary problem again, and these come out of what it left behind.
+									Two keys applied in turn act as one cipher with a longer key, so the text alone
+									can't separate them. With the first key off, the second is an ordinary problem
+									again, and these suggestions come from what remains.
 								</p>
 								<ul class="keylist">
-									{#each attempt.next as under (under.key)}
+									{#each attempt.next as under, i (i)}
 										<li>
 											<button
 												type="button"
@@ -316,8 +324,8 @@
 			<div class="pane-head">
 				<h2>{broken.length === 1 ? 'One weakness' : `${broken.length} weaknesses`}</h2>
 				<p>
-					None of this breaks RSA. Each one breaks a key that was built wrong, which is what a
-					competition hands you.
+					These attacks don't break RSA itself. Each one exploits a badly built key, which is what
+					competitions tend to hand out.
 				</p>
 			</div>
 
@@ -355,21 +363,18 @@
 				{/each}
 			</ul>
 
-			<p class="footnote">
-				A key generated properly defeats every one of these. When that is what you have, Trawl says
-				so rather than grinding away at it.
-			</p>
+			<p class="footnote">A properly generated key defeats all of these.</p>
 
 			<button type="button" class="again" onclick={onreset}>Try something else</button>
 		{:else if peel.hash}
 			<div class="pane-head">
 				<h2>
-					{peel.hash.certain ? peel.hash.candidates[0] : 'A hash, but of what'}
+					{peel.hash.certain ? peel.hash.candidates[0] : 'A hash, type unclear'}
 				</h2>
 				<p>
 					{peel.hash.certain
-						? 'The string says so itself, so there is nothing to guess.'
-						: 'The shape narrows it this far and no further.'}
+						? 'The string names its own format.'
+						: 'Its shape narrows it down to this list.'}
 				</p>
 			</div>
 
@@ -394,14 +399,14 @@
 
 			{#if !peel.hash.certain && peel.hash.candidates.length > 1}
 				<p class="footnote">
-					These produce digests of the same length, and there is nothing in the string that tells
-					them apart. A tool that prints one name and stops is guessing without saying so.
+					These all produce digests of the same length, and nothing in the string tells them apart.
+					A tool that prints one name here is guessing.
 				</p>
 			{/if}
 
 			<p class="footnote">
-				Trawl does not crack hashes and will not. Reversing one means guessing inputs until a digest
-				matches, which belongs on hardware you control running something built for it.
+				Trawl doesn't crack hashes. That means guessing inputs until a digest matches, which is a
+				job for dedicated software on your own hardware.
 			</p>
 
 			<button type="button" class="again" onclick={onreset}>Try something else</button>
@@ -412,12 +417,11 @@
 			</div>
 
 			<p class="clear">
-				That is a result, not a failure. It means the text is either already plain, or encrypted
-				rather than encoded, or uses a scheme Mantis does not have yet. Decoding it anyway would
-				have turned it into noise and called that progress.
+				The text is probably already plain, encrypted rather than encoded, or in a scheme Mantis
+				doesn't know yet. Decoding it anyway would only have produced noise.
 			</p>
 
-			<h3 class="label section">What you gave it</h3>
+			<h3 class="label section">Your input</h3>
 			<pre class="dump mono">{input}</pre>
 
 			{@render keybox()}
@@ -428,7 +432,7 @@
 		{:else}
 			<div class="pane-head">
 				<h2>Peeled {peel.depth} {peel.depth === 1 ? 'layer' : 'layers'}</h2>
-				<p>Each layer was kept because of what fell out of it, not because of how it looked.</p>
+				<p>Mantis kept each layer because of what decoding it produced.</p>
 			</div>
 
 			<ol class="chain">
@@ -455,7 +459,7 @@
 			<section class="result">
 				<div class="result-head">
 					<h3 class="label">Result</h3>
-					<button type="button" onclick={copy}>{copied ? 'Copied' : 'Copy'}</button>
+					<button type="button" onclick={copy}>{copyLabel}</button>
 				</div>
 				<pre class="answer mono" class:flagged={flags.length > 0}>{peel.result}</pre>
 			</section>
@@ -478,17 +482,17 @@
 
 			{#if peel.dictionary}
 				<section class="cipher">
-					<h3 class="label">A guessed key read it</h3>
+					<h3 class="label">A guessed key worked</h3>
 					<p class="clear">
-						There was not enough text to work the key out by counting letters, so Mantis tried a
-						short list of words people reach for when inventing one. This is a guess that happened
-						to land, not a recovery, and it is only reported because the result reads.
+						There wasn't enough text to work out the key by counting letters, so Mantis tried a
+						short list of words people often pick as keys. This one happened to work, and it only
+						appears here because the result reads as text.
 					</p>
 
 					<div class="key-head">
 						<span class="mono key">{peel.dictionary.key}</span>
 						<span class="mono chip">{peel.dictionary.cipher}</span>
-						{#each peel.dictionary.flags as flag (flag)}
+						{#each new Set(peel.dictionary.flags) as flag (flag)}
 							<span class="mono chip flagged">{flag}</span>
 						{/each}
 					</div>
@@ -500,8 +504,8 @@
 				<section class="cipher">
 					<h3 class="label">Affine underneath</h3>
 					<p class="clear">
-						Each letter was multiplied and then shifted. Only twelve multipliers can be undone at
-						all, so there are 312 keys in total and every one of them was tried.
+						Each letter was multiplied and then shifted. Only twelve multipliers can be undone,
+						which leaves 312 keys, and Mantis tried all of them.
 					</p>
 
 					<div class="key-head">
@@ -519,8 +523,8 @@
 				<section class="cipher">
 					<h3 class="label">Hill cipher underneath</h3>
 					<p class="clear">
-						Every pair of letters was multiplied by a 2x2 matrix. There are roughly 211,000 keys
-						that can be undone at all, and every one of them was tried.
+						Every pair of letters was multiplied by a 2x2 matrix. Roughly 211,000 keys can be
+						undone, and Mantis tried all of them.
 					</p>
 
 					<div class="key-head">
@@ -535,9 +539,8 @@
 				<section class="cipher">
 					<h3 class="label">Transposition underneath</h3>
 					<p class="clear">
-						The letters were never changed, only moved, which is why the letter counts already
-						matched English while the text read as nothing. Putting them back in order is what made
-						it readable.
+						The letters were only moved, never changed, which is why the letter counts matched
+						English while the text made no sense. Putting them back in order made it readable.
 					</p>
 
 					<div class="key-head">
@@ -558,9 +561,9 @@
 				<section class="cipher">
 					<h3 class="label">Substitution underneath</h3>
 					<p class="clear">
-						The whole alphabet was replaced. There are too many keys to try, so this one was climbed
-						to: swap two letters, keep the swap if the text reads better, repeat. Below about 200
-						letters the answer comes back readable with a few letters still crossed.
+						The whole alphabet was replaced. There are too many keys to try, so Mantis climbs
+						towards the answer: swap two letters, keep the swap if the text reads better, repeat.
+						Below about 200 letters the answer comes back readable with a few letters still wrong.
 					</p>
 
 					<dl class="alphabet">
@@ -581,12 +584,12 @@
 				<section class="cipher">
 					<h3 class="label">XOR underneath</h3>
 					<p class="clear">
-						What the layers came off to was not readable, so Mantis tried XOR against it. These keys
-						produced something that was.
+						The decoded text wasn't readable, so Mantis tried XOR on it. These keys produced
+						readable text.
 					</p>
 
 					<ul class="keys">
-						{#each peel.xor as found (found.kind + found.key)}
+						{#each peel.xor as found, i (i)}
 							<li>
 								<div class="key-head">
 									<span class="mono key">{found.key}</span>
@@ -612,15 +615,14 @@
 					{#if peel.frequency.total < COUNTABLE}
 						<p class="clear">
 							{peel.frequency.total}
-							{peel.frequency.total === 1 ? 'letter' : 'letters'}, which is too few to read anything
-							into. The shape below is shown because you asked for it, not because it means
-							something.
+							{peel.frequency.total === 1 ? 'letter' : 'letters'}, which is too few to mean much.
+							Treat the chart below as a curiosity.
 						</p>
 					{:else}
 						<p class="clear">
-							What the solvers were working from. The bar is this text, the amber tick is what
-							English would give the same letter. A cipher that swapped the alphabet moves the bars
-							around; one that only moved the letters leaves them where English put them.
+							This is what the solvers worked from. The bar shows this text and the tick shows the
+							same letter in English. A cipher that swaps the alphabet pulls the bars away from the
+							ticks. One that only moves letters leaves them lined up.
 						</p>
 					{/if}
 
@@ -648,8 +650,8 @@
 							<span class="mono value">{peel.frequency.coincidence.toFixed(4)}</span>
 						</div>
 						<p class="clear">
-							The chance that two letters picked out of this text are the same one. It says how many
-							alphabets were in play, which no amount of staring at the bars will tell you.
+							The chance that two letters picked from this text are the same. It suggests how many
+							alphabets were used, which the bars can't show.
 						</p>
 						<div class="track">
 							<div class="here" style="--at: {along}%"></div>
@@ -681,9 +683,8 @@
 						</div>
 					{:else}
 						<p class="clear">
-							Nothing repeats. In a text this length that is itself a reading: ordinary English
-							repeats constantly, so letters that never do have usually been spread across more than
-							one alphabet.
+							Nothing repeats. Ordinary English repeats constantly, so in a text this long, letters
+							that never repeat have usually been spread across more than one alphabet.
 						</p>
 					{/if}
 				</details>
@@ -694,9 +695,9 @@
 			{@render offer()}
 
 			<p class="footnote">
-				Mantis reads {(peel.score * 100).toFixed(0)}% of this as ordinary text. That number decided
-				where to stop, and it is a rough measure rather than a verdict. If the answer looks half
-				peeled, the layer underneath may use something not in the list yet.
+				Mantis scores this as {(peel.score * 100).toFixed(0)}% ordinary text. It uses that rough
+				score to decide where to stop. If the answer looks half peeled, the next layer may use a
+				scheme Mantis doesn't know yet.
 			</p>
 		{/if}
 	</main>
@@ -706,6 +707,7 @@
 	.shell {
 		min-height: 100dvh;
 		display: grid;
+		grid-template-columns: minmax(0, 1fr);
 		grid-template-rows: auto auto minmax(0, 1fr);
 	}
 
@@ -1642,9 +1644,13 @@
 			height: auto;
 		}
 
+		header {
+			position: static;
+		}
+
 		.pane {
 			padding: var(--s4);
-			overflow: visible;
+			overflow: auto visible;
 		}
 	}
 </style>

@@ -4,7 +4,7 @@
 </script>
 
 <svelte:head>
-	<title>Not found — Trawl</title>
+	<title>Not found · Trawl</title>
 	<meta name="description" content="This address doesn't lead anywhere in Trawl." />
 	<meta name="robots" content="noindex" />
 </svelte:head>
@@ -14,9 +14,8 @@
 	<span class="eyebrow mono">404</span>
 	<h1>Trawl finds hidden things. This page isn't one of them.</h1>
 	<p>
-		No bit-plane wall, no chi-square attack, no palette trick turns up a route that was never built.
-		Nothing was checked and nothing was sent anywhere, the address just doesn't exist. Whatever link
-		brought you here is out of date or mistyped.
+		No bit-plane wall or chi-square attack can turn up a page that was never built. The link that
+		brought you here is out of date or mistyped. Nothing was checked or sent anywhere.
 	</p>
 	<a class="home" href={resolve('/')}>Back to Trawl</a>
 </main>

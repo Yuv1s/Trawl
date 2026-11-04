@@ -556,6 +556,172 @@ fn structure_json_reports_the_header_error_rather_than_omitting_it() {
     assert!(json.contains("\"kind\":\"IHDR\""), "the walk still happens");
 }
 
+/// A PNG with its IHDR and nothing else, which is all these refusals should need.
+fn bare(width: u32, height: u32, bit_depth: u8, color_type: u8, interlace: u8) -> Vec<u8> {
+    let mut file = Vec::new();
+    file.extend_from_slice(&SIGNATURE);
+    file.extend_from_slice(&ihdr(width, height, bit_depth, color_type, interlace));
+    file.extend_from_slice(&chunk(b"IEND", &[]));
+    file
+}
+
+#[test]
+fn a_chunk_length_that_wraps_a_32_bit_offset_is_refused() {
+    // 16 + 0xfffffff8 wraps to 8 in WASM, which reads as an end inside the file and
+    // used to slice file[12..8].
+    for length in [0xffff_fff8u32, 0xffff_fffc, 0xffff_ffff, 0xffff_fff4] {
+        let mut file = SIGNATURE.to_vec();
+        file.extend_from_slice(&length.to_be_bytes());
+        file.extend_from_slice(b"tEXt");
+        file.extend_from_slice(&[0u8; 64]);
+
+        assert!(chunks(&file).is_empty(), "length {length:#x} produced a chunk");
+        assert_eq!(idat(&file), Vec::<u8>::new());
+        assert!(structure_json(&file).contains("\"chunks\":[]"));
+    }
+}
+
+#[test]
+fn a_row_too_long_to_count_is_refused_rather_than_wrapped() {
+    // Without the checks the arithmetic wraps to an empty expected length and the
+    // decoder goes on to allocate and index against a nonsense stride.
+    assert_eq!(unfilter(&[], usize::MAX, 1, 2), Err(PngError::TooLarge));
+    assert_eq!(unfilter(&[], usize::MAX / 2, 1, 3), Err(PngError::TooLarge));
+}
+
+#[test]
+fn a_stride_is_counted_in_more_bits_than_an_address_has() {
+    // 2^28 pixels of 16-bit RGBA is 2^31 bytes a row. The bit count wraps to zero in
+    // 32 bits, which made the stride zero and every row empty.
+    let header = Header {
+        width: 1 << 28,
+        height: 1,
+        bit_depth: 16,
+        color_type: 6,
+        interlace: 0,
+    };
+    assert_eq!(stride_of(1 << 28, 4, 16), Ok(1 << 31));
+    assert_eq!(header.pixels(), Err(PngError::TooLarge));
+    assert_eq!(stride_of(usize::MAX, 4, 16), Err(PngError::TooLarge));
+}
+
+#[test]
+fn a_canvas_that_would_wrap_is_refused_before_anything_is_allocated() {
+    // 65536 x 65536 x 4 is 2^34, which is zero in 32 bits, so the buffer came out
+    // empty and the first pixel trapped.
+    let file = bare(65_536, 65_536, 8, 6, 0);
+    assert_eq!(decode(&file, &vec![0u8; 70_000]), Err(PngError::TooLarge));
+}
+
+#[test]
+fn a_huge_interlaced_header_on_a_tiny_file_is_refused() {
+    // 45 bytes declaring 65535 x 65535. The canvas used to be allocated before any
+    // pass had shown it had data.
+    let file = bare(65_535, 65_535, 8, 6, 1);
+    assert_eq!(decode(&file, &[0u8; 16]), Err(PngError::TooLarge));
+
+    // Under the pixel limit the same refusal comes from the data running short,
+    // still before the canvas exists.
+    let file = bare(8192, 8192, 8, 6, 1);
+    assert!(matches!(
+        decode(&file, &[0u8; 16]),
+        Err(PngError::ShortPixelData { .. })
+    ));
+}
+
+#[test]
+fn a_one_bit_image_cannot_turn_a_small_stream_into_gigabytes() {
+    // Two bytes a row at one bit per pixel, so the inflated data fits a test while
+    // the RGBA it asks for does not fit a browser.
+    let width = 8u32;
+    let height = (MAX_PIXELS / 8 + 1) as u32;
+    let file = bare(width, height, 1, 0, 0);
+    assert_eq!(decode(&file, &[]), Err(PngError::TooLarge));
+    assert_eq!(palette_indices(&bare(width, height, 1, 3, 0), &[]), None);
+}
+
+#[test]
+fn a_palette_longer_than_an_index_can_reach_does_not_panic() {
+    // 300 entries, when an index is one byte. The unused count walked past the table
+    // of 256 seen indices.
+    let plte: Vec<u8> = (0..900).map(|i| (i * 7) as u8).collect();
+    let file = png(1, 1, 8, 3, &[chunk(b"PLTE", &plte)]);
+
+    let found = palette(&file, Some(&[0])).unwrap();
+    assert_eq!(found.entries, 300);
+    assert_eq!(found.unused, 299);
+}
+
+#[test]
+fn only_entries_an_index_can_reach_count_as_duplicates() {
+    // The same colour at entry 0 and entry 256. Entry 256 cannot be painted, so
+    // there is no choice to make and nothing to hide in.
+    let mut plte = vec![0u8; 257 * 3];
+    for i in 0..256 {
+        plte[i * 3] = i as u8;
+        plte[i * 3 + 1] = 1;
+    }
+    plte[256 * 3 + 1] = 1;
+
+    let found = palette(&png(1, 1, 8, 3, &[chunk(b"PLTE", &plte)]), Some(&[0])).unwrap();
+    assert!(found.duplicates.is_empty(), "{:?}", found.duplicates);
+    assert_eq!(found.capacity_bits, 0);
+}
+
+#[test]
+fn palette_capacity_agrees_with_what_the_extractor_can_read() {
+    // Three copies carry one reliable bit, not two. This count and the one the
+    // palette tool reports used to differ on anything that was not a power of two.
+    let mut plte = Vec::new();
+    for _ in 0..3 {
+        plte.extend_from_slice(&[9, 9, 9]);
+    }
+    let file = png(1, 1, 8, 3, &[chunk(b"PLTE", &plte)]);
+    let indices = [0u8, 1, 2, 1];
+
+    let found = palette(&file, Some(&indices)).unwrap();
+    assert_eq!(found.capacity_bits, 4);
+    assert_eq!(
+        found.capacity_bits,
+        crate::cuttlefish::palette::capacity(&plte, &indices)
+    );
+}
+
+#[test]
+fn many_flags_past_iend_do_not_rewalk_the_file_each_time() {
+    // Each flag used to walk every chunk and checksum the whole file again, which
+    // took minutes on a few megabytes.
+    let mut file = png(2, 2, 8, 2, &[]);
+    for _ in 0..50_000 {
+        file.extend_from_slice(b"flag{abcd} ");
+    }
+
+    let started = std::time::Instant::now();
+    let found = located_flags(&file);
+    assert_eq!(found.len(), crate::bytes::MAX_FLAGS.min(50_000));
+    assert!(found.iter().all(|f| f.credible && f.region == "after IEND"));
+    assert!(started.elapsed().as_secs() < 15, "took {:?}", started.elapsed());
+}
+
+#[test]
+fn a_flag_is_placed_in_the_chunk_that_holds_it_whatever_the_order() {
+    let mut text = b"Comment".to_vec();
+    text.push(0);
+    text.extend_from_slice(b"flag{second_chunk}");
+    let file = png(
+        2,
+        2,
+        8,
+        2,
+        &[chunk(b"tEXt", b"First\0nothing here"), chunk(b"tEXt", &text)],
+    );
+
+    let found = located_flags(&file);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].region, "inside tEXt");
+    assert!(found[0].credible);
+}
+
 #[test]
 fn idat_concatenates_split_chunks_in_order() {
     let mut file = Vec::new();

@@ -101,6 +101,18 @@ fn u32_at(file: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
+/// Where the RIFF header says the file ends, or nothing when it does not say.
+///
+/// A streamed writer does not know the size when it writes the header, and leaves 0
+/// or 0xffffffff there. Neither is a claim about the file, so neither can make the
+/// rest of it trailing. The sum is 8 plus a 32-bit field, which wraps in WASM.
+fn declared_end(file: &[u8]) -> Result<Option<usize>, WavError> {
+    match u32_at(file, 4).ok_or(WavError::Truncated)? {
+        0 | u32::MAX => Ok(None),
+        size => Ok(Some((size as usize).saturating_add(8))),
+    }
+}
+
 /// Walks the chunk list without interpreting any of it.
 ///
 /// Kept separate from `parse` so a file with a broken fmt chunk still gets a
@@ -110,7 +122,7 @@ pub fn chunks(file: &[u8]) -> Result<Vec<RiffChunk>, WavError> {
         return Err(WavError::NotWav);
     }
 
-    let declared_end = 8 + u32_at(file, 4).ok_or(WavError::Truncated)? as usize;
+    let declared_end = declared_end(file)?;
 
     let mut out = Vec::new();
     let mut at = 12;
@@ -129,17 +141,25 @@ pub fn chunks(file: &[u8]) -> Result<Vec<RiffChunk>, WavError> {
             })
             .collect();
         let length = u32_at(file, at + 4).ok_or(WavError::Truncated)? as usize;
-        let complete = at + 8 + length <= file.len();
+        // Offset plus a 32-bit length wraps in WASM, and a wrapped end reads as a
+        // chunk that fits.
+        let end = at.checked_add(8).and_then(|body| body.checked_add(length));
+        let complete = end.is_some_and(|end| end <= file.len());
 
         // Past the size the header declares, keep walking only while what is
         // there still parses as a chunk. Some writers get the RIFF size wrong
         // and leave real chunks beyond it, which is worth reading; appended
         // payload is not, and listing it as a chunk with a nonsense length says
         // something about the file that is not true.
-        if at >= declared_end && !(complete && raw.iter().all(|b| b.is_ascii_graphic() || *b == b' '))
+        if declared_end.is_some_and(|end| at >= end)
+            && !(complete && raw.iter().all(|b| b.is_ascii_graphic() || *b == b' '))
         {
             break;
         }
+
+        // A data chunk that declares nothing, in a RIFF that declares nothing, is a
+        // stream: everything after it is samples, not more chunks.
+        let streaming = raw == b"data" && length == 0 && declared_end.is_none();
 
         out.push(RiffChunk {
             id,
@@ -148,12 +168,13 @@ pub fn chunks(file: &[u8]) -> Result<Vec<RiffChunk>, WavError> {
             complete,
         });
 
-        if !complete {
+        if !complete || streaming {
             break;
         }
 
-        // RIFF pads odd-length payloads to an even boundary.
-        at += 8 + length + (length & 1);
+        // RIFF pads odd-length payloads to an even boundary. Fits, because `end` was
+        // inside the file, and a pad byte past the last chunk only ends the walk.
+        at = end.unwrap_or(file.len()).saturating_add(length & 1);
     }
 
     Ok(out)
@@ -207,9 +228,18 @@ pub fn parse(file: &[u8]) -> Result<Wav, WavError> {
         .ok_or(WavError::NoData)?;
 
     let data_offset = data.offset + 8;
+    let available = file.len().saturating_sub(data_offset);
     // Streamed files write 0 or 0xffffffff for the data length and let the
-    // reader work it out, so the file itself is the authority.
-    let data_length = data.length.min(file.len().saturating_sub(data_offset));
+    // reader work it out, so the file itself is the authority. A zero followed by a
+    // real chunk is a data chunk that really is empty.
+    let followed = chunks
+        .iter()
+        .any(|chunk| chunk.offset > data.offset && chunk.complete);
+    let data_length = if data.length == 0 && !followed {
+        available
+    } else {
+        data.length.min(available)
+    };
 
     let bytes_per_sample = (format.bits_per_sample as usize).div_ceil(8);
     if bytes_per_sample == 0 {
@@ -217,12 +247,9 @@ pub fn parse(file: &[u8]) -> Result<Wav, WavError> {
     }
     let frames = data_length / (bytes_per_sample * format.channels);
 
-    let declared_end = 8 + u32_at(file, 4).ok_or(WavError::Truncated)? as usize;
-    let trailing = if declared_end < file.len() {
-        Some((declared_end, file.len() - declared_end))
-    } else {
-        None
-    };
+    let trailing = declared_end(file)?
+        .filter(|&end| end < file.len())
+        .map(|end| (end, file.len() - end));
 
     Ok(Wav {
         format,

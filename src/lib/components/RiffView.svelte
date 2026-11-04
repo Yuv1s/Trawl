@@ -90,7 +90,7 @@
 	<section class="found">
 		<h3 class="label">Text in the chunks a player skips</h3>
 		<ul>
-			{#each walked.text as found (found.offset)}
+			{#each walked.text as found, i (i)}
 				<li>
 					<span class="mono big" class:flagged={found.text.includes('{')}>{found.text}</span>
 					<span class="mono muted">{found.chunk} · {hex(found.offset)}</span>

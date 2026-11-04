@@ -31,10 +31,50 @@ pub mod xor;
 use crate::bytes;
 
 /// English letter frequencies, in percent, a through z.
-const ENGLISH: [f32; 26] = [
+pub(crate) const ENGLISH: [f32; 26] = [
     8.167, 1.492, 2.782, 4.253, 12.702, 2.228, 2.015, 6.094, 6.966, 0.153, 0.772, 4.025, 2.406,
     6.749, 7.507, 1.929, 0.095, 5.987, 6.327, 9.056, 2.758, 0.978, 2.360, 0.150, 1.974, 0.074,
 ];
+
+/// xorshift64*, seeded from the text.
+///
+/// Climbing needs somewhere random to start, and a WASM build has no system entropy
+/// to draw on. Seeding from the input instead makes every solve reproducible: the
+/// same ciphertext always walks the same path, so a result that gets reported can
+/// also be re-derived.
+pub(crate) struct Rng(u64);
+
+impl Rng {
+    pub(crate) fn seeded(data: &[u8]) -> Self {
+        let mut hash = 0xcbf29ce484222325u64;
+        for &byte in data {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        Self(hash | 1)
+    }
+
+    pub(crate) fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545f4914f6cdd1d)
+    }
+}
+
+/// The shortest run a key repeats.
+///
+/// Any multiple of the real key length deciphers perfectly, so the search often lands
+/// on one. Reporting "KEYKEY" when the key was "KEY" is not wrong, but it is not the
+/// answer either.
+pub(crate) fn shortest_period(key: &[u8]) -> Vec<u8> {
+    for period in 1..=key.len() / 2 {
+        if key.len().is_multiple_of(period) && key.chunks(period).all(|chunk| chunk == &key[..period]) {
+            return key[..period].to_vec();
+        }
+    }
+    key.to_vec()
+}
 
 /// Words common enough that finding them is strong evidence of English.
 ///
@@ -298,7 +338,7 @@ fn conclusive(data: &[u8], tags: &[String]) -> Option<String> {
         return Some(format!("{format} signature"));
     }
 
-    let flags = bytes::flag_candidates(data);
+    let flags = bytes::flag_candidates_naming(data, tags);
     // A configured tag is the strongest claim: it was named, not merely guessed,
     // so it outweighs the brace shape alone. Falls back to the plain shape, which
     // is what recognised flags always were.
@@ -726,16 +766,25 @@ pub fn read_for_tags(data: &[u8], tags: &[String]) -> Reading {
     // pure ciphertext. Taken as conclusive on text nothing was peeled off, that
     // shape stops the attacks before they start, on exactly the input most
     // likely to be an enciphered flag.
+    //
+    // A run past the size limit is a file, and the attacks are for pasted strings.
     let produced = !peel.steps.is_empty();
-    if (produced && conclusive(inner, tags).is_some()) || plainness(inner) >= 0.5 {
+    if inner.len() > MAX_INPUT
+        || (produced && conclusive(inner, tags).is_some())
+        || plainness(inner) >= 0.5
+    {
         return nothing(peel);
     }
 
     let xor = xor::recover(inner, tags);
 
+    // The working behind the Vigenère answer, which is also shown as it stands further
+    // down, and working it out twice is most of what a short paste costs.
+    let derived = vigenere::derive(inner, tags);
+
     // Vigenère only ever produces letters, so a run of bytes that is not
     // mostly letters was never enciphered with it.
-    let vigenere = vigenere::solve(inner, tags);
+    let vigenere = vigenere::solve_among(inner, &derived);
 
     // Each of these answers on its own evidence, against a bar measured in
     // `tests::probe_bars`, rather than on whether another attack came up empty.
@@ -780,11 +829,9 @@ pub fn read_for_tags(data: &[u8], tags: &[String]) -> Reading {
 
     let settled = settled || dictionary.is_some();
 
-    // The working, shown whether or not an attack landed above. Text that
+    // The working is shown whether or not an attack landed above. Text that
     // already reads never gets this far, which is right: forty ways of
     // rearranging a readable sentence is not evidence, it is clutter.
-    let derived = vigenere::derive(inner, tags);
-
     let shortlist = if settled {
         Vec::new()
     } else if readable(inner) {

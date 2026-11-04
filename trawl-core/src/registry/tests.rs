@@ -36,9 +36,132 @@ fn names_a_hive_from_its_root_keys_when_the_path_says_nothing() {
 }
 
 #[test]
+fn a_hive_under_system32_is_not_named_system_for_it() {
+    // Every hive Windows loads has System32 in its path, so a search of the whole path
+    // called SOFTWARE, SECURITY and SAM all SYSTEM.
+    for (path, kind) in [
+        ("mRoot\\System32\\Config\\SOFTWARE", "SOFTWARE"),
+        ("mRoot\\System32\\Config\\SAM", "SAM"),
+        ("mRoot\\System32\\Config\\SECURITY", "SECURITY"),
+        ("mRoot\\System32\\Config\\SYSTEM", "SYSTEM"),
+        ("\\??\\C:\\Users\\yuvi\\NTUSER.DAT", "NTUSER.DAT"),
+        ("\\??\\C:\\Users\\yuvi\\UsrClass.dat", "UsrClass.dat"),
+        ("SYSTEM.sav", "SYSTEM"),
+    ] {
+        let file = hive_of(BuildKey::new("ROOT"), path);
+        assert_eq!(read(&file).unwrap().kind, kind, "{path}");
+    }
+}
+
+#[test]
+fn a_name_that_merely_starts_like_a_hive_is_not_one() {
+    let file = hive_of(BuildKey::new("ROOT"), "\\Config\\SYSTEMATIC");
+    assert_eq!(read(&file).unwrap().kind, "an unrecognised hive");
+}
+
+#[test]
+fn a_root_key_with_a_character_across_byte_ten_does_not_panic() {
+    // Byte ten of this name falls inside a two-byte character once it is read out of
+    // Latin-1, and slicing a String there is a panic.
+    let mut file = hive_of(
+        BuildKey::new("ROOT").child(BuildKey::new("123456789Xabc")),
+        "",
+    );
+    let at = file.windows(13).position(|w| w == b"123456789Xabc").unwrap();
+    file[at + 9] = 0xe9;
+
+    let report = read(&file).unwrap();
+    assert_eq!(report.top[0].name, "123456789\u{e9}abc");
+    assert!(report.searched.is_empty());
+}
+
+#[test]
+fn control_set_needs_its_digits() {
+    let file = hive_of(
+        BuildKey::new("ROOT")
+            .child(BuildKey::new("ControlSet"))
+            .child(BuildKey::new("ControlSetABC"))
+            .child(BuildKey::new("controlset002")),
+        "",
+    );
+    assert_eq!(
+        read(&file).unwrap().searched,
+        vec!["controlset002\\Enum\\USBSTOR", "controlset002\\Enum\\USB"]
+    );
+}
+
+#[test]
+fn keys_listed_under_each_other_stay_a_bounded_report() {
+    // Every model lists every model as its instances. The file holds a few hundred
+    // keys and the walk used to make the square of them, with 36 KB reaching three
+    // gigabytes.
+    use crate::regf::tests::Builder;
+
+    let mut builder = Builder::new();
+    let mut offsets = Vec::new();
+    for index in 0..400u32 {
+        offsets.push(builder.write_key(&BuildKey::new(&format!("Disk&Ven_V{index}&Prod_P&Rev_1"))));
+    }
+    let mut body = b"li".to_vec();
+    body.extend_from_slice(&(offsets.len() as u16).to_le_bytes());
+    for offset in &offsets {
+        body.extend_from_slice(&offset.to_le_bytes());
+    }
+    let list = builder.alloc(&body);
+    for offset in &offsets {
+        builder.point_subkeys_at(*offset, list);
+    }
+
+    let usbstor = builder.write_key(&BuildKey::new("USBSTOR"));
+    builder.point_subkeys_at(usbstor, list);
+    let tree = BuildKey::new("Enum");
+    let enum_key = builder.write_key(&tree);
+    let mut holder = b"li".to_vec();
+    holder.extend_from_slice(&1u16.to_le_bytes());
+    holder.extend_from_slice(&usbstor.to_le_bytes());
+    let holder = builder.alloc(&holder);
+    builder.point_subkeys_at(enum_key, holder);
+
+    let set = builder.write_key(&BuildKey::new("ControlSet001"));
+    let mut holder = b"li".to_vec();
+    holder.extend_from_slice(&1u16.to_le_bytes());
+    holder.extend_from_slice(&enum_key.to_le_bytes());
+    let holder = builder.alloc(&holder);
+    builder.point_subkeys_at(set, holder);
+
+    let root = builder.write_key(&BuildKey::new("ROOT"));
+    let mut holder = b"li".to_vec();
+    holder.extend_from_slice(&1u16.to_le_bytes());
+    holder.extend_from_slice(&set.to_le_bytes());
+    let holder = builder.alloc(&holder);
+    builder.point_subkeys_at(root, holder);
+    let file = builder.finish(root, "");
+
+    let started = std::time::Instant::now();
+    let report = read(&file).unwrap();
+    assert!(report.devices.len() <= MAX_DEVICES);
+    assert!(started.elapsed().as_secs() < 15, "took {:?}", started.elapsed());
+    assert!(crate::json::is_well_formed(&json(&file)));
+}
+
+#[test]
+fn a_root_with_thousands_of_control_sets_returns_in_good_time() {
+    let mut root = BuildKey::new("ROOT");
+    for index in 0..3000 {
+        root = root.child(BuildKey::new(&format!("ControlSet{index:04}")));
+    }
+    let file = hive_of(root, "");
+
+    let started = std::time::Instant::now();
+    let report = read(&file).unwrap();
+    assert_eq!(report.searched.len(), MAX_CONTROL_SETS * 2);
+    assert!(started.elapsed().as_secs() < 15, "took {:?}", started.elapsed());
+}
+
+#[test]
 fn says_plainly_when_it_does_not_recognise_a_hive() {
     let file = hive_of(BuildKey::new("ROOT").child(BuildKey::new("Whatever")), "");
-    assert_eq!(read(&file).unwrap().kind, "a hive this does not recognise");
+    assert_eq!(read(&file).unwrap().kind, "an unrecognised hive");
 }
 
 #[test]

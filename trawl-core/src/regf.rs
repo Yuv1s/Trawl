@@ -29,6 +29,8 @@
 //! touches on a specific event, the difference stops mattering much.
 
 use crate::binary::MAX_SYMBOLS;
+use std::cell::Cell;
+use std::collections::HashSet;
 
 /// Where the hive bins begin, and the point every offset in the file is
 /// measured from.
@@ -38,6 +40,24 @@ const BASE_BLOCK: usize = 4096;
 /// hundreds of thousands, which no panel can show and no browser should be
 /// asked to hold, so the walk stops and says it stopped.
 const MAX_KEYS: usize = 20_000;
+
+/// Keys and values one reading of a hive will decode, however it is walked.
+///
+/// A hive is a graph its author draws. Every key can list the same twenty thousand
+/// children, so the cost of a walk has nothing to do with the size of the file, and
+/// thirty-six kilobytes can ask for three gigabytes. A real walk down to the device keys
+/// reads a few thousand.
+const MAX_KEY_READS: usize = 200_000;
+const MAX_VALUE_READS: usize = 1_000_000;
+
+/// What a value costs on top of being read: one more read for this many bytes of what
+/// it keeps. A key holds on to its values, a long name and preview is a kilobyte, and a
+/// million reads of one such cell would be a gigabyte held all at once.
+const BYTES_PER_READ: usize = 64;
+
+/// Longest key or value name kept. Windows allows 255 characters for a key, and a
+/// name field holding more is a way to make every copy of it expensive.
+const MAX_NAME_BYTES: usize = 512;
 
 /// Days between 1601-01-01, where Windows counts from, and 1970-01-01,
 /// where the civil-date maths below counts from.
@@ -169,6 +189,37 @@ pub struct Hive<'a> {
     /// lived on the machine it came from.
     pub file_name: String,
     pub written: String,
+    keys_left: Cell<usize>,
+    values_left: Cell<usize>,
+}
+
+/// Takes one from a budget, or says it is spent.
+fn spend(budget: &Cell<usize>) -> bool {
+    let left = budget.get();
+    budget.set(left.saturating_sub(1));
+    left > 0
+}
+
+/// A name as the hive stores it, cut to the room worth giving it. Bit 5 of a key's
+/// flags and bit 0 of a value's say whether it is one byte per character or two.
+fn name_of(raw: &[u8], one_byte: bool) -> String {
+    let raw = &raw[..raw.len().min(MAX_NAME_BYTES)];
+    if one_byte {
+        crate::json::latin1(raw)
+    } else {
+        utf16(raw)
+    }
+}
+
+/// What one walk of a subkey list has already been through. A list can point at
+/// itself, or at a thousand lists that all point at each other, and only the visited
+/// set stops that being exponential: a limit on depth leaves the breadth alone, which
+/// 5.8 KB of file is enough to make endless.
+#[derive(Default)]
+struct ListWalk {
+    lists: HashSet<u32>,
+    keys: HashSet<u32>,
+    found: Vec<u32>,
 }
 
 impl<'a> Hive<'a> {
@@ -198,6 +249,8 @@ impl<'a> Hive<'a> {
             // length rather than to a terminator.
             file_name: utf16(data.get(0x30..0x30 + 64)?),
             written: filetime(u64_at(0x0c)?),
+            keys_left: Cell::new(MAX_KEY_READS),
+            values_left: Cell::new(MAX_VALUE_READS),
         })
     }
 
@@ -227,6 +280,9 @@ impl<'a> Hive<'a> {
     }
 
     fn key_at(&self, offset: u32) -> Option<Key> {
+        if !spend(&self.keys_left) {
+            return None;
+        }
         let cell = self.cell(offset)?;
         if cell.get(..2)? != b"nk" {
             return None;
@@ -255,11 +311,7 @@ impl<'a> Hive<'a> {
         // Reading it the wrong way gives either every other letter or a run
         // of replacement characters, and both look like a corrupt hive.
         let raw_name = cell.get(0x4c..0x4c + name_length)?;
-        let name = if flags & 0x20 != 0 {
-            crate::json::latin1(raw_name)
-        } else {
-            utf16(raw_name)
-        };
+        let name = name_of(raw_name, flags & 0x20 != 0);
 
         Some(Key {
             name,
@@ -278,6 +330,9 @@ impl<'a> Hive<'a> {
             .filter_map(|index| {
                 let at = index * 4;
                 let raw: [u8; 4] = list.get(at..at + 4)?.try_into().ok()?;
+                if !spend(&self.values_left) {
+                    return None;
+                }
                 self.value_at(u32::from_le_bytes(raw))
             })
             .collect()
@@ -305,11 +360,7 @@ impl<'a> Hive<'a> {
         let flags = u16_at(0x10)?;
 
         let raw_name = cell.get(0x14..0x14 + name_length)?;
-        let name = if flags & 0x01 != 0 {
-            crate::json::latin1(raw_name)
-        } else {
-            utf16(raw_name)
-        };
+        let name = name_of(raw_name, flags & 0x01 != 0);
 
         // The top bit of the size means the data is small enough to live in
         // the offset field itself rather than in a cell of its own.
@@ -350,6 +401,12 @@ impl<'a> Hive<'a> {
             _ => hex(shown, 64),
         };
 
+        self.values_left.set(
+            self.values_left
+                .get()
+                .saturating_sub((name.len() + rendered.len()) / BYTES_PER_READ),
+        );
+
         Some(Value {
             name,
             kind,
@@ -371,15 +428,15 @@ impl<'a> Hive<'a> {
             return Vec::new();
         };
 
-        let mut out = Vec::new();
-        self.collect_list(u32::from_le_bytes(raw), &mut out, 0);
-        out
+        let mut walk = ListWalk::default();
+        self.collect_list(u32::from_le_bytes(raw), &mut walk, 0);
+        walk.found
     }
 
-    /// Reads a subkey list into `out`. An `ri` list holds other lists rather
-    /// than keys, so this recurses, bounded in case one points at itself.
-    fn collect_list(&self, offset: u32, out: &mut Vec<u32>, depth: usize) {
-        if depth > 4 || out.len() >= MAX_KEYS {
+    /// Reads a subkey list into the walk. An `ri` list holds other lists rather
+    /// than keys, so this recurses, once per list however many point at it.
+    fn collect_list(&self, offset: u32, walk: &mut ListWalk, depth: usize) {
+        if depth > 4 || walk.found.len() >= MAX_KEYS || !walk.lists.insert(offset) {
             return;
         }
         let Some(cell) = self.cell(offset) else { return };
@@ -401,7 +458,7 @@ impl<'a> Hive<'a> {
         };
 
         for index in 0..count as usize {
-            if out.len() >= MAX_KEYS {
+            if walk.found.len() >= MAX_KEYS {
                 return;
             }
             let at = 4 + index * stride;
@@ -411,9 +468,10 @@ impl<'a> Hive<'a> {
             let entry = u32::from_le_bytes(raw);
 
             if kind == b"ri" {
-                self.collect_list(entry, out, depth + 1);
-            } else {
-                out.push(entry);
+                self.collect_list(entry, walk, depth + 1);
+            } else if walk.keys.insert(entry) {
+                // A key is one subkey however many times its list names it.
+                walk.found.push(entry);
             }
         }
     }

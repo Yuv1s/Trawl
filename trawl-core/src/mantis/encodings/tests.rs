@@ -1,6 +1,33 @@
 use super::*;
 
 #[test]
+fn a_text_of_ampersands_is_not_searched_from_each_one() {
+    for unit in [&b"&"[..], b"&#x", b"&a"] {
+        let mut text = unit.repeat(1 << 18);
+        text.push(b';');
+
+        let started = std::time::Instant::now();
+        assert_eq!(html_entities(&text), None);
+        assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+    }
+}
+
+#[test]
+fn an_entity_padded_with_zeros_still_decodes() {
+    assert_eq!(html_entities(b"&#0000000000000000065;&amp;"), Some(b"A&".to_vec()));
+    assert_eq!(html_entities(b"&#x10ffff;&amp;").unwrap().len(), 5);
+}
+
+#[test]
+fn a_long_run_of_base58_is_refused_rather_than_divided_down() {
+    let text = b"abc".repeat(1 << 16);
+
+    let started = std::time::Instant::now();
+    assert_eq!(base58(&text), None);
+    assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+}
+
+#[test]
 fn decodes_base64() {
     assert_eq!(base64(b"SGVsbG8sIHdvcmxkIQ==").unwrap(), b"Hello, world!");
     // Padding is optional in the wild.

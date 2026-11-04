@@ -19,7 +19,7 @@
 			doc.revisions > 1 &&
 				`this file has been incrementally updated ${doc.revisions - 1} time${doc.revisions - 1 === 1 ? '' : 's'}, each %%EOF a saved revision`,
 			doc.trailing > 0 &&
-				`${doc.trailing.toLocaleString()} bytes follow the last %%EOF, which nothing that wrote this document put there`,
+				`${doc.trailing.toLocaleString()} bytes follow the last %%EOF, where a PDF writer puts nothing`,
 			doc.encrypted &&
 				'the trailer names an /Encrypt dictionary, so this document is password protected',
 			doc.usesXrefStream &&
@@ -33,15 +33,15 @@
 <div class="pdf">
 	{#if orphaned.length > 0 || carrying.length > 0 || notes.length > 0}
 		<ul class="findings">
-			{#each carrying as object (object.offset)}
-				{#each object.flags ?? [] as flag (flag)}
+			{#each carrying as object, i (i)}
+				{#each new Set(object.flags ?? []) as flag (flag)}
 					<li class="flagged">
 						<span class="mono big">{flag}</span>
 						<span class="muted"> inside <span class="mono">{objectLabel(object)}</span></span>
 					</li>
 				{/each}
 			{/each}
-			{#each orphaned as object (object.offset)}
+			{#each orphaned as object, i (i)}
 				<li class="flagged">
 					<span class="mono">{objectLabel(object)}</span> is in the file but the cross-reference table
 					no longer points at it, so no ordinary reader will open it
@@ -54,7 +54,7 @@
 	{:else}
 		<p class="clear">
 			The cross-reference table lists every object in the file, there is one revision, and nothing
-			follows the last %%EOF. That is what an untouched PDF looks like.
+			follows the last %%EOF. This looks like an untouched PDF.
 		</p>
 	{/if}
 
@@ -62,7 +62,7 @@
 		<div class="info">
 			<h3 class="label">Document info</h3>
 			<dl>
-				{#each doc.info as field (field.key)}
+				{#each doc.info as field, i (i)}
 					<div>
 						<dt class="label">{field.key}</dt>
 						<dd class="mono">{field.value}</dd>
@@ -74,8 +74,10 @@
 
 	<table>
 		<caption class="label">
-			{doc.objects.length} object{doc.objects.length === 1 ? '' : 's'}, PDF {doc.version}
-			{embedded.length > 0 ? `, ${embedded.length} attached` : ''}
+			{doc.objects.length} object{doc.objects.length === 1 ? '' : 's'}, PDF {doc.version}{embedded.length >
+			0
+				? `, ${embedded.length} attached`
+				: ''}
 		</caption>
 		<thead>
 			<tr>
@@ -87,7 +89,7 @@
 			</tr>
 		</thead>
 		<tbody>
-			{#each doc.objects as object (object.offset)}
+			{#each doc.objects as object, i (i)}
 				<tr class:odd={object.orphaned || (object.flags?.length ?? 0) > 0}>
 					<td>
 						<span class="mono name">{objectLabel(object)}</span>
@@ -98,10 +100,10 @@
 							<span class="mono chip">attachment</span>
 						{/if}
 					</td>
-					<td class="muted">{object.type ?? '—'}{object.subtype ? ` / ${object.subtype}` : ''}</td>
-					<td class="muted">{object.stream?.filter || (object.stream ? 'uncompressed' : '—')}</td>
+					<td class="muted">{object.type ?? '-'}{object.subtype ? ` / ${object.subtype}` : ''}</td>
+					<td class="muted">{object.stream?.filter || (object.stream ? 'uncompressed' : '-')}</td>
 					<td class="mono num"
-						>{object.stream ? `${object.stream.length.toLocaleString()} B` : '—'}</td
+						>{object.stream ? `${object.stream.length.toLocaleString()} B` : '-'}</td
 					>
 					<td class="mono muted">0x{object.offset.toString(16)}</td>
 				</tr>
@@ -133,8 +135,8 @@
 
 	{#if doc.encrypted}
 		<p class="footnote">
-			Trawl does not crack document passwords. Reversing one means guessing until a checksum
-			matches, which belongs on hardware you control running something built for it.
+			Trawl doesn't crack document passwords. That means guessing until a checksum matches, which is
+			a job for dedicated software on your own hardware.
 		</p>
 	{/if}
 </div>

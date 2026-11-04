@@ -2,7 +2,7 @@
 	import { resolve } from '$app/paths';
 	import Logo from '$lib/components/Logo.svelte';
 	import HeaderControls from '$lib/components/HeaderControls.svelte';
-	import { PLANNED } from '$lib/analysis/tools';
+	import { MANTIS_TOOLS, PLANNED, RACK_OVERVIEW, type ToolGroup } from '$lib/analysis/tools';
 
 	let {
 		onfile,
@@ -31,52 +31,14 @@
 		if (ready) ontext(pasted.trim());
 	}
 
-	/**
-	 * What the page can actually do, grouped the way the workbench groups it.
-	 *
-	 * Written out rather than derived, because there is no file here to run
-	 * anything against. That makes it a promise, so it has to stay true: every
-	 * line below is a tool that exists.
-	 */
+	const inRack = (group: ToolGroup): [string, string][] =>
+		RACK_OVERVIEW.filter((tool) => tool.group === group).map((tool) => [tool.name, tool.measures]);
+
+	/** What the page can do, grouped the way the workbench groups it. */
 	const GROUPS: { name: string; blurb: string; tools: [string, string][] }[] = [
-		{
-			name: 'Cuttlefish',
-			blurb: 'Runs on an image or a sound file',
-			tools: [
-				['LSB sweep', 'Tries every way of reading hidden bits'],
-				['Bit-plane wall', 'Shows each layer of bits as a picture'],
-				['Chi-square attack', 'Statistical test for a hidden payload'],
-				['RS analysis', 'Second opinion on how much is hidden'],
-				['Spectrogram', 'Draws the sound, in case a picture is hiding in it'],
-				['Audio LSB sweep', 'Hidden bits in the samples of a sound file'],
-				['JSteg sweep', 'Reads hidden bits out of a JPEG after compression'],
-				['Palette', 'Repeated colours that carry hidden bits']
-			]
-		},
-		{
-			name: 'Survey',
-			blurb: 'Runs on any file you drop',
-			tools: [
-				['Flag scan', 'Looks for flag{...} text in the file'],
-				['Embedded files', 'Finds files hidden inside this one, and saves them'],
-				['Metadata', 'Camera details and notes saved with the photo'],
-				['Entropy window', 'Finds compressed or encrypted regions'],
-				['Chunk walk', 'Lists every part of the file'],
-				['Readable text', 'Text anywhere in the file, plain or wide'],
-				['Archive entries', 'Reads a ZIP twice and reports where the two copies disagree'],
-				['PDF structure', 'Walks a PDF for every object, and what the index leaves out'],
-				['Binary structure', 'Reads what an ELF or PE declares, down to its own defences'],
-				['Registry hive', 'Reads which USB stick a Windows hive remembers, and when']
-			]
-		},
-		{
-			name: 'Mantis',
-			blurb: 'Runs on a string you paste',
-			tools: [
-				['Encoding peeler', 'Unwraps base64, hex, morse and ten more, layer by layer'],
-				['Caesar solver', 'Tries every shift and keeps the one that reads']
-			]
-		}
+		{ name: 'Cuttlefish', blurb: 'Looks for hidden data', tools: inRack('cuttlefish') },
+		{ name: 'Survey', blurb: 'Reads the file itself', tools: inRack('survey') },
+		{ name: 'Mantis', blurb: 'Runs on a string you paste', tools: MANTIS_TOOLS }
 	];
 
 	const total = GROUPS.reduce((n, group) => n + group.tools.length, 0);
@@ -151,7 +113,7 @@
 	<header>
 		<h1><Logo size={44} /><span>Trawl</span></h1>
 		<p class="lede">
-			{total} tools for a CTF challenge, running at once, in this tab. Nothing is uploaded.
+			{total} tools for CTF challenges, all running in this tab. Nothing is uploaded.
 		</p>
 
 		<label class="pick" class:armed={dragging}>
@@ -173,7 +135,7 @@
 
 		<button type="button" class="web" onclick={onweb}>
 			Explore a live site
-			<span class="alt">a URL, scanned by a helper you run yourself</span>
+			<span class="alt">Scans a URL with a small program you run yourself</span>
 		</button>
 	</header>
 
@@ -212,7 +174,8 @@
 
 	<footer>
 		<p class="assurance">
-			No upload, no account, no telemetry. Works offline after the first load.
+			Trawl uploads nothing, needs no account and sends no telemetry. Once loaded, this tab keeps
+			working offline.
 		</p>
 		<nav aria-label="Site">
 			<a href={resolve('/privacy')}>Privacy</a>

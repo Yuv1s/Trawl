@@ -385,14 +385,28 @@ impl Probe<'_> {
     /// real key is in hand.
     async fn forge_and_replay(&mut self) {
         for token_str in self.tokens.clone() {
+            if *self.budget == 0 || Instant::now() >= self.deadline {
+                return;
+            }
             let Some(token) = crate::jwt::parse(&token_str) else {
                 continue;
             };
-            let keys = crate::jwt::candidate_keys(&token, &self.source);
-            let Some(key) = crate::jwt::recover_key(&token, &keys) else {
+            // Key recovery is pure CPU over the token and the whole page source,
+            // which can be large and hostile. Run it off the async worker so it
+            // cannot stall the executor, and let the per-token deadline check
+            // above keep the pass inside ACTIVE_DEADLINE.
+            let source = self.source.clone();
+            let forged = tokio::task::spawn_blocking(move || {
+                let keys = crate::jwt::candidate_keys(&token, &source);
+                crate::jwt::recover_key(&token, &keys)
+                    .map(|key| crate::jwt::forge_admin(&token, &key))
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some(forged) = forged else {
                 continue;
             };
-            let forged = crate::jwt::forge_admin(&token, &key);
 
             for url in self.existing.clone() {
                 if *self.budget == 0 || Instant::now() >= self.deadline {
@@ -403,6 +417,7 @@ impl Probe<'_> {
                     body: None,
                     headers: vec![("authorization".into(), format!("Bearer {forged}"))],
                     timeout: None,
+                    ..Request::default()
                 };
                 if let Some(response) = self.send(&url, &request).await {
                     self.scan(
@@ -422,6 +437,10 @@ impl Probe<'_> {
         *self.budget -= 1;
         let mut request = request.clone();
         request.timeout.get_or_insert(PROBE_TIMEOUT);
+        // Every probe carries a method, a body or credentials, so none may follow
+        // a redirect off the target's origin. This is the one place all probe
+        // requests pass through, so the rule is set here once.
+        request.stop_at_cross_origin = true;
         fetch::fetch_with(url, self.allow_local, &request)
             .await
             .ok()
@@ -468,6 +487,7 @@ impl Probe<'_> {
                     body: None,
                     headers: vec![(carriable.header.clone(), carriable.value.clone())],
                     timeout: None,
+                    ..Request::default()
                 };
                 if let Some(response) = self.send(&url, &request).await {
                     self.scan(
@@ -525,6 +545,7 @@ impl Probe<'_> {
                 body: Some(body.clone()),
                 headers: vec![("content-type".into(), "application/json".into())],
                 timeout: None,
+                ..Request::default()
             };
             if let Some(response) = self.send(url, &request).await {
                 self.scan(
@@ -543,6 +564,7 @@ impl Probe<'_> {
                 body: None,
                 headers: vec![("accept".into(), accept)],
                 timeout: None,
+                ..Request::default()
             };
             if let Some(response) = self.send(url, &request).await {
                 self.scan(
@@ -640,9 +662,10 @@ pub async fn run(
         let Ok(endpoint) = base.join(&path) else {
             continue;
         };
-        // Same host only: a wordlist is data, and data does not get to redirect a
-        // crafted request to a target the person did not name.
-        if endpoint.host_str() != base.host_str() {
+        // Same origin only: a wordlist is data, and data does not get to send a
+        // crafted request to a target the person did not name. Origin, not host,
+        // so a path cannot climb to another port or scheme on the same name.
+        if endpoint.origin() != base.origin() {
             continue;
         }
         let url = endpoint.to_string();

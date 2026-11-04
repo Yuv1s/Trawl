@@ -12,7 +12,7 @@
 //! several, which is the difference between Caesar and Vigenère and cannot be
 //! seen by eye.
 
-use super::{ngram, vigenere};
+use super::{ENGLISH, ngram, vigenere};
 
 /// How often each letter turns up, and how that compares with English.
 #[derive(Debug, Clone, PartialEq)]
@@ -47,12 +47,6 @@ pub struct Table {
     pub trigrams: Vec<Repeat>,
 }
 
-/// English letter frequencies, in percent, a through z.
-const ENGLISH: [f32; 26] = [
-    8.167, 1.492, 2.782, 4.253, 12.702, 2.228, 2.015, 6.094, 6.966, 0.153, 0.772, 4.025, 2.406,
-    6.749, 7.507, 1.929, 0.095, 5.987, 6.327, 9.056, 2.758, 0.978, 2.360, 0.150, 1.974, 0.074,
-];
-
 /// How many repeated pairs and triples to report.
 ///
 /// Enough to see a pattern, few enough to read at a glance. Past a dozen the
@@ -66,21 +60,38 @@ fn repeats(letters: &[u8], size: usize) -> Vec<Repeat> {
         return Vec::new();
     }
 
-    let mut seen: Vec<(Vec<u8>, usize)> = Vec::new();
+    // A counter per possible run rather than a search of the runs seen so far, which
+    // is thousands of comparisons for every letter of a long paste. Numbered in base
+    // 26 from the first letter, so walking the counters in order is alphabetical.
+    let index = |run: &[u8]| {
+        run.iter()
+            .fold(0usize, |number, &letter| number * 26 + (letter - b'A') as usize)
+    };
+    let mut counts = vec![0usize; 26usize.pow(size as u32)];
+    let mut first = vec![0usize; counts.len()];
 
-    for window in letters.windows(size) {
-        match seen.iter_mut().find(|(text, _)| text == window) {
-            Some((_, count)) => *count += 1,
-            None => seen.push((window.to_vec(), 1)),
+    for (at, window) in letters.windows(size).enumerate() {
+        let number = index(window);
+        if counts[number] == 0 {
+            first[number] = at;
         }
+        counts[number] += 1;
     }
 
-    seen.retain(|(_, count)| *count > 1);
+    let mut seen: Vec<(usize, usize)> = counts
+        .iter()
+        .enumerate()
+        .filter(|&(_, &count)| count > 1)
+        .map(|(number, &count)| (number, count))
+        .collect();
     seen.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     seen.truncate(REPEATS);
 
     seen.into_iter()
-        .map(|(text, count)| Repeat { text, count })
+        .map(|(number, count)| Repeat {
+            text: letters[first[number]..first[number] + size].to_vec(),
+            count,
+        })
         .collect()
 }
 

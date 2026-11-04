@@ -37,6 +37,14 @@ pub fn push_number(out: &mut String, key: &str, value: usize) {
     out.push_str(&value.to_string());
 }
 
+/// For a number that is 64 bits wide in the file, which a WASM `usize` would cut down
+/// to its low half.
+pub fn push_u64(out: &mut String, key: &str, value: u64) {
+    push_string(out, key);
+    out.push(':');
+    out.push_str(&value.to_string());
+}
+
 pub fn push_bool(out: &mut String, key: &str, value: bool) {
     push_string(out, key);
     out.push(':');
@@ -68,7 +76,7 @@ pub fn is_well_formed(text: &str) -> bool {
 
     impl Parser<'_> {
         fn skip_ws(&mut self) {
-            while self.bytes.get(self.at).is_some_and(u8::is_ascii_whitespace) {
+            while matches!(self.bytes.get(self.at), Some(b' ' | b'\n' | b'\r' | b'\t')) {
                 self.at += 1;
             }
         }
@@ -105,28 +113,52 @@ pub fn is_well_formed(text: &str) -> bool {
                     }
                     Some(b'\\') => {
                         self.at += 1;
-                        if self.bytes.get(self.at).is_none() {
-                            return false;
+                        match self.bytes.get(self.at) {
+                            Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {
+                                self.at += 1;
+                            }
+                            Some(b'u') => {
+                                let digits = self.bytes.get(self.at + 1..self.at + 5);
+                                if !digits.is_some_and(|d| d.iter().all(u8::is_ascii_hexdigit)) {
+                                    return false;
+                                }
+                                self.at += 5;
+                            }
+                            _ => return false,
                         }
-                        self.at += 1;
                     }
+                    // A raw control character is the one thing a JSON string cannot
+                    // hold, and what a missed escape looks like.
+                    Some(0x00..=0x1f) => return false,
                     Some(_) => self.at += 1,
                 }
             }
         }
 
-        fn number(&mut self) -> bool {
+        fn digits(&mut self) -> bool {
             let start = self.at;
-            self.eat(b'-');
             while self.bytes.get(self.at).is_some_and(u8::is_ascii_digit) {
                 self.at += 1;
             }
-            if self.eat(b'.') {
-                while self.bytes.get(self.at).is_some_and(u8::is_ascii_digit) {
-                    self.at += 1;
-                }
-            }
             self.at > start
+        }
+
+        fn number(&mut self) -> bool {
+            self.eat(b'-');
+            // A lone zero, or digits that do not begin with one.
+            if !self.eat(b'0') && !(self.bytes.get(self.at).is_some_and(|b| *b != b'0') && self.digits()) {
+                return false;
+            }
+            if self.eat(b'.') && !self.digits() {
+                return false;
+            }
+            if self.eat(b'e') || self.eat(b'E') {
+                if !self.eat(b'+') {
+                    self.eat(b'-');
+                }
+                return self.digits();
+            }
+            true
         }
 
         fn value(&mut self) -> bool {
@@ -239,6 +271,48 @@ mod tests {
         // substring an assertion might look for, but the key appears twice
         // with no colon after the first one.
         assert!(!is_well_formed(r#"{"type""type":"Catalog"}"#));
+    }
+
+    #[test]
+    fn rejects_a_raw_control_character_in_a_string() {
+        assert!(!is_well_formed("\"a\nb\""));
+        assert!(!is_well_formed("\"a\tb\""));
+        assert!(!is_well_formed("\"a\u{1}b\""));
+        assert!(is_well_formed("\"a\\nb\""));
+        assert!(is_well_formed("\"caf\u{e9} \u{7f}\""));
+    }
+
+    #[test]
+    fn rejects_an_escape_json_does_not_have() {
+        for bad in [r#""\q""#, r#""\u12""#, r#""\u12g4""#, r#""\x41""#, r#""\"#, r#""\u"#] {
+            assert!(!is_well_formed(bad), "{bad}");
+        }
+        for good in [r#""\"""#, r#""\\""#, r#""\/""#, r#""\b\f\n\r\t""#, r#""\u00e9""#, r#""\uABCD""#] {
+            assert!(is_well_formed(good), "{good}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_number_json_does_not_have() {
+        for bad in ["-", "1.", ".5", "01", "-01", "1e", "1e+", "--1", "+1", "NaN", "inf"] {
+            assert!(!is_well_formed(bad), "{bad}");
+        }
+        for good in ["0", "-0", "10", "1.5", "-1.25", "0.5", "1e5", "1E-5", "1.5e+3"] {
+            assert!(is_well_formed(good), "{good}");
+        }
+    }
+
+    #[test]
+    fn rejects_whitespace_json_does_not_have() {
+        assert!(!is_well_formed("\u{c}1"));
+        assert!(is_well_formed(" \r\n\t1 "));
+    }
+
+    #[test]
+    fn a_wide_number_is_written_in_full() {
+        let mut out = String::new();
+        push_u64(&mut out, "size", 0x1_0000_0000);
+        assert_eq!(out, "\"size\":4294967296");
     }
 
     #[test]

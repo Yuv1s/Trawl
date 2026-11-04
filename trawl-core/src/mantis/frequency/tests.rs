@@ -45,6 +45,40 @@ fn english_leans_on_e_and_t() {
 }
 
 #[test]
+fn repeats_rank_by_count_then_alphabet() {
+    let found = repeats(b"ABABABCDCDXYXY", 2);
+    let shown: Vec<(&[u8], usize)> = found.iter().map(|r| (&r.text[..], r.count)).collect();
+    assert_eq!(
+        shown,
+        vec![
+            (&b"AB"[..], 3),
+            (&b"BA"[..], 2),
+            (&b"CD"[..], 2),
+            (&b"XY"[..], 2)
+        ]
+    );
+    assert!(repeats(b"A", 2).is_empty());
+}
+
+#[test]
+fn a_long_paste_does_not_search_its_runs_for_every_letter() {
+    // Every run distinct is the worst case for a search of the runs seen so far.
+    let mut state = 0x2545_f491u32;
+    let letters: Vec<u8> = (0..2_000_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            b'A' + (state % 26) as u8
+        })
+        .collect();
+
+    let started = std::time::Instant::now();
+    assert_eq!(repeats(&letters, 3).len(), REPEATS);
+    assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+}
+
+#[test]
 fn finds_the_repeats_that_matter() {
     let table = table(PROSE);
 

@@ -18,6 +18,7 @@
 	const embedded = $derived(hits.filter((h) => h.embedded));
 	const header = $derived(hits.find((h) => !h.embedded) ?? null);
 
+	const startsWithVowel = /^[aeiou]/i;
 	const hex = (n: number) => `0x${n.toString(16)}`;
 
 	/** Find the carved child that automatic analysis attached to this magic hit. */
@@ -37,7 +38,7 @@
 	function statusChip(status: 'analysed' | 'skipped' | 'error', reason?: string): string {
 		switch (status) {
 			case 'analysed':
-				return '✓ analysed';
+				return 'analysed';
 			case 'skipped':
 				return reason ? `skipped: ${reason}` : 'skipped';
 			case 'error':
@@ -94,7 +95,8 @@
 
 {#if header}
 	<p class="lead">
-		This file starts with a <strong>{header.label}</strong> signature.
+		This file starts with {startsWithVowel.test(header.label) ? 'an' : 'a'}
+		<strong>{header.label}</strong> signature.
 	</p>
 {/if}
 
@@ -106,7 +108,7 @@
 	</p>
 {:else}
 	<ul class="hits">
-		{#each embedded as hit (hit.offset)}
+		{#each embedded as hit, i (i)}
 			<li>
 				<div class="head">
 					<span class="label-text">{hit.label}</span>
@@ -152,8 +154,8 @@
 	</ul>
 
 	<p class="caveat">
-		A file signature this far into another file did not get there by accident. Where the format
-		declares its own end, PNG, JPEG, ZIP and PDF, the saved bytes stop exactly there.
+		A file signature this far into another file is rarely an accident. PNG, JPEG, ZIP and PDF mark
+		their own end, so for those formats the saved bytes stop exactly there.
 	</p>
 {/if}
 

@@ -6,7 +6,10 @@
 		<meta name="text-scale" content="scale" />
 		<script>
 			(function () {
-				var stored = localStorage.getItem('trawl.theme');
+				var stored = null;
+				try {
+					stored = localStorage.getItem('trawl.theme');
+				} catch (e) {}
 				var theme =
 					stored === 'dark' || stored === 'light'
 						? stored

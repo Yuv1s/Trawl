@@ -1,12 +1,15 @@
-﻿import { describe, expect, it } from 'vitest';
-import { flagsOf, PLANNED, tools } from './tools';
+import { describe, expect, it } from 'vitest';
+import { chiStands, flagsOf, PLANNED, tools } from './tools';
 import type {
+	ChiSquare,
 	Chunk,
 	BinaryStructure,
 	RegistryHive,
 	SqliteDatabase,
 	PcapCapture,
 	PcapStream,
+	PlaneWall,
+	RsAnalysis,
 	GifAnalysis,
 	NestedAnalysis,
 	Structure,
@@ -169,7 +172,7 @@ describe('format scope', () => {
 		const pngLevel = tools({ survey }).filter((t) => t.scope === 'png');
 		expect(pngLevel.length).toBeGreaterThan(0);
 		expect(pngLevel.every((t) => t.status === 'pending')).toBe(true);
-		expect(pngLevel.every((t) => t.value === 'PNG only, for now')).toBe(true);
+		expect(pngLevel.every((t) => t.value === 'PNG only')).toBe(true);
 	});
 
 	it('keeps strings and flags available on a file it cannot walk', () => {
@@ -323,7 +326,7 @@ describe('gif frames', () => {
 
 	it('stands the GIF tool down on a file with no frame analysis', () => {
 		expect(withGif(null)?.status).toBe('pending');
-		expect(withGif(null)?.value).toBe('pixels unavailable');
+		expect(withGif(null)?.value).toBe('not a GIF');
 	});
 
 	it('reports an error instead of claiming a finding', () => {
@@ -582,7 +585,7 @@ describe('binary structure', () => {
 	it('stands down on a file that is not an ELF', () => {
 		const tool = tools({ survey, structure }).find((t) => t.id === 'binary')!;
 		expect(tool.status).toBe('pending');
-		expect(tool.value).toBe('not an executable this reads');
+		expect(tool.value).toBe('not an ELF or PE binary');
 	});
 
 	it('stays clear on a binary built with every protection on', () => {
@@ -706,14 +709,14 @@ describe('registry hive', () => {
 		// going to hold anything.
 		const searched = tools({ survey, hive: hive() }).find((t) => t.id === 'hive')!;
 		expect(searched.status).toBe('clear');
-		expect(searched.value).toBe('SYSTEM, no device history');
+		expect(searched.value).toBe('SYSTEM, no devices recorded');
 
 		const wrongKind = tools({
 			survey,
 			hive: hive({ kind: 'SOFTWARE', searched: [] })
 		}).find((t) => t.id === 'hive')!;
 		expect(wrongKind.status).toBe('clear');
-		expect(wrongKind.value).toBe('SOFTWARE, nowhere here keeps device history');
+		expect(wrongKind.value).toBe('SOFTWARE, keeps no device history');
 	});
 });
 
@@ -832,5 +835,60 @@ describe('planned tools', () => {
 	it('keeps built and planned ids disjoint', () => {
 		const builtIds = new Set(tools({ survey, structure }).map((t) => t.id));
 		expect(PLANNED.some((t) => builtIds.has(t.id))).toBe(false);
+	});
+});
+
+describe('chi-square against RS', () => {
+	const chi = { detected: true, embeddedFraction: 0.14, peakProbability: 1 } as ChiSquare;
+
+	it('does not call it a payload when RS can read the image and sees nothing', () => {
+		expect(chiStands(chi, { reliable: true, detected: false } as RsAnalysis)).toBe(false);
+	});
+
+	it('stands when RS agrees, or cannot read the image at all', () => {
+		expect(chiStands(chi, { reliable: true, detected: true } as RsAnalysis)).toBe(true);
+		expect(chiStands(chi, { reliable: false, detected: false } as RsAnalysis)).toBe(true);
+		expect(chiStands(chi, null)).toBe(true);
+	});
+
+	it('keeps the rack honest about the disagreement', () => {
+		const rack = (rs: Partial<RsAnalysis>) =>
+			tools({
+				survey,
+				chi,
+				rs: rs as RsAnalysis,
+				wall: { planes: [] } as unknown as PlaneWall
+			}).find((t) => t.id === 'chi')!;
+
+		expect(rack({ reliable: true, detected: false }).status).toBe('ready');
+		expect(rack({ reliable: true, detected: true }).status).toBe('hit');
+	});
+});
+
+describe('a PNG that stops short', () => {
+	it('reports a missing IEND as a finding', () => {
+		const tool = tools({
+			survey,
+			structure: {
+				signature: true,
+				header: { width: 1, height: 1, bitDepth: 8, colorType: 2, interlace: 0 },
+				chunks: [chunk('IHDR', 8, 13)],
+				text: [],
+				flags: [],
+				trailing: null,
+				palette: null
+			} as unknown as Structure
+		}).find((t) => t.id === 'chunks')!;
+
+		expect(tool.status).toBe('hit');
+		expect(tool.value).toContain('no IEND');
+	});
+
+	it('says the pixels could not be read, instead of blaming the format', () => {
+		const tool = tools({ survey, pixelError: 'inflated data is too short' }).find(
+			(t) => t.id === 'lsb'
+		)!;
+
+		expect(tool.value).toBe('pixels unreadable');
 	});
 });

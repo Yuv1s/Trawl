@@ -25,6 +25,7 @@ pub enum DctError {
     Truncated,
     BadHuffmanCode,
     MissingTable,
+    TooLarge,
 }
 
 impl fmt::Display for DctError {
@@ -37,9 +38,25 @@ impl fmt::Display for DctError {
             Self::Truncated => write!(f, "the scan data ends before the last block"),
             Self::BadHuffmanCode => write!(f, "a Huffman code in the scan does not decode"),
             Self::MissingTable => write!(f, "the scan refers to a table the file does not define"),
+            Self::TooLarge => write!(
+                f,
+                "the frame declares more blocks than this file could hold or Trawl will read"
+            ),
         }
     }
 }
+
+/// Most blocks a frame may hold, at 256 bytes each and more than once over while
+/// they are read. A 64-megapixel 4:2:0 photograph has about three quarters of this.
+const MAX_BLOCKS: usize = 1 << 21;
+
+/// Most scans a file is read for. An encoder writes a dozen; each one can walk every
+/// block for a few bytes of entropy data, so a file of nothing else is a hang.
+const MAX_SCANS: usize = 128;
+
+/// Largest magnitude category a DC table can name. Larger is a corrupt table, and
+/// reading that many bits into a 32-bit value means nothing.
+const MAX_CATEGORY: u32 = 16;
 
 /// Zig-zag order. Coefficients are stored along this path, low frequency first,
 /// so index 0 is DC and 63 is the highest frequency.
@@ -419,7 +436,14 @@ fn read_scan_header(file: &[u8], scan: Segment, frame: &Frame) -> Result<ScanHea
             .position(|c| c.id == spec[0])
             .ok_or(DctError::MissingTable)?;
 
-        components.push((index, (spec[1] >> 4) as usize, (spec[1] & 0x0f) as usize));
+        // Four bits each, and only four slots: anything above is a table no file can
+        // define, and indexes past the end of the table array.
+        let (dc_slot, ac_slot) = ((spec[1] >> 4) as usize, (spec[1] & 0x0f) as usize);
+        if dc_slot > 3 || ac_slot > 3 {
+            return Err(DctError::MissingTable);
+        }
+
+        components.push((index, dc_slot, ac_slot));
     }
 
     let tail = file
@@ -450,10 +474,10 @@ fn mcu_targets(
     planes: &[Plane],
     mcus_across: usize,
     mcu: usize,
-) -> Vec<(usize, usize, usize)> {
+    out: &mut Vec<(usize, usize, usize)>,
+) {
     let mcu_row = mcu / mcus_across;
     let mcu_col = mcu % mcus_across;
-    let mut out = Vec::new();
 
     for (slot, &(index, _, _)) in header.components.iter().enumerate() {
         let component = frame.components[index];
@@ -465,8 +489,6 @@ fn mcu_targets(
             }
         }
     }
-
-    out
 }
 
 /// Runs one scan over the coefficient buffer.
@@ -507,6 +529,9 @@ fn decode_scan(
     };
 
     let mut since_restart = 0usize;
+    // Kept between units. A scan can visit millions of blocks for almost no data, and
+    // an allocation for each is most of what that costs.
+    let mut targets: Vec<(usize, usize, usize)> = Vec::new();
 
     for unit in 0..units {
         if restart_interval > 0 && unit > 0 && since_restart == restart_interval {
@@ -519,16 +544,17 @@ fn decode_scan(
         }
         since_restart += 1;
 
-        let targets = if interleaved {
-            mcu_targets(frame, header, planes, mcus_across, unit)
+        targets.clear();
+        if interleaved {
+            mcu_targets(frame, header, planes, mcus_across, unit, &mut targets);
         } else {
             let (index, _, _) = header.components[0];
             let row = unit / planes[index].across;
             let col = unit % planes[index].across;
-            vec![(index, row * planes[index].stride + col, 0usize)]
-        };
+            targets.push((index, row * planes[index].stride + col, 0usize));
+        }
 
-        for (index, at, slot) in targets {
+        for &(index, at, slot) in &targets {
             if at >= planes[index].blocks.len() {
                 continue;
             }
@@ -579,9 +605,7 @@ fn decode_baseline_block(
     ac: &Huffman,
     predictor: &mut i32,
 ) -> Result<(), DctError> {
-    let category = reader.decode(dc)? as u32;
-    *predictor += extend(reader.receive(category), category);
-    block[0] = *predictor;
+    block[0] = read_dc(reader, dc, predictor)?;
 
     let mut k = 1usize;
     while k < 64 {
@@ -610,6 +634,20 @@ fn decode_baseline_block(
     Ok(())
 }
 
+/// One DC difference, added to the running total and returned.
+///
+/// The table supplies the category from the file, so it can name any byte, and the
+/// total runs on for as many blocks as the file declares. Neither is a number that
+/// can be trusted to fit.
+fn read_dc(reader: &mut BitReader, dc: &Huffman, predictor: &mut i32) -> Result<i32, DctError> {
+    let category = reader.decode(dc)? as u32;
+    if category > MAX_CATEGORY {
+        return Err(DctError::BadHuffmanCode);
+    }
+    *predictor = predictor.wrapping_add(extend(reader.receive(category), category));
+    Ok(*predictor)
+}
+
 /// The first scan to carry DC, at reduced precision.
 fn decode_dc_first(
     reader: &mut BitReader,
@@ -618,9 +656,7 @@ fn decode_dc_first(
     predictor: &mut i32,
     low: u32,
 ) -> Result<(), DctError> {
-    let category = reader.decode(dc)? as u32;
-    *predictor += extend(reader.receive(category), category);
-    block[0] = *predictor << low;
+    block[0] = read_dc(reader, dc, predictor)? << low;
     Ok(())
 }
 
@@ -718,7 +754,7 @@ fn decode_ac_refine(
                     // Already non-zero, so this scan only says whether to nudge
                     // it. Zero-history slots are what the run counts.
                     if reader.bit() == 1 && (block[k] & plus) == 0 {
-                        block[k] += if block[k] >= 0 { plus } else { minus };
+                        nudge(&mut block[k], plus, minus);
                     }
                 } else {
                     if run == 0 {
@@ -741,7 +777,7 @@ fn decode_ac_refine(
         // already there still take their correction bits.
         while k <= header.spectral_end {
             if block[k] != 0 && reader.bit() == 1 && (block[k] & plus) == 0 {
-                block[k] += if block[k] >= 0 { plus } else { minus };
+                nudge(&mut block[k], plus, minus);
             }
             k += 1;
         }
@@ -749,6 +785,32 @@ fn decode_ac_refine(
     }
 
     Ok(())
+}
+
+/// Adds one more bit of precision to a coefficient, away from zero. Wrapping, since a
+/// file may refine one coefficient as many times as it has scans.
+fn nudge(coefficient: &mut i32, plus: i32, minus: i32) {
+    *coefficient = coefficient.wrapping_add(if *coefficient >= 0 { plus } else { minus });
+}
+
+/// Blocks a frame's planes will hold, once that is known to be a number a file of
+/// this length could justify.
+///
+/// Every block takes at least one bit of entropy data, whichever way it is coded, so
+/// a frame with more blocks than the file has bits is not a truncated image. It is a
+/// 17-byte file asking for seventeen gigabytes. A block count that does not fit a
+/// `usize` is the same claim, in the form that wraps in WASM.
+fn check_block_count(frame: &Frame, mcus_across: usize, mcus_down: usize, file_len: usize) -> Result<(), DctError> {
+    let total = frame.components.iter().try_fold(0usize, |sum, c| {
+        let across = mcus_across.checked_mul(c.horizontal)?;
+        let down = mcus_down.checked_mul(c.vertical)?;
+        sum.checked_add(across.checked_mul(down)?)
+    });
+
+    match total {
+        Some(blocks) if blocks <= MAX_BLOCKS && blocks <= file_len.saturating_mul(8) => Ok(()),
+        _ => Err(DctError::TooLarge),
+    }
 }
 
 /// Decodes every scan into quantized coefficients.
@@ -781,6 +843,7 @@ pub fn coefficients(file: &[u8]) -> Result<Coefficients, DctError> {
                 let v_max = read.components.iter().map(|c| c.vertical).max().unwrap();
                 let mcus_across = read.width.div_ceil(8 * h_max);
                 let mcus_down = read.height.div_ceil(8 * v_max);
+                check_block_count(&read, mcus_across, mcus_down, file.len())?;
 
                 planes = read
                     .components
@@ -806,6 +869,13 @@ pub fn coefficients(file: &[u8]) -> Result<Coefficients, DctError> {
                 let Some(ref frame) = frame else {
                     return Err(DctError::NoFrame);
                 };
+
+                // What the scans so far wrote is still worth reading, and no less
+                // honest than a file that was cut short.
+                if scans >= MAX_SCANS {
+                    truncated = true;
+                    break;
+                }
 
                 let header = read_scan_header(file, *segment, frame)?;
 

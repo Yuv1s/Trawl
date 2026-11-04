@@ -299,6 +299,104 @@ fn reports_duration_from_the_frame_count() {
 }
 
 #[test]
+fn a_chunk_length_that_wraps_a_32_bit_offset_ends_the_walk() {
+    // A 36-byte file. In WASM 12 + 8 + 0xfffffff8 wraps to 12, which reads as a
+    // complete chunk, and adding the same length to the offset leaves it where it
+    // was, so the walk pushed entries until memory ran out.
+    let mut file = b"RIFF".to_vec();
+    file.extend_from_slice(&1000u32.to_le_bytes());
+    file.extend_from_slice(b"WAVEabcd");
+    file.extend_from_slice(&0xffff_fff8u32.to_le_bytes());
+    file.extend_from_slice(&[0u8; 16]);
+    assert_eq!(file.len(), 36);
+
+    let listed = chunks(&file).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(!listed[0].complete);
+    assert!(structure_json(&file).contains("\"complete\":false"));
+}
+
+#[test]
+fn every_length_near_the_top_of_32_bits_ends_the_walk() {
+    for length in [0xffff_ffffu32, 0xffff_fffe, 0xffff_ffec, 0xffff_ffe0] {
+        let mut file = mono16(&[1, 2, 3, 4]);
+        let data_at = file.len() - 8 - 4;
+        file[data_at..data_at + 4].copy_from_slice(&length.to_le_bytes());
+
+        let listed = chunks(&file).unwrap();
+        assert_eq!(listed.len(), 2, "length {length:#x}");
+        assert!(!listed[1].complete);
+        assert_eq!(parse(&file).unwrap().frames, 4);
+    }
+}
+
+#[test]
+fn a_data_length_of_all_ones_in_a_streamed_riff_is_one_incomplete_chunk() {
+    // The arithmetic has to refuse it rather than wrap to something in bounds.
+    let mut file = b"RIFF".to_vec();
+    file.extend_from_slice(&u32::MAX.to_le_bytes());
+    file.extend_from_slice(b"WAVEdata");
+    file.extend_from_slice(&u32::MAX.to_le_bytes());
+    file.extend_from_slice(&[1, 2, 3, 4]);
+
+    let listed = chunks(&file).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(!listed[0].complete);
+}
+
+#[test]
+fn a_streamed_file_is_not_reported_as_all_trailing() {
+    // 8 + 0xffffffff wraps to 7 in WASM, so the whole file sat past the declared end.
+    let mut file = mono16(&[10, 20, 30, 40]);
+    let data_at = file.len() - 8 - 4;
+    file[data_at..data_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    file[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+
+    let wav = parse(&file).unwrap();
+    assert_eq!(wav.trailing, None);
+    assert_eq!(wav.frames, 4);
+    assert!(structure_json(&file).contains("\"trailing\":null"));
+
+    assert_eq!(declared_end(&file), Ok(None));
+    file[4..8].copy_from_slice(&0u32.to_le_bytes());
+    assert_eq!(declared_end(&file), Ok(None));
+}
+
+#[test]
+fn a_data_length_of_zero_means_the_rest_of_the_file() {
+    // Streamed writers leave zero here as often as 0xffffffff, and the comment said
+    // so while the arithmetic returned no frames at all.
+    let mut file = mono16(&[10, 20, 30, 40]);
+    let data_at = file.len() - 8 - 4;
+    file[data_at..data_at + 4].copy_from_slice(&0u32.to_le_bytes());
+    file[4..8].copy_from_slice(&0u32.to_le_bytes());
+
+    let wav = parse(&file).unwrap();
+    assert_eq!(wav.frames, 4);
+    assert_eq!(wav.data_length, 8);
+    assert_eq!(wav.trailing, None);
+    assert_eq!(integer_samples(&file, &wav).unwrap(), vec![10, 20, 30, 40]);
+    assert_eq!(
+        wav.chunks.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        vec!["fmt ", "data"],
+        "samples must not be walked as chunks"
+    );
+}
+
+#[test]
+fn a_data_length_of_zero_with_a_real_chunk_after_it_is_empty() {
+    let file = riff(&[
+        (b"fmt ", fmt_chunk(PCM, 1, 8000, 16)),
+        (b"data", Vec::new()),
+        (b"LIST", b"INFOICMTnothing to see".to_vec()),
+    ]);
+
+    let wav = parse(&file).unwrap();
+    assert_eq!(wav.frames, 0);
+    assert_eq!(wav.data_length, 0);
+}
+
+#[test]
 fn does_not_read_text_out_of_the_audio_itself() {
     let mut samples = vec![0i16; 200];
     for (i, b) in b"flag{not_a_real_find}".iter().enumerate() {

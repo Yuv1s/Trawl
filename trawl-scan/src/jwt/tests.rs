@@ -99,6 +99,60 @@ fn forges_an_admin_token_that_verifies_with_the_key() {
 #[test]
 fn a_wrong_key_is_never_accepted() {
     let token = parse(OBSERVER).unwrap();
-    let wrong = vec![b"the-wrong-key".to_vec(), b"admin".to_vec(), b"secret".to_vec()];
+    let wrong = vec![
+        b"the-wrong-key".to_vec(),
+        b"admin".to_vec(),
+        b"secret".to_vec(),
+    ];
     assert!(recover_key(&token, &wrong).is_none());
+}
+
+#[test]
+fn forging_preserves_a_nested_claim() {
+    // A payload with a nested object. The old splice cut the string at its first
+    // trailing brace, forging invalid JSON; the forged payload must parse and keep
+    // the nested claim intact while naming an administrator.
+    let key = b"secret";
+    let header_b64 = "eyJhbGciOiJIUzI1NiJ9";
+    let payload_b64 = b64url_encode(br#"{"user":{"id":1,"name":"ava"},"role":"user"}"#);
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let sig = hmac_sha256(key, signing_input.as_bytes());
+    let token_str = format!("{signing_input}.{}", b64url_encode(&sig));
+    let token = parse(&token_str).unwrap();
+
+    let forged = parse(&forge_admin(&token, key)).expect("forged token does not parse");
+    let claims: serde_json::Value =
+        serde_json::from_slice(&forged.payload).expect("forged payload is not valid JSON");
+
+    assert_eq!(claims["role"], "admin");
+    assert_eq!(claims["admin"], true);
+    // The nested object survived rather than being truncated at its first brace.
+    assert_eq!(claims["user"]["id"], 1);
+    assert_eq!(claims["user"]["name"], "ava");
+}
+
+#[test]
+fn find_tokens_is_bounded_on_a_hostile_body() {
+    // A body that is nothing but repeated token-shaped runs must not be parsed
+    // without limit: the output is capped and a repeat is verified once.
+    let one = OBSERVER.as_bytes();
+    let mut body = Vec::new();
+    for _ in 0..5000 {
+        body.extend_from_slice(one);
+        body.push(b' ');
+    }
+    let found = find_tokens(&body);
+    // The same token repeated collapses to one, well under the cap.
+    assert_eq!(found, vec![OBSERVER.to_string()]);
+
+    // Many distinct token-shaped runs are held to the cap rather than all kept.
+    let mut many = Vec::new();
+    for i in 0..(MAX_TOKENS * 4) {
+        let payload_b64 = b64url_encode(format!(r#"{{"n":{i}}}"#).as_bytes());
+        let signing_input = format!("eyJhbGciOiJIUzI1NiJ9.{payload_b64}");
+        let sig = hmac_sha256(b"k", signing_input.as_bytes());
+        many.extend_from_slice(format!("{signing_input}.{}", b64url_encode(&sig)).as_bytes());
+        many.push(b'\n');
+    }
+    assert!(find_tokens(&many).len() <= MAX_TOKENS);
 }

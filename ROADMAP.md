@@ -1,6 +1,7 @@
 # Roadmap
 
-Where Trawl is. Checked means built, tested, and working in the browser today.
+Where Trawl is. Checked means built, tested, and working today: in the browser,
+or on your own machine for Remora's scanner.
 
 ## Done
 
@@ -8,7 +9,8 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 
 - [x] PNG, all colour types and bit depths, interlaced or not
 - [x] BMP and GIF, every frame of an animation and the difference between each
-      pair, each run through the steganography detectors in their own right
+      pair, each one run through the steganography detectors as an image of
+      its own
 - [x] WAV, 8 through 32-bit, mono or multichannel
 - [x] JPEG structure, and the compressed numbers underneath it, baseline or
       progressive
@@ -18,26 +20,26 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 
 - [x] ZIP archives, read twice and compared. A zip describes itself in a local
       header before each file and again in a central directory at the end, and
-      readers only consult the directory, so the two disagreeing is how an
-      archive hides something. Reports entries the directory never lists,
-      sizes and checksums the two copies argue about, bytes before the first
-      header, bytes appended past the end, and the comments nothing shows
+      readers only consult the directory, so a disagreement between the two is
+      how an archive hides something. Trawl reports entries the directory never
+      lists, sizes and checksums the two copies argue about, bytes before the
+      first header, bytes appended past the end, and the comments nothing shows
 - [x] Reading inside the archive too: each entry inflated and scanned, so a flag
       in a file inside the zip, including one appended to a PNG, shows in place
       without saving it out and unzipping it first
-- [x] Recursive embedded-file analysis: ZIP entries and carved files are
-      automatically scanned through the same pipelines. A shared budget limits
-      depth (3), total children (32), per-child bytes (1 MiB), and aggregate
-      bytes (8 MiB). Skipped and errored children are reported in place.
+- [x] Recursive embedded-file analysis: ZIP entries and carved files go through
+      the same pipelines automatically. A shared budget limits depth (3), total
+      children (32), per-child bytes (1 MiB), and aggregate bytes (8 MiB).
+      Skipped and errored children are reported in place.
 - [x] PDF documents, walked the way a ZIP is: every object found independent of
       the cross-reference table, then the table read separately and compared.
       An object the table no longer points at is a leftover from an earlier
       revision that a reader would never open. Streams are inflated the same
-      way a compressed PNG chunk is, so a flag hiding in one is read rather
-      than reported as unread; the document's own `/Info` metadata, whether it
+      way a compressed PNG chunk is, so a flag hiding in one gets read, not
+      just reported as unread. The document's own `/Info` metadata, whether it
       is encrypted, and what it attaches are read too. A cross-reference stream
-      rather than the classic table is detected but not decoded, so an object's
-      standing against it is left unmarked rather than guessed at
+      in place of the classic table is detected but not decoded, so an object's
+      standing against it stays unmarked and Trawl does not guess
 
 - [x] ELF binaries, read for what their own tables declare: the header, the
       section table, the segments the loader maps, the libraries needed, and
@@ -48,29 +50,29 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
       decision to make and not a claim the binary made. Nothing is
       disassembled: what the code does is a different question, and answering
       it wants a tool built around a session that outlasts one file
-- [x] PE binaries, the Windows half of the same reading, converging on the
-      same shape so one panel reads both. Where ELF names a table by where it
-      sits in the file, PE names almost everything by where it lands in
-      memory, so every read goes through the section table to translate
-      between the two. What one format carries and the other has no
-      counterpart for is reported as absent rather than filled in: a PE has
-      nothing RELRO would describe, and saying "none" there would report a
-      defence as missing that was never available to it
+- [x] PE binaries, the Windows half of the same reading, brought to the same
+      shape so one panel reads both. Where ELF names a table by where it sits
+      in the file, PE names almost everything by where it lands in memory, so
+      every read goes through the section table to translate between the two.
+      What one format carries and the other has no counterpart for is reported
+      as absent and never filled in: a PE has nothing RELRO would describe, and
+      saying "none" there would report a defence as missing that was never
+      available to it
 
 - [x] Windows registry hives, for tracing which USB stick was plugged in
       when. Every other format here describes itself in a table; a hive is a
       tree of cells pointing at each other by byte offset, so it is walked
-      from the root rather than listed. What makes one worth reading is that
-      every key carries the time it was last written, and the keys Windows
-      touches when a device is connected are therefore the best evidence in
-      the file for when a stick was last plugged in. Reported as that and no
-      more: it is not a connection log, nothing says a device was ever
-      removed, and a driver can rewrite a key without anyone touching a port.
-      The one thing inferred outright is the serial, because the rule is
-      exact rather than probabilistic: an ampersand in the second position of
-      an instance identifier means the device reported no serial and Windows
-      generated one, so it names the port rather than the stick and does not
-      follow it between machines
+      from the root rather than listed. Every key carries the time it was last
+      written, which is what makes a hive worth reading: the keys Windows
+      touches when a device is connected are the best evidence in the file for
+      when a stick was last plugged in. Trawl reports them as that and no more.
+      A hive is not a connection log, nothing says a device was ever removed,
+      and a driver can rewrite a key without anyone touching a port. The one
+      thing inferred outright is the serial, because the rule is exact, not
+      probabilistic: an ampersand in the second position of an instance
+      identifier means the device reported no serial and Windows generated one,
+      so that serial names the port, not the stick, and does not follow the
+      stick between machines
 - [x] SQLite databases, read for their tables and rows, and for the rows that
       were deleted but never left. A raw scan already finds a flag sitting in
       a database; this says which table a row was in, and whether it is one a
@@ -79,8 +81,8 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
       where a deleted row's bytes sit until something reuses them. Deleting a
       row overwrites its first four bytes with the freeblock's own header, so
       the leading column is usually gone, but the surviving column types and
-      values exactly fill the freed space, and that is the handle used to carve
-      the record back out
+      values exactly fill the freed space, and that fit is the handle used to
+      carve the record back out
 - [x] Packet captures, classic pcap and pcapng, read for the protocol mix, the
       conversations, the DNS questions asked, and the reassembled TCP streams. A
       raw scan already finds a flag that sits whole inside one packet; this finds
@@ -88,8 +90,8 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
       one segment's payload is followed by the next packet's headers, so a flag
       crossing that boundary is interrupted by bytes that are not part of it.
       Following the sequence numbers and laying the payloads back in order is the
-      only way it reads again, and the same reassembly surfaces a whole file
-      carried over a connection, its signature sitting mid-packet
+      only way it reads again, and the same reassembly finds a whole file carried
+      over a connection, its signature sitting mid-packet
 
 ### Cuttlefish, the steganography half
 
@@ -102,34 +104,33 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 - [x] Spectrogram, for pictures drawn into sound
 - [x] JSteg extraction from JPEG coefficients
 - [x] Coefficient statistics, with the value counts shown
-- [x] AES-CBC run on a file that carries its own key. The hex key and IV out of
-      the metadata, the base64 payload from nearby, tried across the key sizes and
-      shown only when the result reads as text. A wrong key turns AES into noise,
-      so a file with no key in it stays silent, and the cipher is written out here
-      the same as every other, nothing pulled in
+- [x] AES-CBC run on a file that carries its own key. The hex key and IV come
+      out of the metadata and the base64 payload from nearby, tried across the
+      key sizes and shown only when the result reads as text. A wrong key turns
+      AES into noise, so a file with no key in it stays silent. The cipher is
+      written out here the same as every other, with nothing pulled in
 
 ### Mantis, the cryptography half
 
-- [x] Spot an encoding and peel it, over and over, until plain text falls out,
-      and keep going through compression: when a layer peels to a gzip or zlib
-      stream, the layer is inflated in the browser and peeled after, within the
-      same layer budget, until plain text falls out
+- [x] Spot an encoding and peel it, over and over, until plain text falls out.
+      Compression does not stop it: a layer that peels to a gzip or zlib stream
+      is inflated in the browser and peeled in turn, within the same layer
+      budget
 - [x] Sixteen encodings: base64, base58, base32, ascii85, hex, morse, binary,
       uuencode, quoted-printable and the rest
 - [x] Bacon and Polybius, the classical ciphers that need no key: five A/B
       symbols to a letter, or pairs of one-to-five digits through the 5x5
-      square. Their ciphertext reads as plainly as the plaintext to a letter
-      scorer, so they are taken by the same greedy unwrap the structural
-      encodings use rather than the readability search, and the unwrap stops
-      once it lands on a word so a short decode is not eaten again as base64
-- [x] Brainfuck, run rather than decoded: the program is the ciphertext and
-      what it prints is the answer, on a bounded tape with a cap on steps and
-      output
-- [x] Caesar, solved rather than applied: every shift tried, the readable one
-      kept
+      square. To a letter scorer their ciphertext reads as plainly as the
+      plaintext, so they go to the same greedy unwrap the structural encodings
+      use rather than the readability search. The unwrap stops once it lands on
+      a word, so a short decode is not eaten again as base64
+- [x] Brainfuck, run and not decoded: the program is the ciphertext and what it
+      prints is the answer, on a bounded tape with a cap on steps and output
+- [x] Caesar, solved without being given a shift: every shift tried, the
+      readable one kept
 - [x] XOR key recovery, single byte and repeating key, with the key length
-      worked out rather than asked for
-- [x] Hash identification, which names every format a shape allows rather than
+      worked out and never asked for
+- [x] Hash identification, which names every format a shape allows instead of
       picking one and sounding sure
 - [x] A crib attack on flag shapes. No cipher here enciphers punctuation, so the
       braces of `flag{...}` survive being encrypted and the letters in front of
@@ -137,10 +138,10 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
       positions by subtraction and leaves a handful to search exhaustively, which
       reaches keys no amount of counting or climbing could: a six letter key out
       of twelve letters, two per position
-- [x] Cribs ranked by what they had to get right rather than by how the answer
-      reads. A tag longer than the key reaches some position twice and has to
-      agree with itself, and a wrong guess almost never does. That check is the
-      only part of a crib that could have failed, so it is the only part that is
+- [x] Cribs ranked by what they had to get right, never by how the answer reads.
+      A tag longer than the key reaches some position twice and has to agree
+      with itself, and a wrong guess almost never does. That check is the only
+      part of a crib that could have failed, so it is the only part that is
       evidence, and it decides. Readability cannot: `testCTF{W3lc0me2DaD@sh}` is
       a correct answer that reads like nothing at all
 - [x] Layers, one key at a time. Two keys applied in turn are one cipher with a
@@ -166,26 +167,27 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 - [x] Playfair's grid, enciphered and deciphered, but not solved blind: a single
       swap in the key square changes almost every digraph it produces, so
       nothing short of the exact grid reads, and no realistic search finds one
-      grid out of 25! by trying swaps. Measured rather than assumed, and applied
-      in the key box instead, the same as a Vigenère guess
+      grid out of 25! by trying swaps. That was measured, not assumed. A grid is
+      applied in the key box instead, the same as a Vigenère guess
 - [x] Transposition, rail fence and columnar, where the letters were never
       changed and only moved
 - [x] Columnar transposition wider than eight columns, where trying every
       arrangement stops being possible: the order is built up instead, a few
-      chunks at a time by which trigrams continue best, several candidate
-      starts kept alive rather than committed to the first one, then polished
-      by the same kind of swap a narrower grid solves outright. Needs enough
-      rows per column to say anything at all, and says nothing rather than
-      guessing below that
-- [x] Simple substitution, climbed rather than counted, against a trigram census
-      of English measured from a corpus and committed as text
+      chunks at a time by which trigrams continue best, with several candidate
+      starts kept alive and no commitment to the first one, then polished by
+      the same kind of swap a narrower grid solves outright. It needs enough
+      rows per column to say anything at all, and below that it says nothing
+      and does not guess
+- [x] Simple substitution, solved by climbing and not by counting, against a
+      trigram census of English measured from a corpus and committed as text
 - [x] A letter frequency table, with the index of coincidence and every repeated
       pair and triple, for when no attack fires and the shape is the answer
-- [x] A list of keys worked out of the text when you have none. Not common keys
-      looked up: each is what falls out of splitting the letters into that many
-      columns and counting each one, so a different ciphertext gives entirely
-      different keys. Shown with how many letters each column had, since that is
-      what decides whether a key is worth anything. Clicking one applies it
+- [x] A list of keys worked out of the text when you have none. Each is what
+      falls out of splitting the letters into that many columns and counting
+      each one, with no list of common keys behind it, so a different ciphertext
+      gives entirely different keys. Keys are shown with how many letters each
+      column had, since that decides whether a key is worth anything. Clicking
+      one applies it
 - [x] A key box, for the keys no amount of text would give up. Vigenère needs
       about sixty letters before its columns say anything, and a short puzzle has
       neither that nor an answer a scorer could confirm, so a supplied key is
@@ -195,8 +197,7 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 - [x] Every rotation laid out when nothing reads, letters, digits and letters
       together, Atbash and reversed, ordered by which of them decode onward.
       Answers that are tokens or keys read like nothing, and against those the
-      scorer is blind rather than wrong, so it stops guessing and hands over the
-      list
+      scorer is blind, not wrong, so it stops guessing and hands over the list
 - [x] RSA: small exponent, close primes, a shared prime between two keys, and a
       private exponent chosen too small
 
@@ -211,7 +212,7 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 - [x] A scanner started with one line per system, which downloads a prebuilt
       binary, checks it against a published checksum, and runs it on your own
       machine; the page finds it on its own and switches to a box for the target.
-      No repository, no toolchain, nothing uploaded
+      It takes no repository and no toolchain, and nothing is uploaded
 - [x] A token and a single allowed origin, both chosen when the scanner starts,
       required on every request. The scanner is a service on your loopback, and
       this keeps another page on the same machine from turning it into a proxy of
@@ -232,12 +233,12 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
       in a new tab against the same tools a dropped picture gets, so the offline
       half reads a picture off a URL exactly as it reads one off a disk and still
       never touches the network itself
-- [x] Active checks, off until you affirm you may test the target, since this is
-      the half that sends rather than reads: a quote in a parameter to draw out an
-      error, a privilege field into an update, the current time into a window that
-      only opens for now, an internal marker into a header. Wordlist-driven, held
-      to the target's own host, and bounded by a timeout so a stalling endpoint
-      cannot hang the scan
+- [x] Active checks, off until you affirm you may test the target, since this
+      half sends where the rest only reads: a quote in a parameter to draw out
+      an error, a privilege field into an update, the current time into a window
+      that only opens for now, an internal marker into a header. They are
+      wordlist-driven, held to the target's own host, and bounded by a timeout
+      so a stalling endpoint cannot hang the scan
 - [x] A box for your own leads, each woven into every position at once, an
       endpoint, a parameter, a field and a header, on top of the built-in list, so
       a name you suspect is tried wherever it might belong without your having to
@@ -247,32 +248,34 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
       token's own signature, whether the site leaked the key in the token's own
       payload or left a weak one a short list guesses. With the key in hand a
       fresh token that names an administrator is signed and replayed against the
-      endpoints that answered. SHA-256 and HMAC are written out here too, nothing
-      borrowed
+      endpoints that answered. SHA-256 and HMAC are written out here too, with
+      nothing borrowed
 - [x] Flows that take more than one request. Every other active check is one
       request in and one response out, so a flag behind a session stays out of
       reach: the endpoint that holds it answers only to something another
       endpoint handed over first. This reads each response for a value the site
       issued, a cookie it set or a token it named, and carries it to every
       endpoint that answered, as a cookie and as a bearer credential both, since
-      a site takes one where another expects the other. The same shape as the
-      forging pass and run beside it, except the value is one the site gave out
-      rather than one forged from a key it leaked. A JWT is left to the forging
-      pass, which reaches further than replaying the token as sent
+      a site takes one where another expects the other. It has the same shape as
+      the forging pass and runs beside it, except the site gave this value out,
+      where the forging pass makes one from a key the site leaked. A JWT is left
+      to the forging pass, which reaches further than replaying the token as
+      sent
 
 ### Onboarding and reporting
 
 - [x] A short guided tour on first load, walking through what to drop in and
       what to look for, using example files it builds in your browser
-- [x] Seven demo and practice files, runnable or downloadable anytime from the
-      page: three generated flag samples, a picture drawn into a WAV
-      spectrogram, that WAV with text in its low bits, and a clean/modified PNG
-      pair for checking duplicate palette entries
+- [x] A library of 57 demo and practice files in twelve labelled groups,
+      runnable or downloadable anytime from the page: three generated flag
+      samples, a picture drawn into a WAV spectrogram, that WAV with text in its
+      low bits, a clean/modified PNG pair for checking duplicate palette
+      entries, and the rest of the corpus under `static/samples/`
 - [x] A list of flag shapes that detectors report against, `flag{`, `CTF{`,
       `key{` and more, edited in the header and saved with the page
 - [x] A Markdown writeup of the whole analysis, taken to the clipboard or saved
-      as a file, with every candidate and finding listed and generated on your
-      machine, nothing uploaded
+      as a file, with every candidate and finding listed. It is generated on
+      your machine and nothing is uploaded
 
 ## Next
 
@@ -283,7 +286,7 @@ Where Trawl is. Checked means built, tested, and working in the browser today.
 
 ### Forensics
 
-Nothing open here.
+There is nothing to do here right now.
 
 ### Steganography still open
 
@@ -295,7 +298,7 @@ Nothing open here.
 
 ## Not planned
 
-No accounts, no cloud storage, no history, no sharing.
+Trawl will not get accounts, cloud storage, history or sharing.
 
 No pwn. It needs a live server to hold onto, which a page in your browser cannot
 give it. Web challenges are in reach now, through Remora, but only because Remora

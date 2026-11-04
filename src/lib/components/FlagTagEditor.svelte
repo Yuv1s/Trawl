@@ -41,8 +41,8 @@
 	</form>
 
 	<p class="hint">
-		A named format matches first and steers key recovery; unlabelled&nbsp;&lbrace;…&rbrace; shapes
-		still match on shape alone.
+		The Cod-end lists flags whose tag ends in one of these, so CTF also covers testCTF, and key
+		recovery looks for them. With an empty list it lists any tag&lbrace;…&rbrace; shape.
 	</p>
 </div>
 

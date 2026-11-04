@@ -9,6 +9,7 @@ import init, {
 	plane_wall,
 	png_idat,
 	png_palette,
+	png_patch_ihdr,
 	png_structure,
 	jpeg_stego,
 	jpeg_stego_extract,
@@ -95,11 +96,16 @@ const RECURSION_MAX_DEPTH = 3; // below the root file
 const RECURSION_MAX_CHILDREN = 32; // total children analysed across the tree
 const RECURSION_PER_CHILD_LIMIT = 1 << 20; // 1 MiB per child (decompressed or carved)
 const RECURSION_AGGREGATE_LIMIT = 8 << 20; // 8 MiB aggregate bytes expanded
+
+/** The file someone actually dropped gets far more room than a child inside it: a
+ *  1000x1000 RGB image is already 3 MB of pixels. Still bounded, since a tiny PNG can
+ *  claim to inflate to anything. */
+const ROOT_PIXEL_LIMIT = 256 << 20;
 const ZIP_TEXT_PREVIEW = 8192;
 
 /** Deterministic fingerprint for dedup: first 64 bytes + last 64 bytes + length. */
-async function inflate(bytes: Uint8Array): Promise<Uint8Array> {
-	return boundedInflate('deflate', bytes, RECURSION_PER_CHILD_LIMIT);
+async function inflate(bytes: Uint8Array, limit = RECURSION_PER_CHILD_LIMIT): Promise<Uint8Array> {
+	return boundedInflate('deflate', bytes, limit);
 }
 
 /** Raw deflate, with no zlib wrapper, which is how a ZIP stores each entry. */
@@ -152,8 +158,12 @@ function normaliseGifAnalysis(value: unknown): GifAnalysis | null {
 }
 
 /** Only PNG hands its pixel data to a platform inflate; the rest carry their own. */
-async function pixelInput(bytes: Uint8Array, isPng: boolean): Promise<Uint8Array> {
-	return isPng ? inflate(png_idat(bytes)) : new Uint8Array();
+async function pixelInput(
+	bytes: Uint8Array,
+	isPng: boolean,
+	limit = RECURSION_PER_CHILD_LIMIT
+): Promise<Uint8Array> {
+	return isPng ? inflate(png_idat(bytes), limit) : new Uint8Array();
 }
 
 /**
@@ -223,6 +233,29 @@ async function inflatePdfStreams(
 			stream.error = error instanceof Error ? error.message : String(error);
 		}
 	}
+}
+
+/** Scans each cell of a database on its own, since the columns of a row sit side by
+ *  side in the file and a flag with a word before it stops looking like a flag. */
+function flagSqliteCells(db: SqliteDatabase, flagTags: string): void {
+	const encoder = new TextEncoder();
+	const flags: NonNullable<SqliteDatabase['flags']> = [];
+
+	for (const table of db.tables) {
+		for (const [rows, deleted] of [
+			[table.rows, false],
+			[table.deleted, true]
+		] as const) {
+			for (const cell of rows.flat()) {
+				const found = JSON.parse(
+					find_flags_for_tags(encoder.encode(cell.text), flagTags)
+				) as Found[];
+				for (const { text } of found) flags.push({ text, table: table.name, deleted });
+			}
+		}
+	}
+
+	db.flags = flags;
 }
 
 /**
@@ -770,6 +803,18 @@ async function analyseRoot(
 ): Promise<{ response: AnalysisResponse; nested: NestedAnalysis; gif: GifAnalysis | null }> {
 	await ready;
 
+	const crashed: string[] = [];
+
+	/** One reader crashing on a hostile file should not cost the results of the rest. */
+	function attempt<T>(reader: string, read: () => T, fallback: T): T {
+		try {
+			return read();
+		} catch {
+			crashed.push(reader);
+			return fallback;
+		}
+	}
+
 	const context = new RecursionContext();
 
 	// Run the internal analyzer on the root file
@@ -778,26 +823,55 @@ async function analyseRoot(
 	// Now run the FULL analysis for the root (with plane wall, spectrogram, etc.)
 	// This is the original analyse logic but we need to merge findings
 	const survey = JSON.parse(file_survey(bytes)) as Survey;
-	const walked = JSON.parse(png_structure(bytes)) as Structure;
-	const structure = walked.signature ? walked : null;
+	const walked = attempt('PNG', () => JSON.parse(png_structure(bytes)) as Structure, null);
+	const structure = walked?.signature ? walked : null;
 
 	if (structure) await inflateTextChunks(bytes, structure, flagTags);
 
-	const wav = JSON.parse(wav_structure(bytes)) as WavStructure | WavError | null;
-	const zip = JSON.parse(zip_structure(bytes)) as ZipArchive | null;
+	const wav = attempt(
+		'WAV',
+		() => JSON.parse(wav_structure(bytes)) as WavStructure | WavError | null,
+		null
+	);
+	const zip = attempt('ZIP', () => JSON.parse(zip_structure(bytes)) as ZipArchive | null, null);
 	if (zip) await inflateZipEntries(bytes, zip, flagTags);
 
-	const pdf = JSON.parse(pdf_structure(bytes)) as PdfStructure | null;
+	const pdf = attempt('PDF', () => JSON.parse(pdf_structure(bytes)) as PdfStructure | null, null);
 	if (pdf) await inflatePdfStreams(bytes, pdf, flagTags);
 
-	const binary = JSON.parse(binary_structure(bytes)) as BinaryStructure | null;
-	const hive = JSON.parse(registry_hive(bytes)) as RegistryHive | null;
-	const sqlite = JSON.parse(sqlite_database(bytes)) as SqliteDatabase | null;
-	const pcap = JSON.parse(pcap_capture(bytes, flagTags)) as PcapCapture | null;
+	const binary = attempt(
+		'binary',
+		() => JSON.parse(binary_structure(bytes)) as BinaryStructure | null,
+		null
+	);
+	const hive = attempt(
+		'registry hive',
+		() => JSON.parse(registry_hive(bytes)) as RegistryHive | null,
+		null
+	);
+	const sqlite = attempt(
+		'SQLite',
+		() => JSON.parse(sqlite_database(bytes)) as SqliteDatabase | null,
+		null
+	);
+	if (sqlite) attempt('SQLite', () => flagSqliteCells(sqlite, flagTags), undefined);
+	const pcap = attempt(
+		'packet capture',
+		() => JSON.parse(pcap_capture(bytes, flagTags)) as PcapCapture | null,
+		null
+	);
 
-	const aes = JSON.parse(aes_probe(withInflatedText(bytes, structure))) as AesSolved[];
-	const jpeg = JSON.parse(jpeg_stego(bytes, SWEEP_BYTES, CHI_STEPS_JPEG)) as
-		JpegStego | JpegError | null;
+	const aes = attempt(
+		'AES',
+		() => JSON.parse(aes_probe(withInflatedText(bytes, structure))) as AesSolved[],
+		[]
+	);
+	const jpeg = attempt(
+		'JPEG',
+		() =>
+			JSON.parse(jpeg_stego(bytes, SWEEP_BYTES, CHI_STEPS_JPEG)) as JpegStego | JpegError | null,
+		null
+	);
 
 	let sweep: Sweep | null = null;
 	let wall: PlaneWall | null = null;
@@ -811,7 +885,7 @@ async function analyseRoot(
 
 	let inflated: Uint8Array = new Uint8Array();
 	try {
-		inflated = await pixelInput(bytes, structure !== null);
+		inflated = await pixelInput(bytes, structure !== null, ROOT_PIXEL_LIMIT);
 	} catch (error: unknown) {
 		pixelError = error instanceof Error ? error.message : String(error);
 	}
@@ -857,7 +931,7 @@ async function analyseRoot(
 			const json = gif_frame_analysis(bytes, flagTags, SWEEP_BYTES, CHI_STEPS);
 			gif = normaliseGifAnalysis(JSON.parse(json));
 		} catch {
-			// If the export fails, leave gif as null
+			crashed.push('GIF frame');
 		}
 	}
 
@@ -873,6 +947,7 @@ async function analyseRoot(
 	const response: AnalysisResponse = {
 		id,
 		status: 'ok',
+		crashed,
 		name,
 		size: bytes.length,
 		survey,
@@ -979,6 +1054,18 @@ async function extract(
 }
 
 /** Mantis. The only request that carries no file: a string is the whole subject. */
+/** The held file with a repaired IHDR, handed back to be analysed like any other. */
+async function patchIhdr(
+	id: number,
+	name: string,
+	width: number,
+	height: number
+): Promise<AnalysisResponse> {
+	await ready;
+	if (!cached) throw new Error('No file is loaded.');
+	return { id, status: 'patched', name, bytes: png_patch_ihdr(cached.bytes, width, height) };
+}
+
 async function peelText(id: number, text: string, flagTags: string): Promise<AnalysisResponse> {
 	await ready;
 
@@ -1177,41 +1264,52 @@ async function peelWithCompression(
 	};
 }
 
+function handle(request: AnalysisRequest): Promise<AnalysisResponse> {
+	switch (request.kind) {
+		case 'analyse':
+			return analyseRoot(
+				request.id,
+				request.name,
+				new Uint8Array(request.bytes),
+				request.flagTags
+			).then((r) => r.response);
+		case 'peel':
+			return peelText(request.id, request.text, request.flagTags);
+		case 'withKey':
+			return applyKey(request.id, request.text, request.key, request.flagTags);
+		case 'plane':
+			return requestPlane(request.id, request.channel, request.bit);
+		case 'extract':
+			return extract(request.id, request.channels, request.bit, request.msbFirst);
+		case 'extractPalette':
+			return extractPalette(request.id, request.msbFirst);
+		case 'extractJpeg':
+			return extractJpeg(request.id, request.includeDc, request.msbFirst);
+		case 'extractAudio':
+			return extractAudio(
+				request.id,
+				request.label,
+				request.channelIndex,
+				request.bit,
+				request.msbFirst
+			);
+		case 'patchIhdr':
+			return patchIhdr(request.id, request.name, request.width, request.height);
+	}
+}
+
 self.addEventListener('message', (event: MessageEvent<AnalysisRequest>) => {
 	const request = event.data;
 
-	const work =
-		request.kind === 'peel'
-			? peelText(request.id, request.text, request.flagTags)
-			: request.kind === 'withKey'
-				? applyKey(request.id, request.text, request.key, request.flagTags)
-				: request.kind === 'plane'
-					? requestPlane(request.id, request.channel, request.bit)
-					: request.kind === 'extract'
-						? extract(request.id, request.channels, request.bit, request.msbFirst)
-						: request.kind === 'extractPalette'
-							? extractPalette(request.id, request.msbFirst)
-							: request.kind === 'extractJpeg'
-								? extractJpeg(request.id, request.includeDc, request.msbFirst)
-								: request.kind === 'extractAudio'
-									? extractAudio(
-											request.id,
-											request.label,
-											request.channelIndex,
-											request.bit,
-											request.msbFirst
-										)
-									: analyseRoot(
-											request.id,
-											request.name,
-											new Uint8Array(request.bytes),
-											request.flagTags
-										).then((r) => r.response);
-
-	work
+	handle(request)
 		.then((response) => self.postMessage(response))
 		.catch((error: unknown) => {
-			const detail = error instanceof Error ? error.message : String(error);
+			const detail =
+				error instanceof WebAssembly.RuntimeError
+					? `The analysis core crashed on this file (${error.message}). That is a bug in Trawl.`
+					: error instanceof Error
+						? error.message
+						: String(error);
 			self.postMessage({
 				id: request.id,
 				status: 'error',

@@ -320,6 +320,143 @@ fn dynamic_entry(wide: bool, tag: u64, value: u64) -> Vec<u8> {
     out
 }
 
+#[test]
+fn a_string_table_with_no_terminators_does_not_hand_every_symbol_the_rest_of_it() {
+    // Three megabytes of `A` and a thousand symbols pointing into the start of it was
+    // three gigabytes of names.
+    let strings = vec![b'A'; 3 << 20];
+    let mut symbols = Vec::new();
+    for _ in 0..1100 {
+        symbols.extend_from_slice(&symbol(true, 0, 0x12, 0, 0));
+    }
+    let file = Builder::new()
+        .section(BuildSection::new(".dynsym", SHT_DYNSYM, symbols).linked(2))
+        .section(BuildSection::new(".dynstr", SHT_STRTAB, strings))
+        .build();
+
+    let binary = read(&file).unwrap();
+    assert_eq!(binary.import_count, 1100);
+    assert_eq!(binary.imports.len(), MAX_SYMBOLS);
+    assert!(binary.imports.iter().all(|s| s.name.len() == MAX_NAME));
+}
+
+#[test]
+fn an_unterminated_interpreter_path_is_cut_short_too() {
+    let file = Builder::new()
+        .section(BuildSection::new(".interp", SHT_PROGBITS, vec![b'/'; 1 << 20]))
+        .segment(BuildSegment::new(PT_INTERP, 4).over(".interp"))
+        .build();
+
+    assert_eq!(read(&file).unwrap().interpreter.unwrap().len(), MAX_NAME);
+}
+
+#[test]
+fn a_dynamic_table_naming_a_library_a_million_times_stays_bounded() {
+    let mut strings = Strings::new();
+    let name = strings.add("libc.so.6");
+    let mut dynamic = Vec::new();
+    for _ in 0..(MAX_SYMBOLS + 100) {
+        dynamic.extend_from_slice(&dynamic_entry(true, 1, name as u64));
+    }
+    dynamic.extend_from_slice(&dynamic_entry(true, 0, 0));
+
+    let file = Builder::new()
+        .section(BuildSection::new(".dynamic", SHT_DYNAMIC, dynamic).linked(2))
+        .section(BuildSection::new(".dynstr", SHT_STRTAB, strings.data))
+        .build();
+
+    assert_eq!(read(&file).unwrap().needed.len(), MAX_SYMBOLS);
+}
+
+#[test]
+fn many_sections_naming_one_symbol_table_stop_at_the_budget() {
+    // The table itself is small and honest. Sixty-five thousand section headers can
+    // each claim to be it, and each one was walked in full.
+    let mut symbols = Vec::new();
+    for _ in 0..2000 {
+        symbols.extend_from_slice(&symbol(true, 1, 0x12, 0, 0));
+    }
+    let mut file = Builder::new()
+        .section(BuildSection::new(".dynsym", SHT_DYNSYM, symbols).linked(2))
+        .section(BuildSection::new(".dynstr", SHT_STRTAB, b"\0name\0".to_vec()))
+        .build();
+
+    // Copy the section table to the end of the file with the symbol table's header
+    // repeated after it, which costs next to nothing.
+    let shoff = u64::from_le_bytes(file[40..48].try_into().unwrap()) as usize;
+    let shnum = u16::from_le_bytes(file[60..62].try_into().unwrap()) as usize;
+    let table = file[shoff..shoff + shnum * 64].to_vec();
+    let symbol_table = table[64..128].to_vec();
+
+    let moved = file.len() as u64;
+    file.extend_from_slice(&table);
+    for _ in 0..4000 {
+        file.extend_from_slice(&symbol_table);
+    }
+    file[40..48].copy_from_slice(&moved.to_le_bytes());
+    file[60..62].copy_from_slice(&((shnum + 4000) as u16).to_le_bytes());
+
+    let binary = read(&file).unwrap();
+    assert_eq!(binary.import_count, MAX_SYMBOLS_WALKED);
+}
+
+#[test]
+fn sections_that_all_read_one_header_do_not_each_carry_a_long_name() {
+    let long = "A".repeat(8192);
+    let mut file = Builder::new()
+        .section(BuildSection::new(&long, SHT_PROGBITS, vec![1]))
+        .build();
+
+    // The string table's own header, given the long name, and made the only one there
+    // is: a header size of zero reads it sixty-five thousand times over.
+    let shoff = u64::from_le_bytes(file[40..48].try_into().unwrap()) as usize;
+    let shnum = u16::from_le_bytes(file[60..62].try_into().unwrap()) as usize;
+    let names = shoff + (shnum - 1) * 64;
+    file[names..names + 4].copy_from_slice(&1u32.to_le_bytes());
+    file[40..48].copy_from_slice(&(names as u64).to_le_bytes());
+    file[58..60].copy_from_slice(&0u16.to_le_bytes());
+    file[60..62].copy_from_slice(&u16::MAX.to_le_bytes());
+
+    let binary = read(&file).unwrap();
+    assert_eq!(binary.sections.len(), u16::MAX as usize);
+    assert!(binary.sections.iter().all(|section| section.name.len() == MAX_SECTION_NAME));
+}
+
+#[test]
+fn an_offset_too_large_to_address_reads_nothing_rather_than_its_low_half() {
+    assert_eq!(address(0x40), 0x40);
+    assert_eq!(address(u64::MAX), usize::try_from(u64::MAX).unwrap_or(usize::MAX));
+
+    // The section header table's offset, at the top of 64 bits.
+    let mut file = Builder::new().build();
+    file[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert!(read(&file).unwrap().sections.is_empty());
+
+    let mut file = Builder::new().build();
+    file[32..40].copy_from_slice(&0xffff_ffff_ffff_fff8u64.to_le_bytes());
+    file[56..58].copy_from_slice(&4u16.to_le_bytes());
+    assert!(read(&file).unwrap().segments.is_empty());
+}
+
+#[test]
+fn every_size_near_the_top_of_32_bits_ends_a_walk() {
+    let (table, names) = dynsym(true, &[("puts", 0x12, 0, 0)]);
+    let file = Builder::new().section(table.linked(2)).section(names).build();
+    let binary = read(&file).unwrap();
+    assert_eq!(binary.import_count, 1);
+
+    // Each section header's size and offset fields, set to wrap a 32-bit address.
+    let shoff = u64::from_le_bytes(file[40..48].try_into().unwrap()) as usize;
+    for field in [24usize, 32] {
+        for section in 1..3 {
+            let mut bad = file.clone();
+            let at = shoff + section * 64 + field;
+            bad[at..at + 8].copy_from_slice(&0xffff_fff8u64.to_le_bytes());
+            assert!(read(&bad).is_some());
+        }
+    }
+}
+
 const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;

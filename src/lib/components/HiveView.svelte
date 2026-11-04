@@ -27,9 +27,8 @@
 				<li class="flagged">
 					<span class="mono big">{model(device)}</span>
 					<span class="muted">
-						last written <span class="mono"
-							>{device.lastWritten || 'at a time the key does not say'}</span
-						>, out of <span class="mono">{device.source}</span>
+						last written <span class="mono">{device.lastWritten || 'at an unknown time'}</span>,
+						from <span class="mono">{device.source}</span>
 					</span>
 				</li>
 			{/each}
@@ -41,8 +40,8 @@
 					This hive keeps device history and has none in it. Nothing was ever plugged into the
 					machine it came from, or the keys were cleared.
 				{:else}
-					A {hive.kind} does not keep USB history, so there is nothing here to find. The hive that does
-					is SYSTEM, and the per-user half of it is in an NTUSER.DAT.
+					A {hive.kind} does not keep USB history, so there is nothing here to find. The SYSTEM hive keeps
+					it, and NTUSER.DAT holds the per-user part.
 				{/if}
 			</p>
 			{#if hive.searched.length > 0}
@@ -90,7 +89,7 @@
 								<div class="muted sub">{device.friendlyName}</div>
 							{/if}
 						</td>
-						<td class="mono muted">{device.revision || '—'}</td>
+						<td class="mono muted">{device.revision || '-'}</td>
 						<td>
 							<span class="mono name">{device.serial}</span>
 							{#if device.generatedSerial}
@@ -101,7 +100,7 @@
 								>
 							{/if}
 						</td>
-						<td class="mono">{device.lastWritten || '—'}</td>
+						<td class="mono">{device.lastWritten || '-'}</td>
 						<td class="mono muted">{device.source}</td>
 					</tr>
 				{/each}
@@ -111,7 +110,9 @@
 
 	{#if hive.top.length > 0}
 		<table>
-			<caption class="label">{hive.top.length} keys at the root</caption>
+			<caption class="label">
+				{hive.top.length} key{hive.top.length === 1 ? '' : 's'} at the root
+			</caption>
 			<thead>
 				<tr>
 					<th scope="col" class="label">Key</th>
@@ -121,12 +122,12 @@
 				</tr>
 			</thead>
 			<tbody>
-				{#each hive.top as key (key.name)}
+				{#each hive.top as key, i (i)}
 					<tr>
 						<td><span class="mono name">{key.name}</span></td>
 						<td class="mono num">{key.subkeys.toLocaleString()}</td>
 						<td class="mono num">{key.values.toLocaleString()}</td>
-						<td class="mono muted">{key.written || '—'}</td>
+						<td class="mono muted">{key.written || '-'}</td>
 					</tr>
 				{/each}
 			</tbody>
@@ -134,12 +135,12 @@
 	{/if}
 
 	<p class="footnote">
-		A timestamp here is when Windows last wrote the key, which for a device key is normally a
-		connection and occasionally a driver doing something else. It is evidence of when, not a log of
-		what: nothing in a hive says a device was ever unplugged.
+		A timestamp here is when Windows last wrote the key. For a device key that usually means a
+		connection, and occasionally a driver doing something else. A hive keeps no record of a device
+		being unplugged.
 		{#if devices.some((d) => d.generatedSerial)}
-			A serial marked as not the device's own was invented by Windows because the device reported
-			none, so it belongs to the port it was plugged into rather than travelling with the stick.
+			Windows generated any serial marked as not the device's own, because the device reported none.
+			It identifies the port and does not follow the stick to other machines.
 		{/if}
 	</p>
 </div>

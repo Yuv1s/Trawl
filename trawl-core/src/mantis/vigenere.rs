@@ -16,13 +16,8 @@
 //! No quadgram table is needed for any of this, which is why this arrives before
 //! simple substitution does. Substitution has no columns to split into.
 
-use super::{ngram, plainness};
-
-/// English letter frequencies, in percent, a through z.
-const ENGLISH: [f32; 26] = [
-    8.167, 1.492, 2.782, 4.253, 12.702, 2.228, 2.015, 6.094, 6.966, 0.153, 0.772, 4.025, 2.406,
-    6.749, 7.507, 1.929, 0.095, 5.987, 6.327, 9.056, 2.758, 0.978, 2.360, 0.150, 1.974, 0.074,
-];
+use super::{ENGLISH, Rng, ngram, plainness, shortest_period};
+use core::cell::Cell;
 
 /// Above this, a set of columns is lumpy enough to be English rather than a mix
 /// of differently shifted letters.
@@ -50,13 +45,14 @@ pub fn index_of_coincidence(letters: &[u8]) -> f32 {
         return 0.0;
     }
 
-    let mut counts = [0usize; 26];
+    let mut counts = [0u64; 26];
     for &letter in letters {
         counts[(letter - b'a') as usize] += 1;
     }
 
-    let sum: usize = counts.iter().map(|&n| n * n.saturating_sub(1)).sum();
-    sum as f32 / (total * (total - 1)) as f32
+    // Squared, so wider than a WASM `usize`: seventy thousand of one letter wraps it.
+    let sum: u64 = counts.iter().map(|&n| n * n.saturating_sub(1)).sum();
+    sum as f32 / (total as u64 * (total as u64 - 1)) as f32
 }
 
 /// Lowercase letters only, which is all the cipher touches.
@@ -221,16 +217,6 @@ pub struct Candidate {
     pub score: f32,
 }
 
-/// Shortest run the key repeats, since any multiple of it also deciphers.
-fn shortest_period(key: &[u8]) -> Vec<u8> {
-    for period in 1..=key.len() / 2 {
-        if key.len().is_multiple_of(period) && key.chunks(period).all(|c| c == &key[..period]) {
-            return key[..period].to_vec();
-        }
-    }
-    key.to_vec()
-}
-
 /// Longest keyword worth hunting for.
 ///
 /// Stacking Vigenère does not make a new cipher: enciphering with keys of five,
@@ -328,27 +314,6 @@ fn weight_under(letters: &[u8], key: &[u8]) -> u32 {
     total
 }
 
-/// xorshift64*, seeded from the text so a solve can be re-derived.
-struct Rng(u64);
-
-impl Rng {
-    fn seeded(data: &[u8]) -> Self {
-        let mut hash = 0xcbf29ce484222325u64;
-        for &byte in data {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        Self(hash | 1)
-    }
-
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545f4914f6cdd1d)
-    }
-}
-
 /// Walks one key uphill, one position at a time, until nothing improves it.
 ///
 /// The whole reason this exists. Counting letters in a column judges each key
@@ -420,6 +385,25 @@ const WORDS_BELOW: usize = 5;
 /// Longest text on which a thin-column key is still worth reading words for.
 const WORDS_TEXT: usize = 120;
 
+/// Bytes read scoring keys by their words, across all the key lengths of one text.
+///
+/// Spent shortest key first, since a long key on thin columns is the one least likely
+/// to be the answer. A hundred letters of text can otherwise spend the better part of
+/// a minute in a browser on keys the ranking is going to discount anyway.
+const WORDS_BUDGET: usize = 16_000_000;
+
+/// Bytes read working keys back from flag shapes, on the same reckoning. Six braces in
+/// two hundred bytes are otherwise two minutes of work.
+const CRIB_BUDGET: usize = 16_000_000;
+
+/// Flag shapes a text's keys are worked back from. Any more than this is a stylesheet
+/// or a program rather than a flag with some text around it.
+const MAX_CRIB_SITES: usize = 32;
+
+/// How far back along the letters before a brace a tag fragment is tried. A tag longer
+/// than this is a run of words that happens to end at a brace.
+const MAX_CRIB_SLIDE: usize = 16;
+
 /// Tags and tag fragments a flag is usually wrapped in.
 ///
 /// Two jobs in one list. A whole tag that matches the whole run settles every
@@ -460,6 +444,16 @@ fn crib_tags(tags: &[String]) -> Vec<String> {
 
     out.sort_by_key(|tag| core::cmp::Reverse(tag.len()));
     out.extend(CRIB_TAGS.iter().map(|tag| (*tag).to_string()));
+
+    // The default configuration names most of the built-in list again.
+    let mut seen = Vec::new();
+    out.retain(|tag| {
+        let new = !seen.contains(tag);
+        if new {
+            seen.push(tag.clone());
+        }
+        new
+    });
     out
 }
 
@@ -567,108 +561,137 @@ pub fn from_crib(data: &[u8], tags: &[String]) -> Vec<(Vec<u8>, usize, usize)> {
         return Vec::new();
     }
 
-    let sites = crib_sites(data);
+    let mut sites = crib_sites(data);
     if sites.is_empty() {
         return Vec::new();
     }
+    sites.truncate(MAX_CRIB_SITES);
 
     let longest = MAX_KEY.min(letters.len() / COUNTABLE);
     let mut out: Vec<(Vec<u8>, usize, usize)> = Vec::new();
+    let budget = Cell::new(CRIB_BUDGET);
 
-    for (start, run) in sites {
-        for tag in crib_tags(tags) {
+    // What to try, most telling first so that the budget goes on it: a tag sitting
+    // right against a brace before a fragment slid along the letters, and a long tag
+    // before a short one. A tag ending in CTF is the common case and lands on the last
+    // offset; one that is the whole run, like `flag`, lands on the only offset there is.
+    let tags = crib_tags(tags);
+    let mut placements: Vec<(usize, &str, usize, bool)> = Vec::new();
+    for &(start, run) in &sites {
+        for tag in &tags {
             if tag.len() > run {
                 continue;
             }
+            let last = run - tag.len();
+            for offset in last.saturating_sub(MAX_CRIB_SLIDE)..=last {
+                placements.push((start, tag, offset, offset == last));
+            }
+        }
+    }
+    placements.sort_by_key(|&(_, tag, _, against)| (!against, core::cmp::Reverse(tag.len())));
 
-            // Every place the fragment could sit inside the run. A tag ending in
-            // CTF is the common case and lands on the last offset; one that is
-            // the whole run, like `flag`, lands on the only offset there is.
-            for offset in 0..=(run - tag.len()) {
-                for length in 1..=longest {
-                    let mut key = vec![0u8; length];
-                    let mut fixed = vec![false; length];
-                    let mut clash = false;
+    // Cheapest first, across every placement: a key the crib all but settles, then one
+    // with two or three positions to try outright, then the climbs. Those are exact
+    // where a climb is not, and a long search on the first brace must not spend what the
+    // real one needs.
+    for tier in 0..4 {
+        for &(start, tag, offset, _) in &placements {
+            for length in 1..=longest {
+                if budget.get() == 0 {
+                    return out;
+                }
 
-                    for (step, plain) in tag.bytes().enumerate() {
-                        let at = (start + offset + step) % length;
-                        let implied = (letters[start + offset + step] + 26 - (plain - b'a')) % 26;
+                let mut key = vec![0u8; length];
+                let mut fixed = vec![false; length];
+                let mut clash = false;
 
-                        // The same key position can be reached twice by a crib
-                        // longer than the key. If the two disagree, this length is
-                        // not the one.
-                        if fixed[at] && key[at] != implied {
-                            clash = true;
-                            break;
-                        }
+                for (step, plain) in tag.bytes().enumerate() {
+                    let at = (start + offset + step) % length;
+                    let implied = (letters[start + offset + step] + 26 - (plain - b'a')) % 26;
 
-                        key[at] = implied;
-                        fixed[at] = true;
+                    // The same key position can be reached twice by a crib
+                    // longer than the key. If the two disagree, this length is
+                    // not the one.
+                    if fixed[at] && key[at] != implied {
+                        clash = true;
+                        break;
                     }
 
-                    if clash {
-                        continue;
+                    key[at] = implied;
+                    fixed[at] = true;
+                }
+
+                if clash {
+                    continue;
+                }
+
+                let by_words = |candidate: &[u8]| -> f64 {
+                    budget.set(budget.get().saturating_sub(data.len()));
+                    let text: Vec<u8> = candidate.iter().map(|shift| b'a' + shift).collect();
+                    plainness(&decipher(data, &text)) as f64
+                };
+
+                let free: Vec<usize> = (0..length).filter(|&at| !fixed[at]).collect();
+                if free.len().saturating_sub(1).min(3) != tier {
+                    continue;
+                }
+
+                // Few enough positions left that they can simply all be tried.
+                // A climb can stop on a peak that is one letter out, and one
+                // letter out of a key is three or four letters out of the
+                // answer; exhaustive removes that failure entirely.
+                let mut found: Vec<Vec<u8>> = if free.len() <= EXHAUSTIVE_FREE {
+                    // Swept with trigrams, decided by words. The sweep has to
+                    // visit every remaining key and only integers are cheap
+                    // enough for that; the decision has to read the text and
+                    // only words can make it. A shortlist crosses between them.
+                    let mut swept: Vec<(u32, Vec<u8>)> = Vec::new();
+                    let mut trial = key.clone();
+
+                    // An integer sum over the letters and a small allocation,
+                    // which comes to a fraction of a byte read by words.
+                    let combinations = 26usize.pow(free.len() as u32);
+                    budget.set(budget.get().saturating_sub(combinations.saturating_mul(letters.len() / 16 + 2)));
+
+                    for combination in 0..combinations {
+                        let mut rest = combination;
+                        for &at in &free {
+                            trial[at] = (rest % 26) as u8;
+                            rest /= 26;
+                        }
+                        swept.push((weight_under(&letters, &trial), trial.clone()));
                     }
 
-                    let by_words = |candidate: &[u8]| -> f64 {
-                        let text: Vec<u8> = candidate.iter().map(|shift| b'a' + shift).collect();
-                        plainness(&decipher(data, &text)) as f64
-                    };
+                    swept.sort_by_key(|(weight, _)| core::cmp::Reverse(*weight));
+                    swept.truncate(SWEEP_KEEP);
 
-                    let free: Vec<usize> = (0..length).filter(|&at| !fixed[at]).collect();
+                    let mut ranked: Vec<(f64, Vec<u8>)> = swept
+                        .into_iter()
+                        .map(|(_, candidate)| (by_words(&candidate), candidate))
+                        .collect();
 
-                    // Few enough positions left that they can simply all be tried.
-                    // A climb can stop on a peak that is one letter out, and one
-                    // letter out of a key is three or four letters out of the
-                    // answer; exhaustive removes that failure entirely.
-                    let mut found: Vec<Vec<u8>> = if free.len() <= EXHAUSTIVE_FREE {
-                        // Swept with trigrams, decided by words. The sweep has to
-                        // visit every remaining key and only integers are cheap
-                        // enough for that; the decision has to read the text and
-                        // only words can make it. A shortlist crosses between them.
-                        let mut swept: Vec<(u32, Vec<u8>)> = Vec::new();
-                        let mut trial = key.clone();
+                    ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+                    ranked.truncate(NEAR_TIES);
+                    ranked.into_iter().map(|(_, key)| key).collect()
+                } else {
+                    vec![climb_free(&key, &fixed, by_words).0]
+                };
 
-                        for combination in 0..26usize.pow(free.len() as u32) {
-                            let mut rest = combination;
-                            for &at in &free {
-                                trial[at] = (rest % 26) as u8;
-                                rest /= 26;
-                            }
-                            swept.push((weight_under(&letters, &trial), trial.clone()));
+                let pinned = fixed.iter().filter(|&&at| at).count();
+
+                for candidate in found.drain(..) {
+                    let spelled: Vec<u8> = candidate.iter().map(|shift| b'a' + shift).collect();
+
+                    // Keep the strongest derivation of a key, since the same key
+                    // can fall out of several cribs with different amounts of it
+                    // actually deduced.
+                    match out.iter_mut().find(|(seen, _, _)| *seen == spelled) {
+                        Some((_, best, assumed)) if tag.len() > *assumed => {
+                            *best = pinned;
+                            *assumed = tag.len();
                         }
-
-                        swept.sort_by_key(|(weight, _)| core::cmp::Reverse(*weight));
-                        swept.truncate(SWEEP_KEEP);
-
-                        let mut ranked: Vec<(f64, Vec<u8>)> = swept
-                            .into_iter()
-                            .map(|(_, candidate)| (by_words(&candidate), candidate))
-                            .collect();
-
-                        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
-                        ranked.truncate(NEAR_TIES);
-                        ranked.into_iter().map(|(_, key)| key).collect()
-                    } else {
-                        vec![climb_free(&key, &fixed, by_words).0]
-                    };
-
-                    let pinned = fixed.iter().filter(|&&at| at).count();
-
-                    for candidate in found.drain(..) {
-                        let spelled: Vec<u8> = candidate.iter().map(|shift| b'a' + shift).collect();
-
-                        // Keep the strongest derivation of a key, since the same key
-                        // can fall out of several cribs with different amounts of it
-                        // actually deduced.
-                        match out.iter_mut().find(|(seen, _, _)| *seen == spelled) {
-                            Some((_, best, assumed)) if tag.len() > *assumed => {
-                                *best = pinned;
-                                *assumed = tag.len();
-                            }
-                            Some(_) => {}
-                            None => out.push((spelled, pinned, tag.len())),
-                        }
+                        Some(_) => {}
+                        None => out.push((spelled, pinned, tag.len())),
                     }
                 }
             }
@@ -691,7 +714,13 @@ const CLIMB_RESTARTS: usize = 24;
 /// is exact. Climbing then starts from that answer and from fresh guesses, and
 /// whichever ends up spelling the most English wins. On a long text they agree.
 /// On a short one only the climb has anything to go on.
-fn best_of_length(data: &[u8], letters: &[u8], length: usize, rng: &mut Rng) -> Vec<u8> {
+fn best_of_length(
+    data: &[u8],
+    letters: &[u8],
+    length: usize,
+    rng: &mut Rng,
+    words_read: &Cell<usize>,
+) -> Vec<u8> {
     let counted: Vec<u8> = key_of_length(data, length)
         .iter()
         .map(|b| b - b'a')
@@ -714,6 +743,7 @@ fn best_of_length(data: &[u8], letters: &[u8], length: usize, rng: &mut Rng) -> 
     // that need it, and only ever against keys of one length, where the bias
     // towards longer keys has nothing to act on.
     let by_words = |key: &[u8]| -> f64 {
+        words_read.set(words_read.get().saturating_add(data.len()));
         let letters: Vec<u8> = key.iter().map(|shift| b'a' + shift).collect();
         plainness(&decipher(data, &letters)) as f64
     };
@@ -746,10 +776,13 @@ fn best_of_length(data: &[u8], letters: &[u8], length: usize, rng: &mut Rng) -> 
     // and re-ranking the peaks it reached cannot help when the right key was
     // never among them. So the climb runs again under the fuller score, which
     // is affordable precisely because so few lengths qualify.
-    if per_column < WORDS_BELOW && letters.len() <= WORDS_TEXT {
+    if per_column < WORDS_BELOW && letters.len() <= WORDS_TEXT && words_read.get() < WORDS_BUDGET {
         let mut peaks = seen;
 
         for _ in 0..CLIMB_RESTARTS {
+            if words_read.get() >= WORDS_BUDGET {
+                break;
+            }
             let start: Vec<u8> = (0..length).map(|_| (rng.next() % 26) as u8).collect();
             peaks.push(climb(&start, by_words).0);
         }
@@ -830,8 +863,9 @@ pub fn derive(data: &[u8], tags: &[String]) -> Vec<Derived> {
     // out of the ciphertext, and only what is left has to be searched for.
     let mut candidates: Vec<(Vec<u8>, usize, usize)> = from_crib(data, tags);
 
+    let words_read = Cell::new(0);
     for length in 1..=longest {
-        candidates.push((best_of_length(data, &numbered, length, &mut rng), 0, 0));
+        candidates.push((best_of_length(data, &numbered, length, &mut rng, &words_read), 0, 0));
     }
 
     for (key, deduced, assumed) in candidates {
@@ -865,8 +899,11 @@ pub fn derive(data: &[u8], tags: &[String]) -> Vec<Derived> {
     // Ranked with a cost per key letter. A longer key has more positions to
     // bend and fits any text better given the chance, so without this the list
     // is led by the longest key tried, every time, on every input.
-    out.sort_by(|a, b| worth(b).total_cmp(&worth(a)));
-    out
+    //
+    // Worked out once each, since it scans the whole plaintext for flags.
+    let mut ranked: Vec<(f32, Derived)> = out.into_iter().map(|found| (worth(&found), found)).collect();
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+    ranked.into_iter().map(|(_, found)| found).collect()
 }
 
 /// What each extra key letter costs when ranking keys of different lengths.
@@ -981,6 +1018,11 @@ const SOLVE_BELOW: usize = 5;
 /// What has not changed is the refusal to guess. A key is reported only when
 /// the text it produces reads, and on a short ciphertext nothing will.
 pub fn solve(data: &[u8], tags: &[String]) -> Option<Candidate> {
+    solve_among(data, &derive(data, tags))
+}
+
+/// [`solve`], for a caller that has already worked out what [`derive`] finds.
+pub fn solve_among(data: &[u8], derived: &[Derived]) -> Option<Candidate> {
     let letters = letters_of(data);
     if letters.len() < MIN_LETTERS {
         return None;
@@ -988,16 +1030,16 @@ pub fn solve(data: &[u8], tags: &[String]) -> Option<Candidate> {
 
     let before = plainness(data);
 
-    derive(data, tags)
-        .into_iter()
+    derived
+        .iter()
         .filter(|found| {
             found.per_column >= SOLVE_BELOW
                 && found.score >= MIN_SCORE
                 && found.score >= before + MIN_GAIN
         })
         .map(|found| Candidate {
-            key: found.key,
-            plaintext: found.plaintext,
+            key: found.key.clone(),
+            plaintext: found.plaintext.clone(),
             score: found.score,
         })
         .fold(None::<Candidate>, |best, next| match best {

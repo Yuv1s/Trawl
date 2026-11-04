@@ -62,7 +62,7 @@
 
 				{#if row.flags.length}
 					<ul class="flags">
-						{#each row.flags as flag (flag)}
+						{#each new Set(row.flags) as flag (flag)}
 							<li class="mono flagged">{flag}</li>
 						{/each}
 					</ul>

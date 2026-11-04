@@ -12,17 +12,48 @@
 //! scanner starts. This keeps unrelated pages from turning the loopback service
 //! into a proxy, especially when local targets are enabled.
 
+use crate::guard;
 use axum::{
     Json, Router,
-    extract::{Query, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
-    response::IntoResponse,
+    extract::{Query, Request, State},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tower_http::cors::CorsLayer;
+
+/// The header the file proxy sets when a body was cut at its cap, so the page can
+/// tell a whole file from a truncated one. Named here because both the proxy and
+/// the CORS layer that exposes it refer to it.
+const TRUNCATED_HEADER: HeaderName = HeaderName::from_static("x-trawl-truncated");
+
+/// The file proxy reads a larger slice than the crawl: an image the offline tools
+/// are handed may be bigger than a page worth scanning, but still not unbounded.
+const FETCH_MAX_BODY: usize = 32 * 1024 * 1024;
+
+/// One scan-wide ceiling on the passive crawl. About 140 sequential fetches, each
+/// able to take several hops, could otherwise run for a very long time; when this
+/// is reached the scan returns what it has with a notice rather than failing.
+const PASSIVE_DEADLINE: Duration = Duration::from_secs(180);
+
+/// Longest to spend classifying the entry host before a scan or proxy fetch. The
+/// fetch itself bounds its own resolution; this bounds the one that happens first.
+const ENTRY_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ceilings on what one scan reports back, so a hostile page cannot blow the
+/// result up to megabytes of JSON. Past these the rest are dropped and a notice
+/// gives the count.
+const MAX_FLAGS: usize = 500;
+const MAX_COMMENTS: usize = 500;
+const MAX_BUCKET: usize = 500;
+
+/// The port the scanner binds, so the default and the `Host` check agree with
+/// where it actually listens.
+pub const DEFAULT_PORT: u16 = 8099;
 
 /// What the scanner was started with. Carried into every handler so a request
 /// cannot decide for itself whether local targets are allowed: only the person
@@ -32,6 +63,7 @@ pub struct Config {
     pub allow_local: bool,
     token: String,
     allowed_origin: HeaderValue,
+    port: u16,
 }
 
 impl Config {
@@ -43,25 +75,100 @@ impl Config {
             allow_local,
             token,
             allowed_origin,
+            port: DEFAULT_PORT,
         })
     }
+
+    /// Sets the port the service listens on, for the `Host` header check. Kept
+    /// off `new` so its callers, the tests among them, are left as they were.
+    pub fn with_port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+}
+
+/// Whether the scanner should reach local and private targets, from the flag and
+/// the environment. Only `--allow-local` and `TRAWL_ALLOW_LOCAL=1` turn it on;
+/// the page sends exactly `1`, and a stray `0` must not, the way merely setting
+/// the variable once did.
+pub fn local_requested(flag_present: bool, env_value: Option<&str>) -> bool {
+    flag_present || env_value == Some("1")
 }
 
 pub fn app(config: Config) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(config.allowed_origin.clone())
         .allow_methods([Method::GET, Method::POST])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        // So the page can read whether a proxied file was truncated.
+        .expose_headers([TRUNCATED_HEADER]);
 
     Router::new()
         .route("/health", get(health))
         .route("/scan", post(scan))
         .route("/fetch", get(raw))
         .layer(cors)
+        // Outermost, so a request with a foreign Host is turned away before any
+        // handler runs. The token still gates everything; this closes the DNS
+        // rebinding path, where a public name resolves to loopback and a page
+        // reaches the service as though it were its own origin.
+        .layer(middleware::from_fn_with_state(
+            config.clone(),
+            require_local_host,
+        ))
         .with_state(config)
 }
 
 type ApiError = (StatusCode, String);
+
+/// Turns away any request whose `Host` is not the loopback address the scanner
+/// listens on. A browser reaching the real service always sends one of these;
+/// a rebinding attack, which reaches loopback while believing it is on another
+/// name, sends that name instead and is refused here.
+async fn require_local_host(
+    State(config): State<Config>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
+
+    if host.is_some_and(|host| host_is_allowed(host, config.port)) {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            "the scanner is reachable on loopback only",
+        )
+            .into_response()
+    }
+}
+
+/// Whether a `Host` header names this loopback service: one of `127.0.0.1`,
+/// `localhost` or `[::1]`, and, if it carries a port, the one the scanner binds.
+fn host_is_allowed(host_header: &str, port: u16) -> bool {
+    let (host, host_port) = split_host_port(host_header);
+    let host_ok = matches!(host, "127.0.0.1" | "localhost" | "::1");
+    let port_ok = host_port.is_none_or(|given| given == port);
+    host_ok && port_ok
+}
+
+/// Splits a `Host` header into its host and optional port, understanding the
+/// bracketed `[::1]:port` form an IPv6 literal takes.
+fn split_host_port(host_header: &str) -> (&str, Option<u16>) {
+    if let Some(rest) = host_header.strip_prefix('[') {
+        return match rest.split_once(']') {
+            Some((inside, after)) => (inside, after.strip_prefix(':').and_then(|p| p.parse().ok())),
+            None => (host_header, None),
+        };
+    }
+    match host_header.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse().ok()),
+        None => (host_header, None),
+    }
+}
 
 fn validate_token(token: &str) -> Result<(), String> {
     if token.len() < 32 {
@@ -131,22 +238,6 @@ fn unauthorized() -> ApiError {
 
 fn authorize_bearer(headers: &HeaderMap, config: &Config) -> Result<(), ApiError> {
     if bearer_token(headers).is_some_and(|token| tokens_equal(token, &config.token)) {
-        Ok(())
-    } else {
-        Err(unauthorized())
-    }
-}
-
-fn authorize_fetch(
-    headers: &HeaderMap,
-    query_token: Option<&str>,
-    config: &Config,
-) -> Result<(), ApiError> {
-    let header_matches =
-        bearer_token(headers).is_some_and(|token| tokens_equal(token, &config.token));
-    let query_matches = query_token.is_some_and(|token| tokens_equal(token, &config.token));
-
-    if header_matches || query_matches {
         Ok(())
     } else {
         Err(unauthorized())
@@ -235,6 +326,10 @@ struct Found {
 struct ScanResult {
     /// Where the entry request ended up, after redirects.
     target: String,
+    /// What the person should know did not happen: active checks skipped, the
+    /// time limit reached, findings capped. Always present, empty when the scan
+    /// ran in full.
+    notices: Vec<String>,
     /// Every page the crawl visited, the entry first.
     pages: Vec<PageResult>,
     /// Same-host images, each a candidate for Cuttlefish once fetched.
@@ -315,7 +410,11 @@ fn glean(
     // Encoded flags: a base64 variable, a rotated comment, a colour written as
     // CSS escapes, an array XORed against a byte.
     for found in crate::decode::harvest(body) {
-        flags.push(located(found.value, page_url, &format!("{} in the source", found.how)));
+        flags.push(located(
+            found.value,
+            page_url,
+            &format!("{} in the source", found.how),
+        ));
     }
 
     // The response headers carry their own: a plain flag in X-Flag, a base64
@@ -323,7 +422,11 @@ fn glean(
     for (name, value) in headers {
         let name = name.to_ascii_lowercase();
         for flag in flags_in(value.as_bytes()) {
-            flags.push(located(flag, page_url, &format!("in the {name} response header")));
+            flags.push(located(
+                flag,
+                page_url,
+                &format!("in the {name} response header"),
+            ));
         }
         for found in crate::decode::harvest(value.as_bytes()) {
             flags.push(located(
@@ -342,12 +445,43 @@ fn glean(
     (flags, comments, references)
 }
 
-fn same_host(url: &str, host: &Option<String>) -> bool {
-    host.is_some()
-        && &reqwest::Url::parse(url)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_string))
-            == host
+/// Whether a URL is on the same origin as the scan's entry: scheme, host and
+/// port all equal. Origin rather than host, so a link to another port or scheme
+/// on the same name is treated as off-target, the way the guard intends.
+fn same_origin(url: &str, entry: &reqwest::Url) -> bool {
+    reqwest::Url::parse(url)
+        .map(|parsed| parsed.origin() == entry.origin())
+        .unwrap_or(false)
+}
+
+/// The host and port of a URL, for the entry classification that decides whether
+/// local access applies.
+fn host_and_port(url: &str) -> Option<(String, u16)> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_string();
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    Some((host, port))
+}
+
+/// Whether this request may reach local or private addresses: only when the
+/// scanner is in local mode and the host it names itself resolves there. Done off
+/// the async threads, since it resolves. A public entry comes back false and is
+/// held to the strict guard for every hop.
+async fn entry_allows_local(url: &str, config: &Config) -> bool {
+    let Some((host, port)) = host_and_port(url) else {
+        return false;
+    };
+    let scanner_local = config.allow_local;
+    // Resolution blocks and has no timeout of its own, so it runs off the async
+    // threads under a bound. A slow or hostile resolver falls back to the strict
+    // guard rather than hanging the request before it has begun.
+    let resolve =
+        tokio::task::spawn_blocking(move || guard::host_allows_local(&host, port, scanner_local));
+    tokio::time::timeout(ENTRY_DNS_TIMEOUT, resolve)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(false)
 }
 
 /// Sorts a page's references into the buckets they belong in, and hands back the
@@ -365,14 +499,14 @@ struct Buckets<'a> {
 
 fn categorize(
     references: Vec<crate::crawl::Reference>,
-    entry_host: &Option<String>,
+    entry: &reqwest::Url,
     into: &mut Buckets,
 ) -> Vec<String> {
     use crate::crawl::Kind;
     let mut page_links = Vec::new();
 
     for reference in references {
-        if !same_host(&reference.url, entry_host) {
+        if !same_origin(&reference.url, entry) {
             into.external.push(reference.url);
             continue;
         }
@@ -392,7 +526,7 @@ fn categorize(
 fn enqueue_sitemap(
     body: &[u8],
     page_url: &str,
-    entry_host: &Option<String>,
+    entry: &reqwest::Url,
     visited: &mut HashSet<String>,
     queue: &mut Vec<String>,
 ) {
@@ -400,7 +534,7 @@ fn enqueue_sitemap(
         return;
     };
     for loc in crate::crawl::sitemap_locs(&base, body) {
-        if same_host(&loc, entry_host) && visited.insert(loc.clone()) {
+        if same_origin(&loc, entry) && visited.insert(loc.clone()) {
             queue.push(loc);
         }
     }
@@ -440,11 +574,25 @@ fn is_texty(url: &str) -> bool {
     )
 }
 
+/// [`glean`] run off the async worker. The parsing, decoding and flag search can
+/// take seconds on a large or hostile body, which would stall the executor if it
+/// ran inline; moving it to a blocking thread keeps the server responsive.
+async fn glean_off_thread(
+    page_url: String,
+    body: Vec<u8>,
+    headers: Vec<(String, String)>,
+) -> (Vec<Located>, Vec<Located>, Vec<crate::crawl::Reference>) {
+    tokio::task::spawn_blocking(move || glean(&page_url, &body, &headers))
+        .await
+        .unwrap_or_default()
+}
+
 /// Fetches each text resource once and reads flags out of it, plain and decoded.
 /// This is what catches a flag written into a stylesheet or a script the crawl
 /// linked but never opened.
 async fn harvest_resources(
-    config: &Config,
+    allow_local: bool,
+    deadline: Instant,
     resources: &[String],
     visited: &mut HashSet<String>,
     result: &mut ScanResult,
@@ -453,7 +601,7 @@ async fn harvest_resources(
     let mut fetched = 0;
 
     for url in resources {
-        if fetched >= MAX_RESOURCES {
+        if fetched >= MAX_RESOURCES || Instant::now() >= deadline {
             break;
         }
         if !is_texty(url) || !visited.insert(url.clone()) {
@@ -461,17 +609,30 @@ async fn harvest_resources(
         }
         fetched += 1;
 
-        if let Ok(res) = crate::fetch::fetch(url, config.allow_local).await
+        if let Ok(res) = crate::fetch::fetch(url, allow_local).await
             && res.status == 200
         {
-            for value in flags_in(&res.body) {
-                result.flags.push(located(value, url, ""));
-            }
-            for found in crate::decode::harvest(&res.body) {
-                result
-                    .flags
-                    .push(located(found.value, url, &format!("{} in the source", found.how)));
-            }
+            // The decode battery is pure CPU over the body, so it runs off the
+            // async worker the same way the page gleaning does.
+            let body = res.body;
+            let url_owned = url.clone();
+            let found = tokio::task::spawn_blocking(move || {
+                let mut out: Vec<Located> = flags_in(&body)
+                    .into_iter()
+                    .map(|value| located(value, &url_owned, ""))
+                    .collect();
+                for found in crate::decode::harvest(&body) {
+                    out.push(located(
+                        found.value,
+                        &url_owned,
+                        &format!("{} in the source", found.how),
+                    ));
+                }
+                out
+            })
+            .await
+            .unwrap_or_default();
+            result.flags.extend(found);
         }
     }
 }
@@ -490,9 +651,9 @@ const MAX_FOUND: usize = 40;
 /// turn references bucketed like any other page's.
 #[allow(clippy::too_many_arguments)]
 async fn probe_by_name(
-    config: &Config,
-    entry_url: &str,
-    entry_host: &Option<String>,
+    allow_local: bool,
+    deadline: Instant,
+    entry: &reqwest::Url,
     visited: &mut HashSet<String>,
     result: &mut ScanResult,
     images: &mut Vec<String>,
@@ -500,9 +661,7 @@ async fn probe_by_name(
     assets: &mut Vec<String>,
     external: &mut Vec<String>,
 ) {
-    let Ok(base) = reqwest::Url::parse(entry_url) else {
-        return;
-    };
+    let base = entry.clone();
 
     // Ask for two paths that cannot be there and remember the answer, so a
     // server that says 200 to everything does not make every name look found.
@@ -513,7 +672,7 @@ async fn probe_by_name(
     let mut samples = Vec::new();
     for path in crate::discovery::calibration_paths(seed) {
         if let Ok(url) = base.join(&path)
-            && let Ok(res) = crate::fetch::fetch(url.as_str(), config.allow_local).await
+            && let Ok(res) = crate::fetch::fetch(url.as_str(), allow_local).await
         {
             samples.push((res.status, res.body.len()));
         }
@@ -521,10 +680,12 @@ async fn probe_by_name(
     let baseline = crate::discovery::Baseline::from_samples(&samples);
 
     let sensitive = SENSITIVE_PATHS.iter().map(|p| (*p, true));
-    let loot = crate::discovery::DISCOVERY_PATHS.iter().map(|p| (*p, false));
+    let loot = crate::discovery::DISCOVERY_PATHS
+        .iter()
+        .map(|p| (*p, false));
 
     for (path, sensitive) in sensitive.chain(loot) {
-        if result.found.len() >= MAX_FOUND {
+        if result.found.len() >= MAX_FOUND || Instant::now() >= deadline {
             break;
         }
         let Ok(url) = base.join(path) else {
@@ -535,7 +696,7 @@ async fn probe_by_name(
             continue;
         }
 
-        let Ok(page) = crate::fetch::fetch(&probe, config.allow_local).await else {
+        let Ok(page) = crate::fetch::fetch(&probe, allow_local).await else {
             continue;
         };
         if !baseline.is_hit(page.status, page.body.len()) {
@@ -550,7 +711,8 @@ async fn probe_by_name(
         });
 
         if !page.body.is_empty() {
-            let (flags, comments, references) = glean(&probe, &page.body, &page.headers);
+            let (flags, comments, references) =
+                glean_off_thread(probe.clone(), page.body, page.headers).await;
             result.flags.extend(flags);
             result.comments.extend(comments);
 
@@ -560,7 +722,7 @@ async fn probe_by_name(
                 assets: &mut *assets,
                 external: &mut *external,
             };
-            categorize(references, entry_host, &mut buckets);
+            categorize(references, entry, &mut buckets);
         }
     }
 }
@@ -572,7 +734,12 @@ async fn scan(
 ) -> Result<Json<ScanResult>, ApiError> {
     authorize_bearer(&headers, &config)?;
 
-    let entry = crate::fetch::fetch(&request.url, config.allow_local)
+    // Local access is decided once, from the host the person named, before the
+    // first fetch. A public entry comes back false and stays under the strict
+    // guard for every hop, so it cannot redirect or resolve its way inward.
+    let allow_local = entry_allows_local(&request.url, &config).await;
+
+    let entry = crate::fetch::fetch(&request.url, allow_local)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let entry_url = entry.final_url.clone();
@@ -582,9 +749,16 @@ async fn scan(
         ..Default::default()
     };
 
-    let entry_host = reqwest::Url::parse(&entry_url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_string));
+    // The entry origin, which every scope decision is measured against. It comes
+    // from a URL a fetch already accepted, so it parses.
+    let Ok(entry_parsed) = reqwest::Url::parse(&entry_url) else {
+        return Err((StatusCode::BAD_REQUEST, "entry URL did not parse".into()));
+    };
+
+    // The whole passive crawl shares one deadline, checked between fetches, so a
+    // site that answers slowly cannot hold the request open indefinitely.
+    let deadline = Instant::now() + PASSIVE_DEADLINE;
+    let mut time_limit_hit = false;
 
     let (mut images, mut scripts, mut assets, mut external) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -600,15 +774,22 @@ async fn scan(
 
     // The entry, whose links seed the queue.
     {
-        let (flags, comments, references) = glean(&entry_url, &entry.body, &entry.headers);
+        let (flags, comments, references) =
+            glean_off_thread(entry_url.clone(), entry.body.clone(), entry.headers.clone()).await;
         result.pages.push(PageResult {
             url: entry_url.clone(),
             status: entry.status,
         });
         result.flags.extend(flags);
         result.comments.extend(comments);
-        enqueue_sitemap(&entry.body, &entry_url, &entry_host, &mut visited, &mut queue);
-        bodies.push(entry.body.clone());
+        enqueue_sitemap(
+            &entry.body,
+            &entry_url,
+            &entry_parsed,
+            &mut visited,
+            &mut queue,
+        );
+        bodies.push(entry.body);
 
         let mut buckets = Buckets {
             images: &mut images,
@@ -616,7 +797,7 @@ async fn scan(
             assets: &mut assets,
             external: &mut external,
         };
-        for link in categorize(references, &entry_host, &mut buckets) {
+        for link in categorize(references, &entry_parsed, &mut buckets) {
             if visited.insert(link.clone()) {
                 queue.push(link);
             }
@@ -624,13 +805,14 @@ async fn scan(
     }
 
     // robots.txt names paths a crawler is asked to avoid, which is a map to what
-    // is worth a look. Its paths join the queue like any other.
-    if let Ok(base) = reqwest::Url::parse(&entry_url)
-        && let Ok(robots_url) = base.join("/robots.txt")
-        && let Ok(robots) = crate::fetch::fetch(robots_url.as_str(), config.allow_local).await
+    // is worth a look. Its paths join the queue like any other, but only those on
+    // the entry's own origin: an absolute Disallow pointing at another host is not
+    // the target and is not fetched.
+    if let Ok(robots_url) = entry_parsed.join("/robots.txt")
+        && let Ok(robots) = crate::fetch::fetch(robots_url.as_str(), allow_local).await
     {
-        for path in crate::crawl::robots_paths(&base, &robots.body) {
-            if visited.insert(path.clone()) {
+        for path in crate::crawl::robots_paths(&entry_parsed, &robots.body) {
+            if same_origin(&path, &entry_parsed) && visited.insert(path.clone()) {
                 queue.push(path);
             }
         }
@@ -640,19 +822,24 @@ async fn scan(
     // but do not follow its own links further.
     let mut cursor = 0;
     while cursor < queue.len() && result.pages.len() < MAX_PAGES {
+        if Instant::now() >= deadline {
+            time_limit_hit = true;
+            break;
+        }
         let url = queue[cursor].clone();
         cursor += 1;
 
-        if let Ok(page) = crate::fetch::fetch(&url, config.allow_local).await {
-            let (flags, comments, references) = glean(&url, &page.body, &page.headers);
+        if let Ok(page) = crate::fetch::fetch(&url, allow_local).await {
+            let (flags, comments, references) =
+                glean_off_thread(url.clone(), page.body.clone(), page.headers.clone()).await;
             result.pages.push(PageResult {
                 url: url.clone(),
                 status: page.status,
             });
             result.flags.extend(flags);
             result.comments.extend(comments);
-            enqueue_sitemap(&page.body, &url, &entry_host, &mut visited, &mut queue);
-            bodies.push(page.body.clone());
+            enqueue_sitemap(&page.body, &url, &entry_parsed, &mut visited, &mut queue);
+            bodies.push(page.body);
 
             let mut buckets = Buckets {
                 images: &mut images,
@@ -660,7 +847,7 @@ async fn scan(
                 assets: &mut assets,
                 external: &mut external,
             };
-            categorize(references, &entry_host, &mut buckets);
+            categorize(references, &entry_parsed, &mut buckets);
         }
     }
 
@@ -668,18 +855,22 @@ async fn scan(
     // place, a dotfile served by mistake, a flag dropped at the root. The
     // server's own not-found answer is learned first so a soft-404 site does
     // not turn every guess into a find. Each hit still runs the guard.
-    probe_by_name(
-        &config,
-        &entry_url,
-        &entry_host,
-        &mut visited,
-        &mut result,
-        &mut images,
-        &mut scripts,
-        &mut assets,
-        &mut external,
-    )
-    .await;
+    if Instant::now() < deadline {
+        probe_by_name(
+            allow_local,
+            deadline,
+            &entry_parsed,
+            &mut visited,
+            &mut result,
+            &mut images,
+            &mut scripts,
+            &mut assets,
+            &mut external,
+        )
+        .await;
+    } else {
+        time_limit_hit = true;
+    }
 
     // Scripts and stylesheets the crawl linked but did not open, read for the
     // flags that hide in a CSS escape or a JS constant.
@@ -689,13 +880,31 @@ async fn scan(
         .filter(|url| is_texty(url))
         .cloned()
         .collect();
-    harvest_resources(&config, &resources, &mut visited, &mut result).await;
+    harvest_resources(allow_local, deadline, &resources, &mut visited, &mut result).await;
+    if Instant::now() >= deadline {
+        time_limit_hit = true;
+    }
 
     // The active battery, only when the page's authorization affirmation asked
-    // for it. This is the half that sends crafted requests.
+    // for it. This is the half that sends crafted requests, so it never runs when
+    // the entry redirected to another origin: the person authorised the target
+    // they named, not wherever it pointed.
     if request.active {
-        for hit in crate::active::run(&entry_url, config.allow_local, &bodies, &request.hints).await {
-            result.flags.push(located(hit.value, &hit.source, &hit.note));
+        let requested_origin = reqwest::Url::parse(&request.url).map(|u| u.origin());
+        let stayed_on_origin = requested_origin
+            .map(|origin| origin == entry_parsed.origin())
+            .unwrap_or(false);
+        if stayed_on_origin {
+            for hit in crate::active::run(&entry_url, allow_local, &bodies, &request.hints).await {
+                result
+                    .flags
+                    .push(located(hit.value, &hit.source, &hit.note));
+            }
+        } else {
+            result.notices.push(format!(
+                "Active checks were skipped because the target redirected from {} to {}.",
+                request.url, entry_url
+            ));
         }
     }
 
@@ -708,7 +917,57 @@ async fn scan(
     result.flags = dedup_located(result.flags);
     result.comments = dedup_located(result.comments);
 
+    if time_limit_hit {
+        result
+            .notices
+            .push("The scan reached its time limit; these are the results found by then.".into());
+    }
+
+    // Hold the result to sensible sizes, so one hostile page cannot return
+    // megabytes of findings. Each cap that bites leaves a notice with the count.
+    cap_with_notice(&mut result.flags, MAX_FLAGS, "flags", &mut result.notices);
+    cap_with_notice(
+        &mut result.comments,
+        MAX_COMMENTS,
+        "comments",
+        &mut result.notices,
+    );
+    cap_with_notice(
+        &mut result.images,
+        MAX_BUCKET,
+        "images",
+        &mut result.notices,
+    );
+    cap_with_notice(
+        &mut result.scripts,
+        MAX_BUCKET,
+        "scripts",
+        &mut result.notices,
+    );
+    cap_with_notice(
+        &mut result.assets,
+        MAX_BUCKET,
+        "assets",
+        &mut result.notices,
+    );
+    cap_with_notice(
+        &mut result.external,
+        MAX_BUCKET,
+        "external links",
+        &mut result.notices,
+    );
+
     Ok(Json(result))
+}
+
+/// Truncates a list to a cap and, when that drops anything, records how many were
+/// left out so the person is not shown a silently shortened result.
+fn cap_with_notice<T>(items: &mut Vec<T>, cap: usize, label: &str, notices: &mut Vec<String>) {
+    if items.len() > cap {
+        let omitted = items.len() - cap;
+        items.truncate(cap);
+        notices.push(format!("{label}: showing {cap}, {omitted} more left out."));
+    }
 }
 
 fn dedup_located(items: Vec<Located>) -> Vec<Located> {
@@ -722,7 +981,29 @@ fn dedup_located(items: Vec<Located>) -> Vec<Located> {
 #[derive(Deserialize)]
 struct FetchQuery {
     url: String,
-    token: Option<String>,
+}
+
+/// The media types the proxy serves with the target's own `Content-Type`: raster
+/// images the page shows as a thumbnail and hands to the offline tools. Anything
+/// else is served as an opaque download, so a proxied HTML page or script is
+/// never rendered as itself in the person's browser.
+const RASTER_IMAGE_TYPES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/bmp",
+    "image/webp",
+    "image/x-icon",
+    "image/vnd.microsoft.icon",
+];
+
+/// Whether a `Content-Type` names a raster image, matched on the media type with
+/// parameters ignored and case folded, so `image/PNG; charset=binary` still counts.
+fn is_raster_image(content_type: &str) -> bool {
+    let media = content_type.split(';').next().unwrap_or("").trim();
+    RASTER_IMAGE_TYPES
+        .iter()
+        .any(|allowed| media.eq_ignore_ascii_case(allowed))
 }
 
 /// Hands the raw bytes of a guarded URL back to the page.
@@ -730,26 +1011,69 @@ struct FetchQuery {
 /// This is what lets the browser show a thumbnail of an image on the target, and
 /// hand that same image to the offline tools, without the page itself ever
 /// reaching across origins: the scanner fetches it, under the same guard as a
-/// scan, and returns the bytes with the type the target gave them.
+/// scan, and returns the bytes.
+///
+/// A raster image keeps its type so the page can render it; everything else is
+/// forced to an opaque attachment, and every response is marked no-sniff and
+/// sandboxed, so nothing proxied can run as a document in the person's origin.
 async fn raw(
     State(config): State<Config>,
     headers: HeaderMap,
     Query(query): Query<FetchQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    authorize_fetch(&headers, query.token.as_deref(), &config)?;
+    authorize_bearer(&headers, &config)?;
 
-    let fetched = crate::fetch::fetch(&query.url, config.allow_local)
+    // The same entry classification a scan uses: local access only when the host
+    // the person named resolves there and the scanner is in local mode.
+    let allow_local = entry_allows_local(&query.url, &config).await;
+
+    let request = crate::fetch::Request {
+        max_body: Some(FETCH_MAX_BODY),
+        ..Default::default()
+    };
+    let fetched = crate::fetch::fetch_with(&query.url, allow_local, &request)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    let content_type = fetched
+    let raw_type = fetched
         .headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-        .map(|(_, value)| value.clone())
-        .unwrap_or_else(|| "application/octet-stream".to_string());
+        .map(|(_, value)| value.clone());
 
-    Ok(([(header::CONTENT_TYPE, content_type)], fetched.body))
+    // A raster image passes its type through; anything else becomes an opaque
+    // download, so the browser never treats proxied bytes as a page to render.
+    let mut content_type = HeaderValue::from_static("application/octet-stream");
+    let mut attachment = true;
+    if let Some(raw_type) = raw_type.as_deref()
+        && is_raster_image(raw_type)
+        && let Ok(value) = HeaderValue::from_str(raw_type)
+    {
+        content_type = value;
+        attachment = false;
+    }
+
+    let mut out = HeaderMap::new();
+    out.insert(header::CONTENT_TYPE, content_type);
+    out.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    out.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox"),
+    );
+    if attachment {
+        out.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment"),
+        );
+    }
+    if fetched.truncated {
+        out.insert(TRUNCATED_HEADER, HeaderValue::from_static("1"));
+    }
+
+    Ok((out, fetched.body))
 }
 
 #[cfg(test)]
@@ -839,18 +1163,101 @@ mod tests {
     }
 
     #[test]
-    fn fetch_auth_accepts_a_bearer_header_or_query_token() {
+    fn a_query_token_no_longer_authorizes_fetch() {
+        // The query-token form is gone: `?token=` binds to nothing on the request,
+        // and the only credential the proxy reads is the bearer header. A request
+        // carrying a token only in the query, with no header, is unauthorized.
         let config = config();
-        let bearer = authorization(&format!("Bearer {TOKEN}"));
 
-        assert!(authorize_fetch(&bearer, None, &config).is_ok());
-        assert!(authorize_fetch(&HeaderMap::new(), Some(TOKEN), &config).is_ok());
-        assert!(authorize_fetch(&authorization("Bearer wrong"), Some(TOKEN), &config).is_ok());
+        let uri: axum::http::Uri = "http://127.0.0.1/fetch?url=http%3A%2F%2Ft.example%2Fa&token=0123456789abcdef0123456789abcdef"
+            .parse()
+            .unwrap();
+        let query: Query<FetchQuery> = Query::try_from_uri(&uri).unwrap();
+        assert_eq!(query.url, "http://t.example/a");
 
-        let error = authorize_fetch(&HeaderMap::new(), None, &config).unwrap_err();
+        // No bearer header, token present only in the query: refused.
+        let error = authorize_bearer(&HeaderMap::new(), &config).unwrap_err();
         assert_eq!(error.0, StatusCode::UNAUTHORIZED);
-        let error =
-            authorize_fetch(&authorization("Bearer wrong"), Some("wrong"), &config).unwrap_err();
-        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+        // The bearer header remains the way in.
+        assert!(authorize_bearer(&authorization(&format!("Bearer {TOKEN}")), &config).is_ok());
+    }
+
+    #[test]
+    fn host_header_must_be_loopback() {
+        // The rebinding guard: only loopback names, and only on the bound port.
+        for host in [
+            "127.0.0.1:8099",
+            "localhost:8099",
+            "[::1]:8099",
+            "127.0.0.1",
+            "localhost",
+        ] {
+            assert!(host_is_allowed(host, 8099), "{host} should be allowed");
+        }
+        for host in [
+            "evil.example",
+            "evil.example:8099",
+            "127.0.0.1:9000", // right host, wrong port
+            "127.0.0.1.evil.example:8099",
+            "10.0.0.1:8099",
+        ] {
+            assert!(!host_is_allowed(host, 8099), "{host} should be refused");
+        }
+    }
+
+    #[test]
+    fn same_origin_distinguishes_port_and_scheme() {
+        let entry = reqwest::Url::parse("http://target.example:80/app").unwrap();
+        assert!(same_origin("http://target.example/other", &entry));
+        // A different port on the same host is a different origin.
+        assert!(!same_origin("http://target.example:8080/other", &entry));
+        // So is a different scheme.
+        assert!(!same_origin("https://target.example/other", &entry));
+        assert!(!same_origin("http://other.example/", &entry));
+    }
+
+    #[test]
+    fn raster_images_pass_type_through_and_nothing_else_does() {
+        assert!(is_raster_image("image/png"));
+        assert!(is_raster_image("image/jpeg; charset=binary"));
+        assert!(is_raster_image("IMAGE/PNG"));
+        assert!(is_raster_image("image/vnd.microsoft.icon"));
+        assert!(is_raster_image("image/x-icon"));
+        // Not raster: a page, a script, a vector image that can carry script.
+        assert!(!is_raster_image("text/html"));
+        assert!(!is_raster_image("image/svg+xml"));
+        assert!(!is_raster_image("application/javascript"));
+        assert!(!is_raster_image(""));
+    }
+
+    #[test]
+    fn local_mode_needs_exactly_one() {
+        assert!(local_requested(true, None));
+        assert!(local_requested(false, Some("1")));
+        // The old bug: any value, even 0, turned it on. Only "1" now.
+        assert!(!local_requested(false, Some("0")));
+        assert!(!local_requested(false, Some("")));
+        assert!(!local_requested(false, Some("true")));
+        assert!(!local_requested(false, None));
+    }
+
+    #[test]
+    fn caps_truncate_and_leave_a_notice() {
+        let mut items: Vec<u32> = (0..10).collect();
+        let mut notices = Vec::new();
+        cap_with_notice(&mut items, 4, "things", &mut notices);
+        assert_eq!(items.len(), 4);
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0].contains('6'),
+            "notice should name the omitted count"
+        );
+
+        // A list within the cap is untouched and leaves no notice.
+        let mut small = vec![1, 2];
+        let mut none = Vec::new();
+        cap_with_notice(&mut small, 4, "things", &mut none);
+        assert_eq!(small.len(), 2);
+        assert!(none.is_empty());
     }
 }

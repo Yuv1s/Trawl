@@ -112,6 +112,36 @@ fn type_size(kind: u16) -> usize {
     }
 }
 
+/// A UserComment's text, past the eight bytes that say how it is encoded.
+///
+/// The tag is UNDEFINED rather than ASCII because of this prefix, and it carries nulls,
+/// so read like any other text it stops at the end of the word `ASCII` and the comment
+/// itself is never seen. A comment with no prefix at all, which plenty of tools write,
+/// is read as it stands.
+fn user_comment(endian: Endian, raw: &[u8]) -> (String, bool) {
+    let (prefix, body) = raw.split_at(raw.len().min(8));
+
+    if prefix == b"UNICODE\0" {
+        let units: Vec<u16> = body
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| endian.u16(pair))
+            .take_while(|&unit| unit != 0)
+            .collect();
+        let text = String::from_utf16_lossy(&units);
+        let printable = !text.is_empty() && !text.chars().any(char::is_control);
+        return (text, printable);
+    }
+
+    let text = if matches!(prefix, b"ASCII\0\0\0" | b"JIS\0\0\0\0\0" | [0, 0, 0, 0, 0, 0, 0, 0]) {
+        body
+    } else {
+        raw
+    };
+    render(endian, 2, text.len(), text)
+}
+
 /// Renders an entry's value, keeping text as text and numbers readable.
 fn render(endian: Endian, kind: u16, count: usize, raw: &[u8]) -> (String, bool) {
     match kind {
@@ -172,6 +202,7 @@ fn render(endian: Endian, kind: u16, count: usize, raw: &[u8]) -> (String, bool)
 
 const MAX_ENTRIES: usize = 512;
 const MAX_VALUE_BYTES: usize = 4096;
+const USER_COMMENT: u16 = 0x9286;
 
 fn walk_ifd(
     tiff: &[u8],
@@ -187,13 +218,16 @@ fn walk_ifd(
     }
     seen.push(offset);
 
-    let Some(header) = tiff.get(offset..offset + 2) else {
+    // Attacker-controlled, and near the top of 32 bits it wraps in WASM. Stopping here
+    // means nothing after this needs to think about it again.
+    let Some(table) = offset.checked_add(2).filter(|&table| table <= tiff.len()) else {
         return;
     };
+    let header = &tiff[offset..table];
     let count = (endian.u16(header) as usize).min(MAX_ENTRIES);
 
     for i in 0..count {
-        let at = offset + 2 + i * 12;
+        let at = table + i * 12;
         let Some(entry) = tiff.get(at..at + 12) else {
             return;
         };
@@ -212,7 +246,8 @@ fn walk_ifd(
             &entry[8..8 + size.min(4)]
         } else {
             let at = endian.u32(&entry[8..12]) as usize;
-            match tiff.get(at..at + size) {
+            // A 32-bit offset plus a size wraps in WASM.
+            match at.checked_add(size).and_then(|end| tiff.get(at..end)) {
                 Some(slice) => slice,
                 None => continue,
             }
@@ -229,7 +264,11 @@ fn walk_ifd(
             continue;
         }
 
-        let (value, textual) = render(endian, kind, values, raw);
+        let (value, textual) = if tag == USER_COMMENT && matches!(kind, 2 | 7) {
+            user_comment(endian, raw)
+        } else {
+            render(endian, kind, values, raw)
+        };
         let named = if label == "GPS" { gps_tag_name(tag) } else { tag_name(tag) };
 
         out.push(Entry {
@@ -242,7 +281,7 @@ fn walk_ifd(
     }
 
     // The next-IFD pointer sits after the entries.
-    let next_at = offset + 2 + count * 12;
+    let next_at = table + count * 12;
     if let Some(slice) = tiff.get(next_at..next_at + 4) {
         let next = endian.u32(slice) as usize;
         if next != 0 && label == "IFD0" {

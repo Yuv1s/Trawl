@@ -27,6 +27,13 @@ fn embed_lsbs(samples: &mut [u8], upto: usize, seed: u32) {
 }
 
 #[test]
+fn a_prefix_of_a_large_image_does_not_wrap() {
+    assert_eq!(prefix_end(400_000_000, 32, 32), 400_000_000);
+    assert_eq!(prefix_end(400_000_000, 16, 32), 200_000_000);
+    assert_eq!(prefix_end(10, 1, 32), 1, "never an empty first prefix");
+}
+
+#[test]
 fn ln_gamma_matches_known_values() {
     assert!((ln_gamma(1.0) - 0.0).abs() < 1e-10);
     assert!((ln_gamma(2.0) - 0.0).abs() < 1e-10);

@@ -29,7 +29,9 @@ pub struct Group {
 ///
 /// @param palette RGB triples, as PLTE stores them
 pub fn groups(palette: &[u8]) -> Vec<Group> {
-    let entries = palette.len() / 3;
+    // An index is one byte, so an entry past the 256th can never paint a pixel, and
+    // counted anyway it would wrap round to masquerade as one of the first.
+    let entries = (palette.len() / 3).min(256);
     let mut seen: Vec<Group> = Vec::new();
 
     for i in 0..entries {
@@ -56,18 +58,28 @@ pub fn groups(palette: &[u8]) -> Vec<Group> {
     seen
 }
 
+/// For each index, which group holds it and which copy it is.
+///
+/// Looked up once per pixel, and an image can have a hundred million of them, so this
+/// is a table rather than a search through the groups.
+fn choices(found: &[Group]) -> [Option<(u32, u32)>; 256] {
+    let mut table = [None; 256];
+    for group in found {
+        for (copy, &index) in group.indices.iter().enumerate() {
+            table[index as usize] = Some((group.bits, copy as u32));
+        }
+    }
+    table
+}
+
 /// Total bits the duplicate entries carry across this image.
 pub fn capacity(palette: &[u8], indices: &[u8]) -> usize {
-    let found = groups(palette);
+    let table = choices(&groups(palette));
 
     indices
         .iter()
-        .filter_map(|&i| {
-            found
-                .iter()
-                .find(|g| g.indices.contains(&i))
-                .map(|g| g.bits as usize)
-        })
+        .filter_map(|&i| table[i as usize])
+        .map(|(bits, _)| bits as usize)
         .sum()
 }
 
@@ -79,23 +91,19 @@ pub fn extract(palette: &[u8], indices: &[u8], msb_first: bool, max_bytes: usize
     if found.is_empty() {
         return Vec::new();
     }
+    let table = choices(&found);
 
     let mut out = Vec::new();
     let mut byte = 0u8;
     let mut filled = 0u8;
 
     for &index in indices {
-        let Some(group) = found.iter().find(|g| g.indices.contains(&index)) else {
+        // Which copy this pixel chose, which is the value the encoder wrote.
+        let Some((bits, choice)) = table[index as usize] else {
             continue;
         };
-        if group.bits == 0 {
-            continue;
-        }
 
-        // Which copy this pixel chose, which is the value the encoder wrote.
-        let choice = group.indices.iter().position(|&i| i == index).unwrap() as u32;
-
-        for shift in (0..group.bits).rev() {
+        for shift in (0..bits).rev() {
             let bit = ((choice >> shift) & 1) as u8;
 
             byte = if msb_first {

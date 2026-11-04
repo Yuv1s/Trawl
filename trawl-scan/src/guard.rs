@@ -58,6 +58,12 @@ pub fn forbidden(ip: IpAddr) -> Option<Reason> {
 /// because no challenge is ever there and the risk of reaching it does not go
 /// away just because the target happens to be local.
 pub fn forbidden_with(ip: IpAddr, allow_local: bool) -> Option<Reason> {
+    // Metadata endpoints are refused first, so the local-mode allowance below can
+    // never reach them. A unique-local address like fd00:ec2::254 is "local" by
+    // shape, but it is AWS's metadata endpoint and stays shut in every mode.
+    if let Some(reason) = cloud_metadata_reason(ip) {
+        return Some(reason);
+    }
     let reason = forbidden(ip)?;
     if allow_local && is_local(ip) {
         return None;
@@ -98,6 +104,9 @@ fn forbidden_v4(ip: Ipv4Addr) -> Option<Reason> {
         // 169.254.0.0/16: link-local, and with it 169.254.169.254, the cloud
         // metadata endpoint. The single most important line here.
         [169, 254, ..] => Some("link-local, includes cloud metadata (169.254.0.0/16)"),
+        // 168.63.129.16: Azure's wire server, a metadata endpoint that lives on
+        // an otherwise public-looking address, so it needs naming outright.
+        [168, 63, 129, 16] => Some("link-local, includes cloud metadata (168.63.129.16)"),
         // 100.64.0.0/10: carrier-grade NAT, a provider's internal space.
         [100, x, ..] if (64..=127).contains(&x) => Some("carrier-grade NAT (100.64.0.0/10)"),
         // 192.0.0.0/24 and 192.0.2.0/24: IETF protocol assignments and TEST-NET.
@@ -117,11 +126,12 @@ fn forbidden_v4(ip: Ipv4Addr) -> Option<Reason> {
 }
 
 fn forbidden_v6(ip: Ipv6Addr) -> Option<Reason> {
-    // An IPv4 address wearing an IPv6 coat. ::ffff:169.254.169.254 reaches the
-    // metadata endpoint as surely as the bare v4 does, so it is unwrapped and
-    // judged as what it is. `to_ipv4_mapped` is exactly this and nothing else,
-    // so it does not misread a native v6 address as v4.
-    if let Some(v4) = ip.to_ipv4_mapped() {
+    // An IPv4 address wearing an IPv6 coat, in any of the forms that tunnel to a
+    // v4 host: mapped, compatible, NAT64, 6to4, Teredo. Each reaches the embedded
+    // v4 as surely as the bare address does, so the v4 rules judge it. A private
+    // or metadata target smuggled through one of these is caught exactly as the
+    // bare v4 would be; a public one stays reachable, the same as `::ffff:8.8.8.8`.
+    if let Some(v4) = embedded_v4(ip) {
         return forbidden_v4(v4);
     }
 
@@ -138,6 +148,10 @@ fn forbidden_v6(ip: Ipv6Addr) -> Option<Reason> {
     if first & 0xffc0 == 0xfe80 {
         return Some("link-local (fe80::/10)");
     }
+    // fec0::/10 site-local, deprecated but still routed on some stacks.
+    if first & 0xffc0 == 0xfec0 {
+        return Some("site-local (fec0::/10)");
+    }
     // fc00::/7 unique local, the v6 equivalent of a private network.
     if first & 0xfe00 == 0xfc00 {
         return Some("unique local address (fc00::/7)");
@@ -146,20 +160,93 @@ fn forbidden_v6(ip: Ipv6Addr) -> Option<Reason> {
     if first & 0xff00 == 0xff00 {
         return Some("multicast (ff00::/8)");
     }
-    // Deprecated IPv4-compatible addresses (::a.b.c.d) tunnel to a v4 host and
-    // are another way to smuggle a private target past a v6-only check.
-    let [.., c, d] = ip.segments();
-    if ip.segments()[..6].iter().all(|&s| s == 0) && ip != Ipv6Addr::LOCALHOST {
-        let v4 = Ipv4Addr::new(
-            (c >> 8) as u8,
-            (c & 0xff) as u8,
-            (d >> 8) as u8,
-            (d & 0xff) as u8,
-        );
-        return forbidden_v4(v4).or(Some("IPv4-compatible IPv6 address"));
+    // Everything reachable on the public v6 internet is global unicast, 2000::/3.
+    // Refusing all else is the opposite default from v4 and the safe one: the
+    // special-purpose blocks above are specific, and nothing outside 2000::/3 is
+    // an ordinary target, so the catch-all denies rather than allows.
+    if first & 0xe000 != 0x2000 {
+        return Some("not global unicast (outside 2000::/3)");
     }
 
     None
+}
+
+/// The IPv4 address an IPv6 address carries, when it is one of the forms that
+/// tunnel to a v4 host. `None` for a native IPv6 address.
+///
+/// Returned so the v4 rules can judge the real destination: `64:ff9b::a9fe:a9fe`
+/// reaches the metadata endpoint exactly as `169.254.169.254` does, and a guard
+/// that only looked at the v6 bits would wave it through.
+fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    // ::ffff:a.b.c.d, the mapped form a dual-stack socket hands back.
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return Some(v4);
+    }
+
+    let s = ip.segments();
+
+    // ::a.b.c.d, the deprecated IPv4-compatible form, but not :: or ::1.
+    if s[..6].iter().all(|&x| x == 0) && (s[6], s[7]) != (0, 0) && ip != Ipv6Addr::LOCALHOST {
+        return Some(v4_from(s[6], s[7]));
+    }
+    // 64:ff9b::/96, the well-known NAT64 prefix: the v4 is the last 32 bits.
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6].iter().all(|&x| x == 0) {
+        return Some(v4_from(s[6], s[7]));
+    }
+    // 2002::/16, 6to4: the v4 is the second and third segments.
+    if s[0] == 0x2002 {
+        return Some(v4_from(s[1], s[2]));
+    }
+    // 2001:0::/32, Teredo: the server v4 is segments 2 and 3, the client v4 is
+    // the last two segments with every bit flipped. Either can point inward, so
+    // the one that the v4 rules refuse is the one to report.
+    if s[0] == 0x2001 && s[1] == 0x0000 {
+        let server = v4_from(s[2], s[3]);
+        if forbidden_v4(server).is_some() {
+            return Some(server);
+        }
+        return Some(v4_from(!s[6], !s[7]));
+    }
+
+    None
+}
+
+/// The IPv4 address packed into two IPv6 segments, high segment first.
+fn v4_from(hi: u16, lo: u16) -> Ipv4Addr {
+    Ipv4Addr::new(
+        (hi >> 8) as u8,
+        (hi & 0xff) as u8,
+        (lo >> 8) as u8,
+        (lo & 0xff) as u8,
+    )
+}
+
+/// The reason an address is a cloud metadata endpoint, checked in every mode.
+///
+/// These are the addresses a scanner must never reach however it was started:
+/// the link-local metadata range and the provider addresses outside it, in v4
+/// and in the v6 forms that reach the same place. Kept apart from [`forbidden`]
+/// so [`forbidden_with`] can refuse them before it ever considers the local-mode
+/// allowance, since the promise that metadata stays blocked does not bend for a
+/// local scan.
+fn cloud_metadata_reason(ip: IpAddr) -> Option<Reason> {
+    match ip {
+        IpAddr::V4(v4) => match v4.octets() {
+            [169, 254, ..] => Some("link-local, includes cloud metadata (169.254.0.0/16)"),
+            [168, 63, 129, 16] => Some("link-local, includes cloud metadata (168.63.129.16)"),
+            _ => None,
+        },
+        IpAddr::V6(v6) => {
+            if let Some(v4) = embedded_v4(v6) {
+                return cloud_metadata_reason(IpAddr::V4(v4));
+            }
+            // fd00:ec2::254, the unique-local address AWS answers IMDS on over v6.
+            if v6 == Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254) {
+                return Some("link-local, includes cloud metadata (fd00:ec2::254)");
+            }
+            None
+        }
+    }
 }
 
 /// What a hostname resolved to, and whether it may be scanned.
@@ -210,6 +297,40 @@ pub fn resolve_and_check(host: &str, port: u16, allow_local: bool) -> std::io::R
         .collect::<Vec<_>>();
 
     Ok(Resolved { addresses })
+}
+
+/// Whether every address a host resolved to is one local mode exists to reach:
+/// blocked by default, allowed only when local mode is on. Empty or mixed with a
+/// public or metadata address, the answer is no.
+///
+/// This is how the entry to a scan is classified. Local access is a property of
+/// the target the person named, not a blanket setting: it is earned only when
+/// that target itself is local, so a public page cannot inherit it and redirect
+/// or resolve its way into the network behind the scanner.
+fn addresses_are_local_entry(addresses: &[IpAddr]) -> bool {
+    !addresses.is_empty()
+        && addresses
+            .iter()
+            .all(|&ip| forbidden(ip).is_some() && forbidden_with(ip, true).is_none())
+}
+
+/// Whether a scan entered at this host may use local access: the scanner is in
+/// local mode and the host resolves wholly to local or private addresses.
+///
+/// Resolution failure or any public or metadata address means no, so the strict
+/// guard governs the whole scan. The later per-hop [`resolve_and_check`] still
+/// runs with the answer, so this only ever narrows what a scan may reach.
+pub fn host_allows_local(host: &str, port: u16, scanner_allow_local: bool) -> bool {
+    if !scanner_allow_local {
+        return false;
+    }
+    match (host, port).to_socket_addrs() {
+        Ok(sockets) => {
+            let addresses: Vec<IpAddr> = sockets.map(|socket| socket.ip()).collect();
+            addresses_are_local_entry(&addresses)
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]

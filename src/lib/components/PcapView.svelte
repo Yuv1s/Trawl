@@ -31,7 +31,7 @@
 <div class="pcap">
 	{#if findings.length > 0}
 		<ul class="findings">
-			{#each findings as stream (stream.src + stream.dst)}
+			{#each findings as stream, i (i)}
 				<li class="flagged">
 					{#if stream.flags.length > 0}
 						{stream.flags.length === 1 ? 'A flag' : `${stream.flags.length} flags`} reassembled from the
@@ -46,9 +46,8 @@
 		</ul>
 	{:else}
 		<p class="clear">
-			Every packet that carried a flag would carry it whole, and the byte scan already reads those.
-			No stream reassembled into one, and no connection carried a file whose signature the file scan
-			could not see. That is what an ordinary capture looks like.
+			No reassembled stream contains a flag or a complete file, which is normal for an ordinary
+			capture. A flag sitting whole inside one packet would show up in the byte scan instead.
 		</p>
 	{/if}
 
@@ -103,7 +102,7 @@
 						</tr>
 					</thead>
 					<tbody>
-						{#each cap.conversations as conv (conv.a + conv.b + conv.protocol)}
+						{#each cap.conversations as conv, i (i)}
 							<tr>
 								<td class="mono">{conv.a}</td>
 								<td class="mono">{conv.b}</td>
@@ -122,7 +121,7 @@
 		<section>
 			<h3 class="label">DNS questions</h3>
 			<ul class="dns">
-				{#each cap.dns as query (query.name + query.type)}
+				{#each cap.dns as query, i (i)}
 					<li>
 						<span class="mono name">{query.name}</span>
 						<span class="mono muted">{query.type}</span>
@@ -141,7 +140,7 @@
 				{/if}
 			</h3>
 			<div class="streams">
-				{#each cap.streams as stream (stream.src + stream.dst)}
+				{#each cap.streams as stream, i (i)}
 					<article class="stream" class:hit={finding(stream)}>
 						<header>
 							<span class="mono flow" class:flagged={finding(stream)}
@@ -152,7 +151,7 @@
 								<span class="mono chip">{stream.embeddedFile}</span>
 							{/if}
 						</header>
-						{#each stream.flags as flag (flag)}
+						{#each new Set(stream.flags) as flag (flag)}
 							<span class="mono big flagged">{flag}</span>
 						{/each}
 						<pre class="transcript mono" class:binary={stream.printable < 0.7}>{stream.text}</pre>
@@ -163,11 +162,10 @@
 	{/if}
 
 	<p class="footnote">
-		A flag shown in the accent came out of a reassembled stream, not the file. TCP breaks a stream
-		into segments, and in the file the payload of one segment is followed by the headers of the
-		packet carrying the next, so a flag crossing that boundary is interrupted by bytes that are not
-		part of it. Following the sequence numbers and laying the payloads back in order is the only way
-		it reads again.
+		A flag in the accent colour came from a reassembled stream. TCP splits a stream into segments,
+		and in the file each segment's payload is followed by the headers of the next packet, so those
+		headers interrupt any flag that crosses the boundary. Trawl follows the sequence numbers and
+		puts the payloads back in order, which makes the flag readable again.
 	</p>
 </div>
 

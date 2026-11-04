@@ -75,7 +75,10 @@ fn the_wordlist_holds_the_names_a_flag_actually_gets() {
     // A guard against someone quietly gutting the list: the obvious ones have
     // to stay in it.
     for name in ["/flag.txt", "/flag", "/secret.txt", "/key.txt", "/uploads/"] {
-        assert!(DISCOVERY_PATHS.contains(&name), "{name} missing from the sweep");
+        assert!(
+            DISCOVERY_PATHS.contains(&name),
+            "{name} missing from the sweep"
+        );
     }
     // Every entry is a rooted path.
     assert!(DISCOVERY_PATHS.iter().all(|p| p.starts_with('/')));

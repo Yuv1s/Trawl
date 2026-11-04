@@ -6,6 +6,13 @@
 
 use crate::{bmp, gif, png};
 
+/// Most pixels a decoder will expand to RGBA, at four bytes each.
+///
+/// A deflate stream and a one-bit depth together turn a few kilobytes of file into
+/// gigabytes of pixels, and a failed allocation in WASM traps the whole instance
+/// rather than returning an error. No photograph comes near this.
+pub const MAX_PIXELS: usize = 1 << 27;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Raster {
     pub width: usize,
@@ -59,7 +66,7 @@ pub fn decode(file: &[u8], inflated: &[u8]) -> Result<Raster, String> {
         });
     }
 
-    Err("no decoder for this format yet".to_string())
+    Err("Trawl can't decode this format yet".to_string())
 }
 
 #[cfg(test)]

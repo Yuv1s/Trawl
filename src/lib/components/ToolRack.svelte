@@ -61,15 +61,17 @@
 		</section>
 	{/each}
 
-	<h2 class="label planned-head">Not built yet</h2>
-	<ul class="planned">
-		{#each planned as tool (tool.id)}
-			<li>
-				<span class="name">{tool.name}</span>
-				<span class="measures">{tool.measures}</span>
-			</li>
-		{/each}
-	</ul>
+	{#if planned.length > 0}
+		<h2 class="label planned-head">Not built yet</h2>
+		<ul class="planned">
+			{#each planned as tool (tool.id)}
+				<li>
+					<span class="name">{tool.name}</span>
+					<span class="measures">{tool.measures}</span>
+				</li>
+			{/each}
+		</ul>
+	{/if}
 </div>
 
 <style>
@@ -126,7 +128,7 @@
 	.tool {
 		width: 100%;
 		display: grid;
-		grid-template-columns: 1fr auto;
+		grid-template-columns: minmax(0, 1fr) minmax(0, auto);
 		gap: 0 var(--s3);
 		padding: var(--s3) var(--s4);
 		background: none;
@@ -158,6 +160,7 @@
 		letter-spacing: 0.1em;
 		color: var(--muted);
 		align-self: center;
+		text-align: right;
 	}
 
 	.status.hit {

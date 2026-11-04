@@ -13,6 +13,65 @@ fn names(peel: &Peel) -> Vec<&str> {
 }
 
 #[test]
+fn a_run_past_the_size_limit_is_not_attacked() {
+    let text: Vec<u8> = (0..MAX_INPUT + 1).map(|i| b'a' + (i * i % 26) as u8).collect();
+
+    let started = std::time::Instant::now();
+    let reading = read(&text);
+    assert!(started.elapsed().as_secs() < 15, "took {:?}", started.elapsed());
+
+    assert!(reading.peel.steps.is_empty());
+    assert!(reading.vigenere.is_none() && reading.shortlist.is_empty());
+}
+
+#[test]
+fn readable_capitals_are_not_rotated_into_a_file_signature() {
+    // Rotated, these open with BM, and a bare two-byte match on that called the rotation
+    // a bitmap and handed it back as the answer in place of the readable sentence.
+    for text in [
+        &b"TELL ME WHAT THE SECRET MESSAGE IS BEFORE THE END OF THE DAY"[..],
+        b"IT WAS THE BEST OF TIMES AND IT WAS THE WORST OF TIMES",
+        b"BM WAS THE BEST OF TIMES AND IT WAS THE WORST OF TIMES",
+    ] {
+        let found = peel(text);
+        assert!(found.steps.is_empty(), "{:?}", found.steps);
+        assert_eq!(found.result, text);
+    }
+}
+
+#[test]
+fn a_real_signature_is_still_conclusive() {
+    let mut bmp = b"BM".to_vec();
+    bmp.extend_from_slice(&60u32.to_le_bytes());
+    bmp.extend_from_slice(&[0u8; 64]);
+    bmp[14] = 40;
+
+    assert_eq!(conclusive(&bmp, &[]).as_deref(), Some("BMP image signature"));
+    assert_eq!(conclusive(b"BM just text", &[]), None);
+}
+
+#[test]
+fn a_configured_tag_outside_the_usual_shape_is_conclusive() {
+    let tags = vec!["HV".to_string()];
+    assert_eq!(
+        conclusive(b"HV{some_flag_here}", &tags).as_deref(),
+        Some("flag shape, HV{some_flag_here}")
+    );
+    assert_eq!(conclusive(b"HV{some_flag_here}", &[]), None);
+}
+
+#[test]
+fn a_short_key_recovered_through_the_shared_working_matches_solving_alone() {
+    let plain = b"the treasure is buried under the old oak tree at the north end of the field and you will need a spade";
+    let hidden = vigenere::encipher(plain, b"key");
+    let reading = read(&hidden);
+
+    assert_eq!(reading.vigenere, vigenere::solve(&hidden, &[]));
+    assert_eq!(reading.vigenere.unwrap().key, b"key".to_vec());
+    assert_eq!(reading.derived, vigenere::derive(&hidden, &[]));
+}
+
+#[test]
 fn scores_prose_above_an_encoded_blob() {
     let prose = plainness(b"the quick brown fox jumps over the lazy dog");
     let blob = plainness(b"dGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIHRoZSBsYXp5IGRvZw==");

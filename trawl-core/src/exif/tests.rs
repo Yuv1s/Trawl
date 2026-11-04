@@ -121,7 +121,8 @@ fn parse_accepts_big_endian_byte_order() {
 fn parse_follows_the_pointer_into_the_exif_sub_directory() {
     const SUB: u32 = 26; // after the header, IFD0's single entry, and its next pointer
     const HEAP: u32 = SUB + 2 + 12 + 4;
-    let comment = b"flag{in_the_sub_ifd}\0";
+    // What a camera writes: UNDEFINED, with its encoding named in the first eight bytes.
+    let comment = b"ASCII\0\0\0flag{in_the_sub_ifd}\0";
 
     let mut tiff = b"II\x2a\x00".to_vec();
     tiff.extend_from_slice(&8u32.to_le_bytes());
@@ -137,7 +138,7 @@ fn parse_follows_the_pointer_into_the_exif_sub_directory() {
 
     tiff.extend_from_slice(&1u16.to_le_bytes());
     tiff.extend_from_slice(&0x9286u16.to_le_bytes()); // UserComment
-    tiff.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+    tiff.extend_from_slice(&7u16.to_le_bytes()); // UNDEFINED
     tiff.extend_from_slice(&(comment.len() as u32).to_le_bytes());
     tiff.extend_from_slice(&HEAP.to_le_bytes());
     tiff.extend_from_slice(&0u32.to_le_bytes());
@@ -149,6 +150,74 @@ fn parse_follows_the_pointer_into_the_exif_sub_directory() {
     let found = entries.iter().find(|e| e.name == "UserComment").unwrap();
     assert_eq!(found.value, "flag{in_the_sub_ifd}");
     assert_eq!(found.ifd, "EXIF");
+}
+
+/// One IFD0 entry holding a UserComment of the given bytes.
+fn with_user_comment(kind: u16, comment: &[u8]) -> Vec<u8> {
+    let mut tiff = b"II\x2a\x00".to_vec();
+    tiff.extend_from_slice(&8u32.to_le_bytes());
+    tiff.extend_from_slice(&1u16.to_le_bytes());
+    tiff.extend_from_slice(&0x9286u16.to_le_bytes());
+    tiff.extend_from_slice(&kind.to_le_bytes());
+    tiff.extend_from_slice(&(comment.len() as u32).to_le_bytes());
+    tiff.extend_from_slice(&26u32.to_le_bytes());
+    tiff.extend_from_slice(&0u32.to_le_bytes());
+    tiff.extend_from_slice(comment);
+    tiff
+}
+
+fn user_comment_of(tiff: &[u8]) -> Entry {
+    parse(tiff).unwrap().into_iter().find(|e| e.name == "UserComment").unwrap()
+}
+
+#[test]
+fn a_user_comment_is_read_past_its_encoding_prefix() {
+    // The null in the prefix used to stop the read, so the value came back as "ASCII".
+    let found = user_comment_of(&with_user_comment(7, b"ASCII\0\0\0flag{in_the_user_comment}"));
+    assert_eq!(found.value, "flag{in_the_user_comment}");
+    assert!(found.textual);
+}
+
+#[test]
+fn a_user_comment_in_unicode_is_decoded() {
+    let mut comment = b"UNICODE\0".to_vec();
+    comment.extend("flag{wide_comment}".encode_utf16().flat_map(u16::to_le_bytes));
+
+    let found = user_comment_of(&with_user_comment(7, &comment));
+    assert_eq!(found.value, "flag{wide_comment}");
+    assert!(found.textual);
+}
+
+#[test]
+fn a_user_comment_with_an_undefined_encoding_is_read_past_its_zeroes() {
+    let found = user_comment_of(&with_user_comment(7, b"\0\0\0\0\0\0\0\0plain words"));
+    assert_eq!(found.value, "plain words");
+}
+
+#[test]
+fn a_user_comment_with_no_prefix_is_read_as_it_stands() {
+    let found = user_comment_of(&with_user_comment(2, b"just a sentence, no prefix\0"));
+    assert_eq!(found.value, "just a sentence, no prefix");
+}
+
+#[test]
+fn a_prefix_and_nothing_else_is_an_empty_comment() {
+    let found = user_comment_of(&with_user_comment(7, b"ASCII\0\0\0"));
+    assert_eq!(found.value, "");
+    assert!(!found.textual);
+}
+
+#[test]
+fn offsets_near_the_top_of_32_bits_are_refused() {
+    // Either one wraps in WASM, and a wrapped sum is an address inside the buffer.
+    let mut tiff = b"II\x2a\x00".to_vec();
+    tiff.extend_from_slice(&0xffff_fff8u32.to_le_bytes());
+    tiff.extend_from_slice(&[0u8; 32]);
+    assert!(parse(&tiff).unwrap().is_empty());
+
+    let mut tiff = with_user_comment(7, b"long enough to need an offset");
+    tiff[18..22].copy_from_slice(&0xffff_fff8u32.to_le_bytes());
+    assert!(parse(&tiff).unwrap().is_empty());
 }
 
 #[test]

@@ -5,13 +5,14 @@
 //! visible to the rest of the network. The port is 8099 unless `PORT` says
 //! otherwise, and it is printed on start so the frontend's default matches.
 //!
-//! `--allow-local` (or `TRAWL_ALLOW_LOCAL` set) lets it reach targets on this
+//! `--allow-local` (or `TRAWL_ALLOW_LOCAL=1`) lets it reach targets on this
 //! machine and on private networks, for challenges hosted locally. It is off by
 //! default, because a scanner that reaches inward is the danger it guards
-//! against, so turning it on is a choice the person starting it makes.
+//! against, so turning it on is a choice the person starting it makes. Only the
+//! exact value `1` counts, so a leftover `TRAWL_ALLOW_LOCAL=0` does not open it.
 
 use std::net::SocketAddr;
-use trawl_scan::server::Config;
+use trawl_scan::server::{Config, local_requested};
 
 fn required_environment(name: &str) -> Result<String, String> {
     match std::env::var(name) {
@@ -28,12 +29,15 @@ async fn main() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(8099u16);
 
-    let allow_local = std::env::args().any(|arg| arg == "--allow-local")
-        || std::env::var_os("TRAWL_ALLOW_LOCAL").is_some();
+    let flag_present = std::env::args().any(|arg| arg == "--allow-local");
+    let allow_local = local_requested(
+        flag_present,
+        std::env::var("TRAWL_ALLOW_LOCAL").ok().as_deref(),
+    );
 
     let config = match required_environment("TRAWL_TOKEN").and_then(|token| {
         required_environment("TRAWL_ORIGIN")
-            .and_then(|origin| Config::new(allow_local, token, origin))
+            .and_then(|origin| Config::new(allow_local, token, origin).map(|c| c.with_port(port)))
     }) {
         Ok(config) => config,
         Err(error) => {

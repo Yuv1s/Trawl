@@ -23,6 +23,11 @@ pub struct Segment {
     pub data_offset: usize,
 }
 
+/// Most segments one walk records. A segment can be four bytes, so a file of nothing
+/// else would hold millions of them, and every reader here walks the list again. A
+/// real JPEG has a few dozen.
+const MAX_SEGMENTS: usize = 1 << 16;
+
 pub fn has_signature(file: &[u8]) -> bool {
     file.starts_with(&[0xff, 0xd8])
 }
@@ -92,7 +97,7 @@ pub fn segments(file: &[u8]) -> Vec<Segment> {
 
     let mut at = 0usize;
 
-    while at + 1 < file.len() {
+    while at + 1 < file.len() && out.len() < MAX_SEGMENTS {
         if file[at] != 0xff {
             match next_marker(file, at) {
                 Some(found) => at = found,

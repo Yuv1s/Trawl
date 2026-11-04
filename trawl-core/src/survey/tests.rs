@@ -80,6 +80,127 @@ fn the_survey_runs_on_a_format_it_cannot_walk() {
     assert!(text.contains("\"credible\":true"));
 }
 
+/// A well-formed JPEG shell around a run of scan data as random as the real thing.
+fn jpeg_around_noise() -> Vec<u8> {
+    let mut jpeg = vec![0xff, 0xd8, 0xff, 0xda, 0x00, 0x02];
+    jpeg.extend(noise(8192, 0x1234).into_iter().map(|b| if b == 0xff { 0x7f } else { b }));
+    jpeg.extend_from_slice(&[0xff, 0xd9]);
+    jpeg
+}
+
+#[test]
+fn a_flag_appended_after_a_jpeg_is_credited() {
+    // Half a kilobyte of compressed scan data sits right before it, and averaging that
+    // in called the flag noise.
+    let mut file = jpeg_around_noise();
+    file.extend_from_slice(b"flag{appended_after_the_eoi}");
+
+    let text = json(&file);
+    assert!(text.contains("\"jpegTrailing\":{"), "{text}");
+    assert!(text.contains("flag{appended_after_the_eoi}"), "{text}");
+    assert!(text.contains("\"credible\":true"), "{text}");
+    assert!(!text.contains("\"credible\":false"), "{text}");
+}
+
+#[test]
+fn a_flag_appended_to_every_compressed_format_is_credited() {
+    let flag = b"flag{appended_past_the_end}";
+    let body = noise(8192, 0x77);
+
+    let mut gif = b"GIF89a\x01\x00\x01\x00\x00\x00\x00".to_vec();
+    gif.extend_from_slice(&[0x21, 0xfe]);
+    for block in body.chunks(255) {
+        gif.push(block.len() as u8);
+        gif.extend_from_slice(block);
+    }
+    gif.extend_from_slice(&[0, 0x3b]);
+
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    pdf.extend_from_slice(&body);
+    pdf.extend_from_slice(b"%%EOF");
+
+    let mut zip = b"PK\x03\x04".to_vec();
+    zip.extend_from_slice(&[0u8; 22]);
+    zip.extend_from_slice(&1u16.to_le_bytes());
+    zip.extend_from_slice(&0u16.to_le_bytes());
+    zip.push(b'x');
+    zip.extend_from_slice(&body);
+    zip.extend_from_slice(b"PK\x05\x06");
+    zip.extend_from_slice(&[0u8; 18]);
+
+    let mut wav = b"RIFF\x00\x20\x00\x00WAVE".to_vec();
+    wav.extend_from_slice(b"fmt \x10\x00\x00\x00\x01\x00\x01\x00\x40\x1f\x00\x00\x40\x1f\x00\x00\x01\x00\x08\x00");
+    wav.extend_from_slice(b"data\xe4\x1f\x00\x00");
+    wav.extend_from_slice(&body[..0x1fe4]);
+
+    for (name, mut file) in [("gif", gif), ("pdf", pdf), ("zip", zip), ("wav", wav)] {
+        file.extend_from_slice(flag);
+        let text = json(&file);
+        assert!(text.contains("flag{appended_past_the_end}"), "{name}: {text}");
+        assert!(text.contains("\"credible\":true"), "{name} did not credit it");
+    }
+}
+
+#[test]
+fn a_flag_shape_inside_trailing_noise_is_still_not_credited() {
+    // Appended data gets judged on its own, which is no free pass when it is itself
+    // compressed.
+    let mut file = jpeg_around_noise();
+    let mut tail = noise(8192, 0x4321);
+    tail[4000..4011].copy_from_slice(b"flag{abcde}");
+    file.extend_from_slice(&tail);
+
+    let text = json(&file);
+    assert!(text.contains("flag{abcde}"));
+    assert!(text.contains("\"credible\":false"), "{text}");
+}
+
+#[test]
+fn a_flag_shape_inside_the_scan_data_is_still_not_credited() {
+    let mut file = jpeg_around_noise();
+    file[4000..4011].copy_from_slice(b"flag{abcde}");
+    file.extend_from_slice(b"appended");
+
+    let text = json(&file);
+    assert!(text.contains("flag{abcde}"));
+    assert!(text.contains("\"credible\":false"), "{text}");
+}
+
+#[test]
+fn entropy_is_counted_only_on_this_side_of_the_end() {
+    let mut file = jpeg_around_noise();
+    let end = file.len();
+    file.extend_from_slice(&[b'a'; 64]);
+
+    let at = |offset: usize| bytes::Found {
+        offset,
+        text: "flag{abcd}".to_string(),
+    };
+
+    let (_, inside) = credible(&file, &at(4000), Some(end));
+    assert!(!inside);
+    let (_, past) = credible(&file, &at(end + 3), Some(end));
+    assert!(past);
+    let (_, straddling) = credible(&file, &at(end - 3), Some(end));
+    assert!(straddling, "it finishes past the end, so that is where it belongs");
+    assert_eq!(format_end(&file), Some(end));
+}
+
+#[test]
+fn a_file_of_wide_flags_reports_a_bounded_number() {
+    let wide: Vec<u8> = "flag{abcd}\u{ffff}"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let text = json(&wide.repeat(bytes::MAX_FLAGS + 50));
+    assert_eq!(text.matches("\"UTF-16LE text\"").count(), bytes::MAX_FLAGS);
+}
+
+#[test]
+fn text_that_only_starts_like_a_bitmap_is_not_named_one() {
+    assert!(json(b"BM not a bitmap, just text").contains("\"format\":null"));
+}
+
 fn entropy_values(text: &str) -> Vec<f32> {
     let start = text.find("\"values\":[").unwrap() + 10;
     let end = start + text[start..].find(']').unwrap();

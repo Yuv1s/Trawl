@@ -102,6 +102,103 @@ fn allows_ordinary_public_addresses() {
 }
 
 #[test]
+fn blocks_the_v6_metadata_translation_addresses() {
+    // Each reaches 169.254.169.254 through a different v6 tunnel, and each slipped
+    // the guard before: NAT64, 6to4 and Teredo all embed the metadata v4.
+    for addr in [
+        "64:ff9b::a9fe:a9fe",
+        "2002:a9fe:a9fe::1",
+        "2001:0:a9fe:a9fe::1",
+    ] {
+        assert!(
+            forbidden(v6(addr)).is_some(),
+            "{addr} was allowed by default"
+        );
+        assert!(
+            forbidden_with(v6(addr), true).is_some(),
+            "{addr} was allowed in local mode"
+        );
+    }
+}
+
+#[test]
+fn blocks_site_local_and_the_azure_wire_server() {
+    // fec0::/10 site-local was reachable before; so was Azure's 168.63.129.16,
+    // which hides on an ordinary-looking v4 address.
+    assert!(forbidden(v6("fec0::1")).is_some());
+    assert!(forbidden_with(v6("fec0::1"), true).is_some());
+    assert!(forbidden(v4("168.63.129.16")).is_some());
+    assert!(forbidden_with(v4("168.63.129.16"), true).is_some());
+}
+
+#[test]
+fn blocks_aws_v6_metadata_even_in_local_mode() {
+    // fd00:ec2::254 is unique-local by shape, so local mode would have opened it;
+    // it is AWS's IMDS endpoint and the metadata promise must hold in both modes.
+    assert!(forbidden(v6("fd00:ec2::254")).is_some());
+    assert!(forbidden_with(v6("fd00:ec2::254"), true).is_some());
+    let reason = forbidden_with(v6("fd00:ec2::254"), true).unwrap();
+    assert!(
+        reason.contains("cloud metadata"),
+        "unhelpful reason: {reason}"
+    );
+}
+
+#[test]
+fn refuses_v6_outside_global_unicast() {
+    // Anything not in 2000::/3 is not an ordinary target; the v6 default denies.
+    assert!(forbidden(v6("4000::1")).is_some());
+    assert!(forbidden(v6("1000::1")).is_some());
+    // Global unicast itself stays reachable.
+    assert!(forbidden(v6("2606:4700:4700::1111")).is_none());
+}
+
+#[test]
+fn a_public_host_does_not_qualify_for_local_entry() {
+    // Entry classification: a scan may only use local access when the target it
+    // names is itself local. A public host, even in local mode, does not qualify.
+    let resolved = resolve_and_check("one.one.one.one", 80, false);
+    if let Ok(resolved) = resolved
+        && resolved
+            .safe_addresses()
+            .iter()
+            .any(|ip| !ip.is_unspecified())
+    {
+        let public: Vec<IpAddr> = resolved.addresses.iter().map(|(ip, _)| *ip).collect();
+        assert!(
+            !addresses_are_local_entry(&public),
+            "a public host was treated as a local entry"
+        );
+    }
+}
+
+#[test]
+fn a_loopback_host_qualifies_for_local_entry_only_in_local_mode() {
+    // localhost resolves to loopback, which is a local entry, but only a scanner
+    // started for local targets may act on it.
+    assert!(host_allows_local("localhost", 80, true));
+    assert!(!host_allows_local("localhost", 80, false));
+}
+
+#[test]
+fn local_entry_rejects_mixed_and_metadata_addresses() {
+    // A name answering with one public and one private address is a rebinding
+    // shape, not a clean local target.
+    assert!(!addresses_are_local_entry(&[
+        v4("8.8.8.8"),
+        v4("127.0.0.1")
+    ]));
+    // The metadata address is never a local entry, so it cannot turn local mode on.
+    assert!(!addresses_are_local_entry(&[v4("169.254.169.254")]));
+    assert!(!addresses_are_local_entry(&[]));
+    // A clean private answer does.
+    assert!(addresses_are_local_entry(&[
+        v4("10.0.0.5"),
+        v4("192.168.1.9")
+    ]));
+}
+
+#[test]
 fn the_reason_names_the_rule() {
     // A blocked scan should be legible, not a flat refusal.
     let reason = forbidden(v4("169.254.169.254")).unwrap();

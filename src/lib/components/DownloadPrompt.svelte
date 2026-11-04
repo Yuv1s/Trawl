@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { trapFocus } from '$lib/focus';
 	import {
 		SAMPLE_GROUPS,
 		downloadSample,
@@ -61,13 +62,19 @@
 <svelte:window onkeydown={keydown} />
 
 <div class="scrim" role="presentation" onclick={onScrimClick}>
-	<div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dl-title">
+	<div
+		class="dialog"
+		{@attach trapFocus}
+		role="dialog"
+		aria-modal="true"
+		aria-labelledby="dl-title"
+	>
 		<header class="head">
 			<span class="eyebrow">{total} samples</span>
-			<h2 id="dl-title">See it work</h2>
+			<h2 id="dl-title">Sample files</h2>
 			<p class="lede">
-				The whole corpus, grouped by what it exercises. Check one to watch the tools run in place,
-				or download it to drop back in yourself. Nothing here leaves the tab.
+				The full sample library, grouped by what each file exercises. Run one to watch the tools
+				work on it here, or download it and drop it in yourself.
 			</p>
 			<div class="search">
 				<input
@@ -129,8 +136,8 @@
 			{#if filtered.length === 0}
 				<div class="empty" role="status">
 					<p>
-						No sample matches <span class="mono">{query.trim()}</span>. Try a tool name, a format,
-						or part of a flag.
+						No sample matches <span class="mono">{query.trim()}</span>. Try a tool name, a format or
+						part of a flag.
 					</p>
 					<button type="button" class="get" onclick={() => (query = '')}>Clear filter</button>
 				</div>

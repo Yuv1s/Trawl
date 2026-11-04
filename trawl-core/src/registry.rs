@@ -23,6 +23,15 @@
 //! machines and one of the second kind does not.
 
 use crate::regf::{Hive, Key};
+use std::collections::HashMap;
+
+/// Devices one report carries. Every device is a pair of keys, so a hive that lists
+/// the same keys under each other turns a few hundred cells into the square of that.
+/// A machine has seen dozens.
+const MAX_DEVICES: usize = 4096;
+
+/// Control sets read. Real hives keep two or three, and each is several walks.
+const MAX_CONTROL_SETS: usize = 64;
 
 /// One device the hive remembers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,8 +85,11 @@ pub struct Report {
 /// of an image may not have one, so the keys at the root are the fallback:
 /// each kind of hive has a set that only it has.
 fn identify(hive: &Hive, root: &Key, top: &[KeyLine]) -> &'static str {
+    // The last part of the path alone. Every hive under \Windows\System32 has SYSTEM
+    // in its path, so looking anywhere in it calls SOFTWARE and SAM by that name.
     let name = hive.file_name.to_ascii_uppercase();
-    for (needle, label) in [
+    let base = name.rsplit(['\\', '/']).next().unwrap_or("");
+    for (wanted, label) in [
         ("NTUSER.DAT", "NTUSER.DAT"),
         ("USRCLASS.DAT", "UsrClass.dat"),
         ("SYSTEM", "SYSTEM"),
@@ -85,7 +97,8 @@ fn identify(hive: &Hive, root: &Key, top: &[KeyLine]) -> &'static str {
         ("SECURITY", "SECURITY"),
         ("SAM", "SAM"),
     ] {
-        if name.contains(needle) {
+        // Left an extension for a backup's sake: SYSTEM.sav is still SYSTEM.
+        if base == wanted || base.strip_prefix(wanted).is_some_and(|rest| rest.starts_with('.')) {
             return label;
         }
     }
@@ -99,7 +112,7 @@ fn identify(hive: &Hive, root: &Key, top: &[KeyLine]) -> &'static str {
         "NTUSER.DAT"
     } else {
         let _ = root;
-        "a hive this does not recognise"
+        "an unrecognised hive"
     }
 }
 
@@ -154,10 +167,14 @@ fn control_sets(hive: &Hive) -> Vec<String> {
         .into_iter()
         .map(|(_, key)| key.name)
         .filter(|name| {
-            name.len() > 10
-                && name[..10].eq_ignore_ascii_case("ControlSet")
-                && name[10..].chars().all(|c| c.is_ascii_digit())
+            // By `get`, since a name is whatever the hive says and byte ten can fall
+            // in the middle of a character.
+            let digits = name.get(10..).filter(|rest| !rest.is_empty());
+            name.get(..10)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ControlSet"))
+                && digits.is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()))
         })
+        .take(MAX_CONTROL_SETS)
         .collect()
 }
 
@@ -173,6 +190,9 @@ fn enumerated_devices(hive: &Hive, base: &str, source: &'static str) -> Vec<Devi
         let (vendor, product, revision) = parse_device_name(&model.name);
 
         for (_, instance) in hive.children(model_offset) {
+            if out.len() >= MAX_DEVICES {
+                return out;
+            }
             out.push(Device {
                 source,
                 // A USB key names a device by its numeric vendor and product
@@ -209,6 +229,7 @@ fn mount_points(hive: &Hive) -> Vec<Device> {
     hive.children(offset)
         .into_iter()
         .filter(|(_, key)| key.name.contains("USBSTOR") || key.name.contains("##?#"))
+        .take(MAX_DEVICES)
         .map(|(_, key)| {
             // The key name is a device path with # where a backslash was.
             // How many parts come before the model varies, so the model is
@@ -255,6 +276,7 @@ pub fn read(data: &[u8]) -> Option<Report> {
     let kind = identify(&hive, &root, &top);
 
     let mut devices: Vec<Device> = Vec::new();
+    let mut known: HashMap<(&'static str, String), usize> = HashMap::new();
     let mut searched = Vec::new();
 
     for set in control_sets(&hive) {
@@ -265,16 +287,17 @@ pub fn read(data: &[u8]) -> Option<Report> {
                 // copies of each other, so one stick is normally recorded in
                 // every one of them. That is one device, not three, and the
                 // useful timestamp is the latest any of them recorded.
-                match devices
-                    .iter_mut()
-                    .find(|seen| seen.source == found.source && seen.serial == found.serial)
-                {
-                    Some(seen) => {
-                        if found.last_written > seen.last_written {
-                            seen.last_written = found.last_written;
+                match known.get(&(found.source, found.serial.clone())) {
+                    Some(&at) => {
+                        if found.last_written > devices[at].last_written {
+                            devices[at].last_written = found.last_written;
                         }
                     }
-                    None => devices.push(found),
+                    None if devices.len() < MAX_DEVICES => {
+                        known.insert((found.source, found.serial.clone()), devices.len());
+                        devices.push(found);
+                    }
+                    None => {}
                 }
             }
             searched.push(path);
@@ -287,7 +310,8 @@ pub fn read(data: &[u8]) -> Option<Report> {
             "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\MountPoints2".to_string(),
         );
     }
-    devices.extend(mounts);
+    let room = MAX_DEVICES.saturating_sub(devices.len());
+    devices.extend(mounts.into_iter().take(room));
 
     Some(Report {
         version: hive.version.clone(),

@@ -499,6 +499,65 @@ fn reports_an_import_by_ordinal_as_the_number_it_is() {
 }
 
 #[test]
+fn a_raw_offset_near_the_top_of_32_bits_reads_nothing() {
+    let sections = [Rva {
+        virtual_address: 0x1000,
+        virtual_size: 0x1000,
+        raw_offset: u32::MAX,
+        raw_size: 0x1000,
+    }];
+    let found = Rva::to_offset(&sections, 0x1800);
+    assert!(found.is_none_or(|at| at > u32::MAX as usize), "{found:?}");
+
+    let file = Builder::new()
+        .section(".text", 0x1000, READ_EXECUTE, vec![0x90; 16])
+        .build();
+    let mut bad = file.clone();
+    // The first section's raw offset.
+    let raw = 0x40 + 4 + 20 + 240 + 20;
+    bad[raw..raw + 4].copy_from_slice(&0xffff_fff8u32.to_le_bytes());
+    assert!(read(&bad).is_some());
+}
+
+#[test]
+fn an_export_count_of_four_billion_counts_what_the_array_can_hold() {
+    let (data, directory, size) = export_blob(0x2000, &[("add", 0x1100), ("mul", 0x1120)]);
+    let file = Builder::new()
+        .dll()
+        .section(".rdata", 0x2000, 0x4000_0040, data)
+        .directory(0, directory, size)
+        .build();
+
+    // The first section lands at the first file-alignment boundary past the headers.
+    let start = 0x200usize;
+    let mut bad = file.clone();
+    // NumberOfNames, 24 bytes into the export directory.
+    let at = start + (directory - 0x2000) as usize + 24;
+    bad[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+
+    let started = std::time::Instant::now();
+    let pe = read(&bad).unwrap();
+    assert!(pe.export_count < 1 << 20, "{}", pe.export_count);
+    assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+}
+
+#[test]
+fn a_huge_section_table_does_not_make_every_lookup_expensive() {
+    let (imports, directory, size) = import_blob(0x2000, true, "KERNEL32.dll", &["ExitProcess"]);
+    let mut builder = Builder::new()
+        .section(".text", 0x1000, READ_EXECUTE, vec![0x90; 16])
+        .section(".rdata", 0x2000, READ_WRITE, imports)
+        .directory(1, directory, size);
+    for _ in 0..(MAX_MAPPED_SECTIONS + 50) {
+        builder = builder.section(".pad", 0x10_0000, READ_WRITE, Vec::new());
+    }
+
+    let pe = read(&builder.build()).unwrap();
+    assert_eq!(pe.sections.len(), MAX_MAPPED_SECTIONS + 52);
+    assert_eq!(pe.import_count, 1, "the sections that matter are still looked up");
+}
+
+#[test]
 fn reads_exports_through_their_three_parallel_arrays() {
     let (data, directory, size) = export_blob(0x2000, &[("add", 0x1100), ("mul", 0x1120)]);
     let file = Builder::new()

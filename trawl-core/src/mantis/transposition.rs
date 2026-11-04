@@ -152,6 +152,37 @@ pub fn columnar_encipher(data: &[u8], order: &[usize]) -> Vec<u8> {
         .collect()
 }
 
+/// The start of what [`columnar_decipher`] would produce, without building the rest.
+///
+/// Forty thousand arrangements each rebuilding a long text, and reading all of it to
+/// score it, is the bulk of what a long paste costs. The first thousand letters of an
+/// arrangement say as much about it as the rest do.
+fn columnar_head(data: &[u8], order: &[usize], limit: usize) -> Vec<u8> {
+    let width = order.len();
+    let lengths = column_lengths(data.len(), width);
+
+    let mut starts = vec![0usize; width];
+    let mut cursor = 0usize;
+    for &column in order {
+        starts[column] = cursor;
+        cursor += lengths[column];
+    }
+
+    let rows = data.len().div_ceil(width);
+    let mut out = Vec::with_capacity(limit.min(data.len()));
+    for row in 0..rows {
+        for column in 0..width {
+            if row < lengths[column] {
+                if out.len() == limit {
+                    return out;
+                }
+                out.push(data[starts[column] + row]);
+            }
+        }
+    }
+    out
+}
+
 /// Every arrangement of `width` columns, in lexicographic order.
 fn permutations(width: usize) -> Vec<Vec<usize>> {
     let mut order: Vec<usize> = (0..width).collect();
@@ -292,7 +323,7 @@ const MIN_ROWS: usize = 100;
 /// fewer. A width this finds nothing on is not proof of nothing there,
 /// only of not enough text to say so — the honest answer [`solve`] gives is
 /// silence rather than a guess.
-fn build_wide_order(data: &[u8], width: usize) -> Option<Candidate> {
+fn build_wide_order(data: &[u8], width: usize, budget: &mut usize) -> Option<Candidate> {
     if width < 3 || !data.len().is_multiple_of(width) {
         return None;
     }
@@ -301,6 +332,12 @@ fn build_wide_order(data: &[u8], width: usize) -> Option<Candidate> {
     if chunk_len < MIN_ROWS {
         return None;
     }
+
+    let beam_cost = (width * width * width + BEAM_WIDTH * width * width).saturating_mul(chunk_len);
+    if beam_cost > *budget {
+        return None;
+    }
+    *budget -= beam_cost;
 
     let chunks: Vec<&[u8]> = data.chunks_exact(chunk_len).collect();
 
@@ -355,7 +392,7 @@ fn build_wide_order(data: &[u8], width: usize) -> Option<Candidate> {
             for (column, &chunk) in placed.iter().enumerate() {
                 order[chunk] = column;
             }
-            refine(data, order)
+            refine(data, order, budget)
         })
         .fold(None::<Candidate>, |best, next| match best {
             Some(current) if current.score >= next.score => Some(current),
@@ -371,6 +408,16 @@ fn build_wide_order(data: &[u8], width: usize) -> Option<Candidate> {
 /// search itself.
 const REFINE_TOP: usize = 20;
 
+/// Letters read across all of the wide search, in beams and in climbs.
+///
+/// What each width costs goes as its cube times the length of its columns, and a
+/// length with many divisors qualifies for most of them. A long enough paste could
+/// spend minutes here on widths no message uses.
+const WIDE_BUDGET: usize = 1 << 29;
+
+/// How much of an arrangement is read to judge it. See [`columnar_head`].
+const JUDGED: usize = 1024;
+
 /// Polishes an arrangement by swapping two grid columns at a time and
 /// keeping the swap when the fully deciphered text reads better.
 ///
@@ -383,7 +430,7 @@ const REFINE_TOP: usize = 20;
 /// already asks each of the ciphers here to clear a bar measured on plainness
 /// alone, so refining on the same measure keeps every cipher answering to the
 /// same standard.
-fn refine(data: &[u8], mut order: Vec<usize>) -> Candidate {
+fn refine(data: &[u8], mut order: Vec<usize>, budget: &mut usize) -> Candidate {
     let width = order.len();
 
     // Trigram fitness rather than the full plainness score while climbing:
@@ -401,6 +448,11 @@ fn refine(data: &[u8], mut order: Vec<usize>) -> Candidate {
 
         for a in 0..width {
             for b in (a + 1)..width {
+                if *budget < data.len() {
+                    return judge(columnar_decipher(data, &order), Shape::Columnar { order });
+                }
+                *budget -= data.len();
+
                 order.swap(a, b);
                 let found = ngram::fitness(&columnar_decipher(data, &order));
 
@@ -477,15 +529,22 @@ pub fn solve(data: &[u8]) -> Option<Candidate> {
     }
 
     let before = plainness(data);
+    let before_head = plainness(&data[..data.len().min(JUDGED)]);
 
     let rails = (2..=MAX_RAILS.min(data.len() - 1))
         .map(|rails| judge(rail_decipher(data, rails), Shape::RailFence { rails }));
 
-    let columns = (2..=MAX_WIDTH.min(data.len() - 1)).flat_map(|width| {
-        permutations(width)
-            .into_iter()
-            .map(|order| judge(columnar_decipher(data, &order), Shape::Columnar { order }))
-    });
+    // Judged on the head of each arrangement, against the head of the text, and only
+    // the one that wins is deciphered in full.
+    let best_column = (2..=MAX_WIDTH.min(data.len() - 1))
+        .flat_map(permutations)
+        .map(|order| (plainness(&columnar_head(data, &order, JUDGED)), order))
+        .filter(|(score, _)| *score >= MIN_SCORE && *score >= before_head + MIN_GAIN)
+        .fold(None::<(f32, Vec<usize>)>, |best, next| match best {
+            Some(current) if current.0 >= next.0 => Some(current),
+            _ => Some(next),
+        })
+        .map(|(_, order)| judge(columnar_decipher(data, &order), Shape::Columnar { order }));
 
     // A real message has exactly one width, so a strong hit at a narrower
     // grid makes every wider one increasingly unlikely to also be it —
@@ -494,8 +553,9 @@ pub fn solve(data: &[u8]) -> Option<Candidate> {
     // once one is clearly right keeps a genuine hit from paying for every
     // width past it.
     let mut wide_columns = Vec::new();
+    let mut budget = WIDE_BUDGET;
     for width in (MAX_WIDTH + 1)..=WIDE_MAX.min(data.len() - 1) {
-        let Some(found) = build_wide_order(data, width) else {
+        let Some(found) = build_wide_order(data, width, &mut budget) else {
             continue;
         };
         let confident = found.score >= CONFIDENT_SCORE;
@@ -506,7 +566,7 @@ pub fn solve(data: &[u8]) -> Option<Candidate> {
     }
 
     rails
-        .chain(columns)
+        .chain(best_column)
         .chain(wide_columns)
         .filter(|found| found.score >= MIN_SCORE && found.score >= before + MIN_GAIN)
         .fold(None::<Candidate>, |best, next| match best {

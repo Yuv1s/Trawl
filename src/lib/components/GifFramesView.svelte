@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { chiStands } from '$lib/analysis/tools';
 	import type { GifAnalysis, GifSource, NestedAnalysis } from '$lib/worker/protocol';
 
 	let { gif, nested }: { gif: GifAnalysis | null; nested: NestedAnalysis | null } = $props();
@@ -10,12 +11,11 @@
 	const frames = $derived(sources.filter((s) => s.kind === 'frame'));
 	const diffs = $derived(sources.filter((s) => s.kind === 'difference'));
 
-	const framesHit = $derived(
-		frames.some((f) => f.lsb.candidates.length > 0 || f.chi?.detected || f.rs?.detected)
-	);
-	const diffsHit = $derived(
-		diffs.some((d) => d.lsb.candidates.length > 0 || d.chi?.detected || d.rs?.detected)
-	);
+	const hit = (s: GifSource) =>
+		s.lsb.candidates.length > 0 || chiStands(s.chi, s.rs) || s.rs?.detected;
+
+	const framesHit = $derived(frames.some(hit));
+	const diffsHit = $derived(diffs.some(hit));
 
 	function formatDisposal(method: string | null): string {
 		switch (method) {
@@ -58,31 +58,32 @@
 		No frames could be analysed. The file is a GIF but the decoder found no image descriptors.
 		{#if gif.capped}
 			<br />
-			<span class="muted">The walk was capped at the frame or pixel budget.</span>
+			<span class="muted">Analysis stopped at the frame or pixel budget.</span>
 		{/if}
 	</p>
 {:else}
 	{#if nestedCapped(nested)}
 		<p class="capped">
-			The recursive walk hit a depth, count, or byte budget and stopped early. Some embedded files
+			The recursive walk hit a depth, count or byte budget and stopped early, so some embedded files
 			were not analysed.
 		</p>
 	{/if}
 
 	<div class="summary">
 		<p class="lead">
-			{frames.length} frame{frames.length === 1 ? '' : 's'} analysed
-			{diffs.length > 0
-				? `, ${diffs.length} consecutive difference${diffs.length === 1 ? '' : 's'} checked`
-				: ''}
-			{gif.capped ? ' · capped at work budget' : ''}.
+			{[
+				`${frames.length} frame${frames.length === 1 ? '' : 's'} analysed`,
+				...(diffs.length > 0
+					? [`${diffs.length} consecutive difference${diffs.length === 1 ? '' : 's'} checked`]
+					: [])
+			].join(', ')}{gif.capped ? ' · capped at work budget' : ''}.
 		</p>
 	</div>
 
 	{#if framesHit || diffsHit}
 		<ul class="findings">
 			{#each frames as frame (frame.from)}
-				{#if frame.lsb.candidates.length > 0 || frame.chi?.detected || frame.rs?.detected}
+				{#if hit(frame)}
 					<li>
 						<h4 class="source-label">{describeSource(frame)}</h4>
 						{@render sourceDetail(frame)}
@@ -90,7 +91,7 @@
 				{/if}
 			{/each}
 			{#each diffs as diff (diff.from)}
-				{#if diff.lsb.candidates.length > 0 || diff.chi?.detected || diff.rs?.detected}
+				{#if hit(diff)}
 					<li>
 						<h4 class="source-label">{describeSource(diff)}</h4>
 						{@render sourceDetail(diff)}
@@ -100,16 +101,18 @@
 		</ul>
 	{:else}
 		<p class="clear">
-			None of the {frames.length} frame{frames.length === 1 ? '' : 's'}
-			{diffs.length > 0 ? ` or ${diffs.length} difference${diffs.length === 1 ? '' : 's'}` : ''}
-			produced a candidate. LSB sweep, chi-square, and RS analysis all came up empty.
+			The LSB sweep, chi-square and RS analysis found nothing in {frames.length === 1
+				? 'the frame'
+				: `any of the ${frames.length} frames`}{diffs.length > 0
+				? ` or ${diffs.length === 1 ? 'the difference' : `the ${diffs.length} differences`}`
+				: ''}.
 		</p>
 	{/if}
 
 	{#if gif.capped && framesHit === false && diffsHit === false}
 		<p class="muted">
-			The work budget capped this analysis before all frames were checked. A manual re-analysis of a
-			carved frame will run without the automatic budget.
+			The work budget ran out before every frame was checked. Analysing a carved frame by hand runs
+			without the automatic budget.
 		</p>
 	{/if}
 {/if}
@@ -125,7 +128,7 @@
 						<span class="reason">{cand.reason}</span>
 						{#if cand.flags.length > 0}
 							<ul class="flags">
-								{#each cand.flags as flag (flag)}
+								{#each new Set(cand.flags) as flag (flag)}
 									<li class="mono flagged">{flag}</li>
 								{/each}
 							</ul>
@@ -136,15 +139,17 @@
 			</ul>
 		{/if}
 
-		{#if frame.chi?.detected}
+		{#if chiStands(frame.chi, frame.rs)}
 			<p class="detector chi">
-				<strong>Chi-square:</strong> ~{(frame.chi?.embeddedFraction ?? 0) * 100}% embedded
+				<strong>Chi-square:</strong> ~{((frame.chi?.embeddedFraction ?? 0) * 100).toFixed(1)}%
+				embedded
 			</p>
 		{/if}
 
 		{#if frame.rs?.detected}
 			<p class="detector rs">
-				<strong>RS analysis:</strong> ~{(frame.rs?.rate ?? 0) * 100}% of low bits embedded
+				<strong>RS analysis:</strong> ~{((frame.rs?.rate ?? 0) * 100).toFixed(1)}% of low bits
+				embedded
 			</p>
 		{/if}
 	</div>

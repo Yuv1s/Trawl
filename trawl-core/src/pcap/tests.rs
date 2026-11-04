@@ -289,6 +289,298 @@ fn configured_tags_steer_the_stream_scan() {
     assert_eq!(stream.flags, vec!["event{custom_tag}"]);
 }
 
+/// A section header then one block claiming whatever total length a test wants.
+fn pcapng_with_block_total(total: u32) -> Vec<u8> {
+    let mut out = pcapng_file(1, &[]);
+    out.extend_from_slice(&0xdeadu32.to_le_bytes());
+    out.extend_from_slice(&total.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out
+}
+
+#[test]
+fn a_block_total_that_wraps_a_32_bit_offset_ends_the_walk() {
+    // In WASM 48 + 0xffffffd0 wraps to zero, which reads as a block that fits and
+    // sends the walk back to the start of the file, forever.
+    for total in [0xffff_ffd0u32, 0xffff_ffe4, 0xffff_fffc, 0xffff_fff8] {
+        let cap = read(&pcapng_with_block_total(total), &[]).unwrap();
+        assert_eq!(cap.format, "pcapng");
+        assert_eq!(cap.packet_count, 0, "total {total:#x}");
+    }
+}
+
+#[test]
+fn a_packet_length_that_wraps_a_32_bit_offset_is_not_a_frame() {
+    let mut file = pcapng_file(1, &[tcp_frame(SRV, CLI, 80, 5000, 1, b"flag{real_one}")]);
+    // Point the captured length of the only packet near the top of 32 bits: past the
+    // section and interface blocks, then a type, a total, an interface and a timestamp.
+    let incl = 28 + 20 + 8 + 4 + 8;
+    file[incl..incl + 4].copy_from_slice(&0xffff_fff0u32.to_le_bytes());
+
+    let cap = read(&file, &[]).unwrap();
+    assert_eq!(cap.packet_count, 0);
+}
+
+#[test]
+fn a_classic_record_claiming_more_than_the_file_ends_the_walk() {
+    let mut file = pcap_file(1, &[tcp_frame(SRV, CLI, 80, 5000, 1, b"abcd")]);
+    file[24 + 8..24 + 12].copy_from_slice(&0xffff_fff8u32.to_le_bytes());
+    assert_eq!(read(&file, &[]).unwrap().packet_count, 0);
+}
+
+#[test]
+fn original_lengths_summed_past_the_top_of_32_bits_do_not_wrap() {
+    let frame = tcp_frame(SRV, CLI, 80, 5000, 1, b"abcd");
+    let mut file = pcap_file(1, &[frame.clone(), frame]);
+    let second = 24 + 16 + 58;
+    file[24 + 12..24 + 16].copy_from_slice(&u32::MAX.to_le_bytes());
+    file[second + 12..second + 16].copy_from_slice(&u32::MAX.to_le_bytes());
+
+    let cap = read(&file, &[]).unwrap();
+    assert!(cap.capture_bytes >= u32::MAX as usize);
+    assert!(cap.truncated);
+}
+
+#[test]
+fn an_impossible_byte_order_is_not_a_pcapng() {
+    let mut file = pcapng_file(1, &[]);
+    file[8..12].copy_from_slice(&[1, 2, 3, 4]);
+    assert!(read(&file, &[]).is_none());
+}
+
+/// A TCP frame carrying `pad` bytes past what the IP length covers, the way Ethernet
+/// pads anything under sixty bytes.
+fn padded(mut frame: Vec<u8>, pad: usize) -> Vec<u8> {
+    frame.extend(std::iter::repeat_n(0u8, pad));
+    frame
+}
+
+#[test]
+fn ethernet_padding_on_a_keep_alive_does_not_overwrite_the_stream() {
+    // A keep-alive is empty and one sequence number behind, padded to the Ethernet
+    // minimum. Read as payload, its six zeroes landed on the closing brace.
+    let data = b"flag{padding_must_not_corrupt_this}";
+    let seq = 5000 + data.len() as u32 - 1;
+    let file = pcap_file(
+        1,
+        &[
+            tcp_frame(SRV, CLI, 80, 5000, 5000, data),
+            padded(tcp_frame(SRV, CLI, 80, 5000, seq, b""), 6),
+        ],
+    );
+
+    let cap = read(&file, &[]).unwrap();
+    assert_eq!(cap.streams[0].bytes, data.len());
+    assert_eq!(cap.streams[0].flags, vec!["flag{padding_must_not_corrupt_this}"]);
+}
+
+#[test]
+fn a_keep_alive_carrying_a_junk_byte_does_not_overwrite_the_stream() {
+    // Some stacks send one byte with the probe rather than none. It is inside the IP
+    // length, so only keeping the first copy of a byte protects what it lands on.
+    let data = b"flag{keep_the_first_copy}";
+    let seq = 100 + data.len() as u32 - 1;
+    let file = pcap_file(
+        1,
+        &[
+            tcp_frame(SRV, CLI, 80, 5000, 100, data),
+            tcp_frame(SRV, CLI, 80, 5000, seq, &[0]),
+        ],
+    );
+
+    let cap = read(&file, &[]).unwrap();
+    assert_eq!(cap.streams[0].flags, vec!["flag{keep_the_first_copy}"]);
+}
+
+#[test]
+fn a_retransmission_lands_where_it_already_sits() {
+    let first = b"flag{once_";
+    let second = b"only_please}";
+    let file = pcap_file(
+        1,
+        &[
+            tcp_frame(SRV, CLI, 80, 5000, 10, first),
+            tcp_frame(SRV, CLI, 80, 5000, 10, first),
+            tcp_frame(SRV, CLI, 80, 5000, 10 + first.len() as u32, second),
+            tcp_frame(SRV, CLI, 80, 5000, 10 + first.len() as u32, second),
+        ],
+    );
+
+    let cap = read(&file, &[]).unwrap();
+    assert_eq!(cap.streams[0].bytes, first.len() + second.len());
+    assert_eq!(cap.streams[0].flags, vec!["flag{once_only_please}"]);
+}
+
+#[test]
+fn a_length_of_zero_in_the_ip_header_leaves_the_frame_in_charge() {
+    // What a capture shows when the card fills the length in after the tap.
+    let mut frame = tcp_frame(SRV, CLI, 80, 5000, 1, b"flag{checksum_offload}");
+    frame[14 + 2..14 + 4].copy_from_slice(&[0, 0]);
+    let cap = read(&pcap_file(1, &[frame]), &[]).unwrap();
+    assert_eq!(cap.streams[0].flags, vec!["flag{checksum_offload}"]);
+}
+
+#[test]
+fn an_ipv6_payload_length_excludes_the_padding_too() {
+    let payload = b"flag{v6_padded}";
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&[0x02; 6]);
+    frame.extend_from_slice(&[0x01; 6]);
+    frame.extend_from_slice(&0x86ddu16.to_be_bytes());
+    frame.extend_from_slice(&[0x60, 0, 0, 0]);
+    frame.extend_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
+    frame.push(6); // TCP
+    frame.push(64);
+    frame.extend_from_slice(&[0x20; 16]);
+    frame.extend_from_slice(&[0x21; 16]);
+    frame.extend_from_slice(&80u16.to_be_bytes());
+    frame.extend_from_slice(&5000u16.to_be_bytes());
+    frame.extend_from_slice(&1u32.to_be_bytes());
+    frame.extend_from_slice(&0u32.to_be_bytes());
+    frame.push(0x50);
+    frame.push(0x18);
+    frame.extend_from_slice(&[0; 6]);
+    frame.extend_from_slice(payload);
+    frame.extend_from_slice(&[0xee; 9]);
+
+    let cap = read(&pcap_file(1, &[frame]), &[]).unwrap();
+    assert_eq!(cap.streams[0].bytes, payload.len());
+    assert_eq!(cap.streams[0].flags, vec!["flag{v6_padded}"]);
+}
+
+#[test]
+fn a_stream_crossing_the_sequence_wrap_keeps_both_halves() {
+    // The plain minimum of 0xfffffff8 and 0 is 0, which put the first half four
+    // billion bytes away, past the cap, and dropped it.
+    let file = pcap_file(
+        1,
+        &[
+            tcp_frame(SRV, CLI, 80, 5000, 0xffff_fff8, b"flag{spl"),
+            tcp_frame(SRV, CLI, 80, 5000, 0, b"it_across_wrap}"),
+        ],
+    );
+
+    let cap = read(&file, &[]).unwrap();
+    assert_eq!(cap.streams[0].flags, vec!["flag{split_across_wrap}"]);
+}
+
+#[test]
+fn a_wrapped_stream_arriving_out_of_order_keeps_both_halves() {
+    let file = pcap_file(
+        1,
+        &[
+            tcp_frame(SRV, CLI, 80, 5000, 0, b"it_across_wrap}"),
+            tcp_frame(SRV, CLI, 80, 5000, 0xffff_fff8, b"flag{spl"),
+        ],
+    );
+
+    let cap = read(&file, &[]).unwrap();
+    assert_eq!(cap.streams[0].flags, vec!["flag{split_across_wrap}"]);
+}
+
+#[test]
+fn a_segment_past_the_limit_is_dropped_rather_than_allocated_for() {
+    let file = pcap_file(
+        1,
+        &[
+            tcp_frame(SRV, CLI, 80, 5000, 1000, b"flag{near_part}"),
+            tcp_frame(SRV, CLI, 80, 5000, 1000 + 0x7000_0000, b"far away"),
+        ],
+    );
+
+    let cap = read(&file, &[]).unwrap();
+    assert_eq!(cap.streams[0].bytes, "flag{near_part}".len());
+}
+
+#[test]
+fn gaps_across_many_connections_stay_inside_the_budget() {
+    // Two packets a connection, each claiming a whole stream's worth of gap. A dozen
+    // megabytes of capture would otherwise ask for tens of gigabytes of buffers.
+    let mut frames = Vec::new();
+    for port in 0..4000u16 {
+        frames.push(tcp_frame(SRV, CLI, 80, port + 1, 0, b"x"));
+        frames.push(tcp_frame(SRV, CLI, 80, port + 1, MAX_STREAM_BYTES as u32 - 1, b"y"));
+    }
+
+    let cap = read(&pcap_file(1, &frames), &[]).unwrap();
+    assert_eq!(cap.stream_count, 4000, "every stream is still counted");
+    assert_eq!(cap.streams.len(), MAX_STREAMS);
+
+    let segments = Segments {
+        parts: vec![(0, 0, 1), (MAX_STREAM_BYTES as u32 - 1, 1, 1)],
+    };
+    assert_eq!(reassemble(b"xy", &segments, MAX_STREAM_BYTES).len(), MAX_STREAM_BYTES);
+    assert_eq!(reassemble(b"xy", &segments, 1).len(), 1);
+    assert!(reassemble(b"xy", &segments, 0).is_empty());
+}
+
+/// A pcapng whose interface declares a timestamp resolution, with two packets a
+/// given number of ticks apart.
+fn pcapng_with_resolution(tsresol: u8, ticks: u64) -> Vec<u8> {
+    let mut out = pcapng_file(1, &[]);
+    // Replace the interface block with one carrying an option.
+    out.truncate(28);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&65535u32.to_le_bytes());
+    body.extend_from_slice(&9u16.to_le_bytes()); // if_tsresol
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&[tsresol, 0, 0, 0]);
+    body.extend_from_slice(&0u16.to_le_bytes()); // end of options
+    body.extend_from_slice(&0u16.to_le_bytes());
+
+    let total = (body.len() + 12) as u32;
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&total.to_le_bytes());
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&total.to_le_bytes());
+
+    let frame = tcp_frame(SRV, CLI, 80, 5000, 1, b"abcd");
+    for stamp in [ticks, ticks * 2] {
+        let padded = (frame.len() + 3) & !3;
+        let total = (32 + padded) as u32;
+        out.extend_from_slice(&6u32.to_le_bytes());
+        out.extend_from_slice(&total.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&((stamp >> 32) as u32).to_le_bytes());
+        out.extend_from_slice(&(stamp as u32).to_le_bytes());
+        out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        out.extend_from_slice(&frame);
+        out.extend(std::iter::repeat_n(0u8, padded - frame.len()));
+        out.extend_from_slice(&total.to_le_bytes());
+    }
+    out
+}
+
+#[test]
+fn a_nanosecond_capture_times_a_second_as_a_second() {
+    // Read as microseconds, this was sixteen and a half minutes.
+    let cap = read(&pcapng_with_resolution(9, 1_000_000_000), &[]).unwrap();
+    assert_eq!(cap.duration, "1.00 s");
+}
+
+#[test]
+fn a_binary_timestamp_resolution_is_a_power_of_two() {
+    let cap = read(&pcapng_with_resolution(0x80 | 10, 1024), &[]).unwrap();
+    assert_eq!(cap.duration, "1.00 s");
+}
+
+#[test]
+fn no_resolution_option_means_microseconds() {
+    assert_eq!(ticks_per_second(&[], 0, 0, true), 1e6);
+    // An option that is not the one asked for is stepped over, padding and all.
+    let mut options = 2u16.to_le_bytes().to_vec();
+    options.extend_from_slice(&5u16.to_le_bytes());
+    options.extend_from_slice(b"hello\0\0\0");
+    options.extend_from_slice(&9u16.to_le_bytes());
+    options.extend_from_slice(&1u16.to_le_bytes());
+    options.extend_from_slice(&[3, 0, 0, 0]);
+    assert_eq!(ticks_per_second(&options, 0, options.len(), true), 1e3);
+}
+
 #[test]
 fn is_not_a_capture() {
     assert!(read(b"not a capture at all, just text", &[]).is_none());

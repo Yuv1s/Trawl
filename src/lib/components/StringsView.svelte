@@ -36,7 +36,7 @@
 		</p>
 	{:else}
 		<ul class="mono">
-			{#each shown as found (found.offset)}
+			{#each shown as found, i (i)}
 				<li>
 					<span class="offset">{found.offset.toString(16).padStart(6, '0')}</span>
 					<span class="text">{found.text}</span>

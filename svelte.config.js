@@ -29,7 +29,7 @@ const config = {
 		// because the data-driven bars and the tour's spotlight set dimensions through the
 		// style attribute, and Svelte externalises component CSS so no style hash is added
 		// that would cancel it. connect-src reaches the loopback scanner Remora runs, and
-		// nowhere else off-origin.
+		// nowhere else off-origin. Images from a target arrive through it as blob: URLs.
 		csp: {
 			mode: 'hash',
 			directives: {

@@ -24,6 +24,14 @@
 
 use crate::binary::{Binary, Guard, MAX_SYMBOLS, Section, Segment, Symbol};
 
+/// Thunks read across the whole import directory, and export names read. Each is a
+/// search of the section table, which a file can make sixty-five thousand entries long.
+const MAX_THUNKS: usize = 1 << 18;
+const MAX_EXPORTS_WALKED: usize = 1 << 18;
+
+/// Sections addresses are looked up in. The Windows loader stops well before this.
+const MAX_MAPPED_SECTIONS: usize = 1024;
+
 /// Reads little-endian numbers, which PE always is on every machine it
 /// targets, unlike ELF where the header declares it.
 struct Reader<'a> {
@@ -80,7 +88,8 @@ impl Rva {
         if into >= holding.raw_size {
             return None;
         }
-        Some(holding.raw_offset as usize + into as usize)
+        // Two 32-bit numbers, whose sum wraps in WASM to somewhere that exists.
+        (holding.raw_offset as usize).checked_add(into as usize)
     }
 }
 
@@ -95,7 +104,7 @@ fn machine_name(value: u16) -> &'static str {
         0xaa64 => "AArch64",
         0x5032 => "RISC-V 32",
         0x5064 => "RISC-V 64",
-        _ => "an architecture this does not name",
+        _ => "an unrecognised architecture",
     }
 }
 
@@ -215,16 +224,18 @@ pub fn read(data: &[u8]) -> Option<Binary> {
         };
         let Some(flags) = r.u32(at + 36) else { break };
 
-        map.push(Rva {
-            virtual_address,
-            virtual_size,
-            raw_offset,
-            raw_size,
-        });
+        if map.len() < MAX_MAPPED_SECTIONS {
+            map.push(Rva {
+                virtual_address,
+                virtual_size,
+                raw_offset,
+                raw_size,
+            });
+        }
         sections.push(Section {
             name,
             kind: section_kind(flags).to_string(),
-            address: image_base + u64::from(virtual_address),
+            address: image_base.wrapping_add(u64::from(virtual_address)),
             offset: u64::from(raw_offset),
             size: u64::from(virtual_size),
             flags: section_flags(flags),
@@ -248,7 +259,7 @@ pub fn read(data: &[u8]) -> Option<Binary> {
         } else {
             "executable"
         },
-        entry: image_base + u64::from(entry_rva),
+        entry: image_base.wrapping_add(u64::from(entry_rva)),
         interpreter: None,
         runpath: None,
         subsystem: Some(subsystem),
@@ -293,6 +304,7 @@ fn read_imports(
     let mut imports = Vec::new();
     let mut needed = Vec::new();
     let mut count = 0usize;
+    let mut thunks_left = MAX_THUNKS;
 
     let Some((address, _)) = directory else {
         return (imports, needed, count);
@@ -305,10 +317,12 @@ fn read_imports(
     // length, and a doctored image can leave that terminator off, so the walk
     // is bounded as well.
     for index in 0..1024 {
-        let at = start + index * 20;
-        let (Some(lookup), Some(name_rva), Some(bound)) =
-            (r.u32(at), r.u32(at + 12), r.u32(at + 16))
-        else {
+        let at = start.saturating_add(index * 20);
+        let (Some(lookup), Some(name_rva), Some(bound)) = (
+            r.u32(at),
+            r.u32(at.saturating_add(12)),
+            r.u32(at.saturating_add(16)),
+        ) else {
             break;
         };
         if lookup == 0 && name_rva == 0 && bound == 0 {
@@ -332,7 +346,12 @@ fn read_imports(
 
         let stride = if wide { 8 } else { 4 };
         for slot in 0..4096 {
-            let at = thunk_start + slot * stride;
+            if thunks_left == 0 {
+                break;
+            }
+            thunks_left -= 1;
+
+            let at = thunk_start.saturating_add(slot * stride);
             let value = if wide {
                 r.u64(at)
             } else {
@@ -353,7 +372,7 @@ fn read_imports(
                     continue;
                 };
                 // Two bytes of hint precede the name itself.
-                match r.string(at + 2, 512).filter(|n| !n.is_empty()) {
+                match r.string(at.saturating_add(2), 512).filter(|n| !n.is_empty()) {
                     Some(name) => name,
                     None => continue,
                 }
@@ -387,10 +406,10 @@ fn read_exports(r: &Reader, map: &[Rva], directory: Option<(u32, u32)>) -> (Vec<
     };
 
     let (Some(name_count), Some(functions_rva), Some(names_rva), Some(ordinals_rva)) = (
-        r.u32(at + 24),
-        r.u32(at + 28),
-        r.u32(at + 32),
-        r.u32(at + 36),
+        r.u32(at.saturating_add(24)),
+        r.u32(at.saturating_add(28)),
+        r.u32(at.saturating_add(32)),
+        r.u32(at.saturating_add(36)),
     ) else {
         return (exports, 0);
     };
@@ -403,8 +422,12 @@ fn read_exports(r: &Reader, map: &[Rva], directory: Option<(u32, u32)>) -> (Vec<
     };
     let functions_at = Rva::to_offset(map, functions_rva);
 
-    let total = name_count as usize;
-    for index in 0..total {
+    // What the array has room for, rather than what a 32-bit field claims.
+    let total = (name_count as usize).min(r.data.len().saturating_sub(names_at) / 4);
+    for index in 0..total.min(MAX_EXPORTS_WALKED) {
+        if exports.len() >= MAX_SYMBOLS {
+            break;
+        }
         let Some(name_rva) = r.u32(names_at + index * 4) else {
             break;
         };
@@ -418,19 +441,19 @@ fn read_exports(r: &Reader, map: &[Rva], directory: Option<(u32, u32)>) -> (Vec<
         // The ordinal array indexes the address array, so a name's address is
         // only reachable through both.
         let address = r
-            .u16(ordinals_at + index * 2)
+            .u16(ordinals_at.saturating_add(index * 2))
             .zip(functions_at)
-            .and_then(|(ordinal, functions)| r.u32(functions + ordinal as usize * 4))
+            .and_then(|(ordinal, functions)| {
+                r.u32(functions.saturating_add(ordinal as usize * 4))
+            })
             .unwrap_or(0);
 
-        if exports.len() < MAX_SYMBOLS {
-            exports.push(Symbol {
-                name,
-                kind: "function",
-                address: u64::from(address),
-                from: None,
-            });
-        }
+        exports.push(Symbol {
+            name,
+            kind: "function",
+            address: u64::from(address),
+            from: None,
+        });
     }
 
     (exports, total)
@@ -446,16 +469,16 @@ fn read_pdb_path(r: &Reader, map: &[Rva], directory: Option<(u32, u32)>) -> Opti
     let start = Rva::to_offset(map, address)?;
 
     for index in 0..(size as usize / 28).min(64) {
-        let at = start + index * 28;
-        if r.u32(at + 12)? != CODEVIEW {
+        let at = start.saturating_add(index * 28);
+        if r.u32(at.saturating_add(12))? != CODEVIEW {
             continue;
         }
-        let raw_at = r.u32(at + 24)? as usize;
+        let raw_at = r.u32(at.saturating_add(24))? as usize;
         // "RSDS", then a build identifier and an age, then the path.
-        if r.data.get(raw_at..raw_at + 4)? != b"RSDS" {
+        if r.data.get(raw_at..raw_at.checked_add(4)?)? != b"RSDS" {
             continue;
         }
-        return r.string(raw_at + 24, 512).filter(|path| !path.is_empty());
+        return r.string(raw_at.checked_add(24)?, 512).filter(|path| !path.is_empty());
     }
 
     None
@@ -487,10 +510,11 @@ fn read_security_cookie(
         return false;
     }
 
+    let at = at.saturating_add(field);
     let cookie = if wide {
-        r.u64(at + field)
+        r.u64(at)
     } else {
-        r.u32(at + field).map(u64::from)
+        r.u32(at).map(u64::from)
     };
 
     cookie.is_some_and(|value| value != 0)

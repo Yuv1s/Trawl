@@ -11,18 +11,17 @@
 </script>
 
 <svelte:head>
-	<title>Something broke — Trawl</title>
+	<title>Something broke · Trawl</title>
 	<meta name="robots" content="noindex" />
 </svelte:head>
 
 <main>
 	<Logo size={40} />
 	<span class="eyebrow mono">{status}</span>
-	<h1>Something in Trawl broke, not anything you dropped.</h1>
+	<h1>Something broke inside Trawl.</h1>
 	<p>
-		Whatever went wrong stayed on this machine, the same as everything else here. Nothing was
-		uploaded and nothing was sent anywhere. Reloading usually clears it; if it does not, the file
-		you were reading is still on your disk, untouched.
+		The fault is in Trawl, and your file didn't cause it. Nothing was uploaded or sent anywhere.
+		Reloading usually clears it, and the file you were reading is still on your disk, untouched.
 	</p>
 	{#if detail}
 		<p class="detail mono">{detail}</p>

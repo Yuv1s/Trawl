@@ -1,22 +1,11 @@
 <script lang="ts">
+	import { WRITTEN_BY_HAND } from '$lib/analysis/tools';
 	import type { ExifEntry } from '$lib/worker/protocol';
 
 	let { entries }: { entries: ExifEntry[] | null } = $props();
 
-	/** Fields a person types, which is where a hidden note ends up. */
-	const WRITEABLE = new Set([
-		'ImageDescription',
-		'UserComment',
-		'Artist',
-		'Copyright',
-		'Software',
-		'ImageUniqueID',
-		'CameraOwnerName',
-		'MakerNote'
-	]);
-
 	const notable = $derived(
-		(entries ?? []).filter((e) => e.textual && WRITEABLE.has(e.name) && e.value.trim() !== '')
+		(entries ?? []).filter((e) => e.textual && WRITTEN_BY_HAND.has(e.name) && e.value.trim() !== '')
 	);
 	const rest = $derived((entries ?? []).filter((e) => !notable.includes(e)));
 
@@ -34,7 +23,7 @@
 	{#if notable.length > 0}
 		<h3 class="label">Written by a person</h3>
 		<ul class="notable">
-			{#each notable as entry (entry.ifd + entry.tag)}
+			{#each notable as entry, i (i)}
 				<li>
 					<span class="key mono">{label(entry)}</span>
 					<span class="value mono">{entry.value}</span>
@@ -43,12 +32,16 @@
 		</ul>
 	{:else}
 		<p class="clear">
-			Nothing in the free-text fields. The camera and timestamp values below are still worth
-			reading, since they place the file.
+			The free-text fields are empty. The camera and timestamp values below can still tell you where
+			the file came from.
 		</p>
 	{/if}
 
-	<h3 class="label spaced">All {entries.length} fields</h3>
+	<h3 class="label spaced">
+		{notable.length > 0
+			? `${rest.length} other field${rest.length === 1 ? '' : 's'}`
+			: `All ${entries.length} field${entries.length === 1 ? '' : 's'}`}
+	</h3>
 	<table>
 		<thead>
 			<tr>
@@ -58,7 +51,7 @@
 			</tr>
 		</thead>
 		<tbody>
-			{#each rest as entry (entry.ifd + entry.tag)}
+			{#each rest as entry, i (i)}
 				<tr>
 					<td class="mono">{label(entry)}</td>
 					<td class="mono value-cell">{entry.value}</td>

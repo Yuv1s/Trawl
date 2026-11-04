@@ -5,6 +5,7 @@ import type {
 	NestedArtifact,
 	PcapCapture,
 	PdfStructure,
+	SqliteDatabase,
 	Structure,
 	Survey,
 	ZipArchive
@@ -42,6 +43,7 @@ export type SolveInput = {
 	aes?: AesSolved[];
 	zip?: ZipArchive | null;
 	pdf?: PdfStructure | null;
+	sqlite?: SqliteDatabase | null;
 	pcap?: PcapCapture | null;
 	nested?: { roots: NestedArtifact[] } | null;
 };
@@ -98,6 +100,10 @@ export function buildSolvePaths(input: SolveInput): SolvePath[] {
 		for (const flag of object.flags ?? []) {
 			add(flag, [fileName, `object ${object.number}`, 'inflated stream']);
 		}
+	}
+
+	for (const found of input.sqlite?.flags ?? []) {
+		add(found.text, [fileName, `table ${found.table}`, found.deleted ? 'deleted row' : 'row']);
 	}
 
 	// AES that decrypted to something readable.

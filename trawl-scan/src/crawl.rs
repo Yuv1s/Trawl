@@ -14,6 +14,14 @@
 //! lying around actually is.
 
 use reqwest::Url;
+use std::collections::HashSet;
+
+/// Ceilings per page, so one hostile document cannot make the parse run away or
+/// the result balloon. A real page references dozens of things and holds a
+/// handful of comments; a page with tens of thousands is an attack on the
+/// scanner's time and memory, not a site to crawl. Past these the rest are left.
+const MAX_REFERENCES: usize = 2000;
+const MAX_COMMENTS: usize = 2000;
 
 /// What a referenced URL turns out to be, judged by its file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,7 +117,9 @@ pub fn comments(body: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = html.as_ref();
 
-    while let Some(start) = rest.find("<!--") {
+    while out.len() < MAX_COMMENTS
+        && let Some(start) = rest.find("<!--")
+    {
         let after = &rest[start + 4..];
         let Some(end) = after.find("-->") else {
             break;
@@ -151,8 +161,12 @@ fn classify(url: &Url) -> Kind {
 pub fn references(base: &Url, body: &[u8]) -> Vec<Reference> {
     let html = String::from_utf8_lossy(body);
     let mut out: Vec<Reference> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
 
     for raw in attribute_values(&html) {
+        if out.len() >= MAX_REFERENCES {
+            break;
+        }
         let Ok(mut abs) = base.join(&raw) else {
             continue;
         };
@@ -167,7 +181,9 @@ pub fn references(base: &Url, body: &[u8]) -> Vec<Reference> {
         let same_host = abs.host_str() == base.host_str();
         let url = abs.to_string();
 
-        if out.iter().any(|seen| seen.url == url) {
+        // A set rather than a scan of what is already kept, so a page carrying
+        // tens of thousands of links stays linear rather than quadratic.
+        if !seen.insert(url.clone()) {
             continue;
         }
 
@@ -216,6 +232,7 @@ pub fn decode_url(url: &str) -> String {
 pub fn robots_paths(base: &Url, body: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(body);
     let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
 
     for line in text.lines() {
         let line = line.trim();
@@ -238,7 +255,7 @@ pub fn robots_paths(base: &Url, body: &[u8]) -> Vec<String> {
 
         if let Ok(abs) = base.join(value) {
             let url = abs.to_string();
-            if !out.contains(&url) {
+            if seen.insert(url.clone()) {
                 out.push(url);
             }
         }
@@ -256,9 +273,12 @@ pub fn robots_paths(base: &Url, body: &[u8]) -> Vec<String> {
 pub fn sitemap_locs(base: &Url, body: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(body);
     let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut rest = text.as_ref();
 
-    while let Some(start) = rest.find("<loc>") {
+    while out.len() < MAX_REFERENCES
+        && let Some(start) = rest.find("<loc>")
+    {
         let after = &rest[start + 5..];
         let Some(end) = after.find("</loc>") else {
             break;
@@ -266,7 +286,7 @@ pub fn sitemap_locs(base: &Url, body: &[u8]) -> Vec<String> {
         let raw = after[..end].trim();
         if let Ok(abs) = base.join(raw) {
             let url = abs.to_string();
-            if !out.contains(&url) {
+            if seen.insert(url.clone()) {
                 out.push(url);
             }
         }

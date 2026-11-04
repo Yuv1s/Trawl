@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { tick } from 'svelte';
+	import { trapFocus } from '$lib/focus';
 	import type { TourStep } from '$lib/tour/types';
 
 	let { steps, onfinish }: { steps: TourStep[]; onfinish: () => void } = $props();
@@ -52,8 +53,10 @@
 
 	function keydown(event: KeyboardEvent) {
 		if (event.key === 'Escape') onfinish();
-		else if (event.key === 'ArrowRight' || event.key === 'Enter') next();
+		else if (event.key === 'ArrowRight') next();
 		else if (event.key === 'ArrowLeft') back();
+		// A focused button already turns Enter into its own click.
+		else if (event.key === 'Enter' && !(event.target as HTMLElement).closest('button')) next();
 	}
 
 	const cardTop = $derived.by(() => {
@@ -101,6 +104,7 @@
 <div
 	class="card"
 	bind:this={card}
+	{@attach trapFocus}
 	tabindex="-1"
 	role="dialog"
 	aria-modal="true"

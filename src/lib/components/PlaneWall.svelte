@@ -104,10 +104,10 @@
 	</div>
 
 	<p class="footnote">
-		The number is the fraction of neighbouring pixels whose bit differs. Around 0.50 is
-		indistinguishable from noise, near 0.00 is flat. It is reported, not judged: a fine gradient
-		flips bit 1 on almost every step, so a high number in an upper plane is ordinary. Chi-square and
-		RS analysis are the tests that will make claims.
+		The number is the fraction of neighbouring pixels whose bit differs. Around 0.50 looks like
+		noise and near 0.00 is flat. Trawl only reports this number and draws no conclusion from it,
+		since a fine gradient flips bit 1 on almost every step and a high number in an upper plane is
+		normal. Chi-square and RS analysis are the tests that judge.
 	</p>
 {/if}
 

@@ -168,6 +168,150 @@ fn refuses_a_progressive_scan_that_mixes_dc_and_ac() {
     );
 }
 
+/// A marker segment with its length field.
+fn segment(marker: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![0xff, marker];
+    out.extend_from_slice(&((body.len() + 2) as u16).to_be_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+/// A one-component baseline frame of the given size.
+fn sof(width: u16, height: u16) -> Vec<u8> {
+    let mut body = vec![8];
+    body.extend_from_slice(&height.to_be_bytes());
+    body.extend_from_slice(&width.to_be_bytes());
+    body.extend_from_slice(&[1, 1, 0x11, 0]);
+    segment(0xc0, &body)
+}
+
+/// A Huffman table holding a single one-bit code.
+fn one_code_table(class_and_slot: u8, value: u8) -> Vec<u8> {
+    let mut body = vec![class_and_slot, 1];
+    body.extend_from_slice(&[0; 15]);
+    body.push(value);
+    segment(0xc4, &body)
+}
+
+/// A file carrying the frame and the given extras, then a scan of component 1.
+fn file_with_scan(selectors: u8, extras: &[Vec<u8>]) -> Vec<u8> {
+    let mut file = vec![0xff, 0xd8];
+    file.extend_from_slice(&sof(8, 8));
+    for extra in extras {
+        file.extend_from_slice(extra);
+    }
+    file.extend_from_slice(&segment(0xda, &[1, 1, selectors, 0, 63, 0]));
+    file.extend_from_slice(&[0x55; 16]);
+    file.extend_from_slice(&[0xff, 0xd9]);
+    file
+}
+
+#[test]
+fn a_table_selector_past_the_four_slots_is_refused() {
+    // Four bits each, so a selector can claim slot fifteen, and the scan decoder used
+    // to index straight into a four-entry array with it.
+    for selectors in [0x50, 0x05, 0xf0, 0x0f, 0x4f] {
+        assert_eq!(
+            coefficients(&file_with_scan(selectors, &[])).unwrap_err(),
+            DctError::MissingTable,
+            "selectors {selectors:#x}"
+        );
+    }
+}
+
+#[test]
+fn a_table_selector_inside_the_slots_naming_nothing_is_refused() {
+    assert_eq!(
+        coefficients(&file_with_scan(0x33, &[])).unwrap_err(),
+        DctError::MissingTable
+    );
+}
+
+#[test]
+fn a_huge_frame_in_a_tiny_file_is_refused_before_anything_is_allocated() {
+    // Seventeen bytes declaring 65535 x 65535, which is seventeen gigabytes of blocks.
+    let mut file = vec![0xff, 0xd8];
+    file.extend_from_slice(&sof(65_535, 65_535));
+    file.extend_from_slice(&[0xff, 0xd9]);
+    assert_eq!(coefficients(&file).unwrap_err(), DctError::TooLarge);
+}
+
+#[test]
+fn a_frame_with_more_blocks_than_the_file_has_bits_is_refused() {
+    // Eight bytes of scan could never have coded this many blocks.
+    let mut file = vec![0xff, 0xd8];
+    file.extend_from_slice(&sof(8 * 1024, 8 * 1024));
+    file.extend_from_slice(&[0x55; 8]);
+    assert_eq!(coefficients(&file).unwrap_err(), DctError::TooLarge);
+}
+
+#[test]
+fn a_block_count_that_wraps_a_32_bit_usize_is_refused() {
+    let frame = Frame {
+        width: 65_535,
+        height: 65_535,
+        precision: 8,
+        progressive: false,
+        components: vec![Component {
+            id: 1,
+            horizontal: 15,
+            vertical: 15,
+            quant_table: 0,
+        }; 255],
+    };
+
+    assert_eq!(
+        check_block_count(&frame, usize::MAX / 2, 3, usize::MAX),
+        Err(DctError::TooLarge)
+    );
+    assert_eq!(
+        check_block_count(&frame, 546, 546, usize::MAX),
+        Err(DctError::TooLarge),
+        "over the absolute limit whatever the file length"
+    );
+}
+
+#[test]
+fn a_corrupt_dc_category_is_refused_rather_than_shifted_by() {
+    // One code, meaning category 200. Reading 200 bits into a u32 and shifting by 199
+    // is a panic in any build with overflow checks.
+    let file = file_with_scan(
+        0x00,
+        &[one_code_table(0x00, 200), one_code_table(0x10, 0)],
+    );
+    assert_eq!(coefficients(&file).unwrap_err(), DctError::BadHuffmanCode);
+}
+
+#[test]
+fn a_running_dc_total_that_overflows_wraps_rather_than_panics() {
+    let mut predictor = i32::MAX;
+    let table = {
+        let mut counts = [0u8; 16];
+        counts[0] = 1;
+        Huffman::build(&counts, vec![16])
+    };
+    let mut reader = BitReader::new(&[0x7f, 0xff, 0xff, 0xff], 0, 4);
+    assert!(read_dc(&mut reader, &table, &mut predictor).is_ok());
+    assert!(predictor < 0, "the total should have wrapped");
+}
+
+#[test]
+fn a_file_of_nothing_but_scans_stops_at_the_limit() {
+    let mut file = vec![0xff, 0xd8];
+    file.extend_from_slice(&sof(8, 8));
+    file.extend_from_slice(&one_code_table(0x00, 0));
+    file.extend_from_slice(&one_code_table(0x10, 0));
+    for _ in 0..MAX_SCANS * 4 {
+        file.extend_from_slice(&segment(0xda, &[1, 1, 0x00, 0, 63, 0]));
+        file.push(0x00);
+    }
+    file.extend_from_slice(&[0xff, 0xd9]);
+
+    let found = coefficients(&file).unwrap();
+    assert_eq!(found.scans, MAX_SCANS);
+    assert!(found.truncated);
+}
+
 #[test]
 fn says_so_when_the_file_is_not_a_jpeg() {
     assert_eq!(

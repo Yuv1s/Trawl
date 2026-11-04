@@ -138,6 +138,75 @@ export function writeupMarkdown(
 		archive.length ? list(archive) : 'No ZIP entries.'
 	);
 
+	const pdf = analysis.pdf;
+	if (pdf) {
+		const lines = [
+			`PDF ${pdf.version}, ${pdf.objects.length} objects, ${pdf.revisions} revision${pdf.revisions === 1 ? '' : 's'}`
+		];
+		for (const object of pdf.objects.filter((o) => o.orphaned))
+			lines.push(
+				`Object ${object.number} ${object.generation} is not in the cross-reference table`
+			);
+		if (pdf.trailing > 0) lines.push(`${pdf.trailing} bytes after the last %%EOF`);
+		if (pdf.encrypted) lines.push('Password protected');
+		if (pdf.embeddedFiles.length > 0) lines.push(`${pdf.embeddedFiles.length} attached files`);
+		sections.push('', '## PDF', list(lines));
+	}
+
+	const binary = analysis.binary;
+	if (binary) {
+		const guards = [
+			`NX: ${binary.nx}`,
+			`${binary.format === 'PE' ? 'ASLR' : 'PIE'}: ${binary.pie}`,
+			...(binary.relro === null ? [] : [`RELRO: ${binary.relro}`]),
+			`Stack canary: ${binary.canary ? 'on' : 'none found'}`
+		];
+		const lines = [`${binary.format}, ${binary.machine}, ${binary.kind}`, guards.join(', ')];
+		if (binary.needed.length > 0) lines.push(`Needs ${binary.needed.map(clean).join(', ')}`);
+		sections.push('', '## Binary', list(lines));
+	}
+
+	const hive = analysis.hive;
+	if (hive) {
+		const lines = hive.devices.map((device) => {
+			const model = [device.vendor, device.product].filter(Boolean).join(' ');
+			return clean(
+				`${model || 'Unnamed device'}, serial ${device.serial}, last written ${device.lastWritten || 'at an unknown time'}, from ${device.source}`
+			);
+		});
+		sections.push(
+			'',
+			'## Registry hive',
+			`${hive.kind} hive. ${lines.length ? 'USB devices it remembers:' : 'It records no USB devices.'}`
+		);
+		if (lines.length) sections.push(list(lines));
+	}
+
+	const sqlite = analysis.sqlite;
+	if (sqlite) {
+		const lines: string[] = [];
+		for (const table of sqlite.tables) {
+			lines.push(`${clean(table.name)}: ${table.rowCount} rows, ${table.deleted.length} deleted`);
+			for (const row of table.deleted)
+				lines.push(`Deleted row: ${clean(row.map((value) => value.text).join(', '))}`);
+		}
+		sections.push('', '## SQLite', lines.length ? list(lines) : 'No tables.');
+	}
+
+	const pcap = analysis.pcap;
+	if (pcap) {
+		const lines = [
+			`${pcap.format}, ${pcap.packetCount} packets, ${pcap.protocols.map((p) => p.name).join(', ') || 'no known protocols'}`
+		];
+		if (pcap.dns.length > 0)
+			lines.push(`DNS questions: ${pcap.dns.map((query) => clean(query.name)).join(', ')}`);
+		for (const stream of pcap.streams) {
+			if (stream.embeddedFile)
+				lines.push(`${stream.src} to ${stream.dst} carries a ${stream.embeddedFile}`);
+		}
+		sections.push('', '## Network capture', list(lines));
+	}
+
 	const childInventory = nestedArtifacts(analysis.nested?.roots ?? [], '');
 	if (childInventory.length) {
 		sections.push('', '## Nested artifacts');

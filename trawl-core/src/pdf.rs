@@ -14,13 +14,38 @@
 //! reader and still readable by a walk).
 //!
 //! So this walks the whole file for `obj` markers first, independent of any
-//! index, and separately reads the last cross-reference table to see what it
-//! claims. An object nothing points at any more is reported as such. A
+//! index, and separately reads the cross-reference tables to see what they
+//! claim. An object nothing points at any more is reported as such. A
 //! stream's own compression is not undone here, the way [`crate::png`] does
 //! not inflate a `zTXt` chunk itself: that is a platform call, and this
 //! reports where the bytes are so the caller can make it.
 
 use crate::bytes;
+use std::collections::{HashMap, HashSet};
+
+/// Most objects one reading reports. An object header is seven bytes, so a file of
+/// nothing else asks for far more text than it holds.
+const MAX_OBJECTS: usize = 1 << 18;
+
+/// How far past the next object header a dictionary may run before it is given up on,
+/// and how much of that the whole file gets.
+///
+/// A dictionary stops at the next header, because that is what makes the walk linear:
+/// every object's search covers bytes no other object's does, where `1 0 obj<<` over
+/// and over has each one searching the rest of the file and keeping all of it. The
+/// allowance is for a string inside a dictionary that happens to read like a header,
+/// and it runs out long before it could matter on a file built to exhaust it.
+const DICT_OVERRUN: usize = 64 * 1024;
+const DICT_OVERRUN_TOTAL: usize = 8 << 20;
+
+/// Cross-reference tables followed back through `/Prev`, and entries read across them.
+/// A table can start inside another, each then reading through most of the same bytes.
+const MAX_REVISIONS_FOLLOWED: usize = 4096;
+const MAX_XREF_ENTRIES: usize = 1 << 22;
+
+/// Trailers read from the end of the file, and how far each dictionary is searched.
+const TRAILERS_READ: usize = 16;
+const TRAILER_SPAN: usize = 1 << 20;
 
 /// Where a byte-string token ends, honouring `\)` and the format's other
 /// escapes so a literal string carrying a close paren is not cut short.
@@ -101,12 +126,73 @@ fn unescape_literal(raw: &[u8]) -> String {
     out
 }
 
+/// Characters that end a name token, whitespace aside.
+fn ends_name(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || b"()<>[]{}/%".contains(&byte)
+}
+
+/// What follows `/Key` at a dictionary's own level.
+///
+/// A key is a whole name, or `/Length` finds `/Length1`, and it is a key of this
+/// dictionary rather than of one nested inside it, or `/Length` finds the one in a
+/// `/DecodeParms`. Strings are stepped over, since one can hold anything.
+fn field<'a>(dict: &'a str, key: &str) -> Option<&'a str> {
+    let bytes = dict.as_bytes();
+    let mut depth = 0usize;
+    let mut arrays = 0usize;
+    let mut at = 0usize;
+    let mut strings = true;
+
+    while let Some(&byte) = bytes.get(at) {
+        match byte {
+            b'<' if bytes.get(at + 1) == Some(&b'<') => {
+                depth += 1;
+                at += 2;
+            }
+            b'>' if bytes.get(at + 1) == Some(&b'>') => {
+                depth = depth.saturating_sub(1);
+                at += 2;
+            }
+            b'[' => {
+                arrays += 1;
+                at += 1;
+            }
+            b']' => {
+                arrays = arrays.saturating_sub(1);
+                at += 1;
+            }
+            // An unmatched parenthesis must not hide the keys after it, and searching
+            // from every one that follows would make a dictionary of them quadratic.
+            b'(' if strings => match literal_string_end(bytes, at) {
+                Some(end) => at = end,
+                None => {
+                    strings = false;
+                    at += 1;
+                }
+            },
+            b'/' => {
+                let start = at + 1;
+                let end = bytes[start..]
+                    .iter()
+                    .position(|&b| ends_name(b))
+                    .map_or(bytes.len(), |length| start + length);
+                if depth == 1 && arrays == 0 && dict.get(start..end) == Some(key) {
+                    return dict.get(end..);
+                }
+                at = end;
+            }
+            _ => at += 1,
+        }
+    }
+
+    None
+}
+
 /// The value of `/Key (literal string)` inside a dictionary's text, if it is
 /// there and written as a literal string rather than a hex string or a
 /// reference to another object.
 fn literal_field(dict: &str, key: &str) -> Option<String> {
-    let needle = format!("/{key}");
-    let after = dict[dict.find(&needle)? + needle.len()..].trim_start();
+    let after = field(dict, key)?.trim_start();
     let bytes = after.as_bytes();
 
     if bytes.first() != Some(&b'(') {
@@ -117,35 +203,86 @@ fn literal_field(dict: &str, key: &str) -> Option<String> {
     Some(unescape_literal(&bytes[1..end - 1]))
 }
 
+/// The name at the start of a run of text, with its slash.
+fn leading_name(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('/')?;
+    let end = rest
+        .find(|c: char| c.is_ascii() && ends_name(c as u8))
+        .unwrap_or(rest.len());
+    rest.get(..end)
+}
+
 /// The value of `/Key /Name` inside a dictionary's text, the space between
 /// them optional: most real PDF writers put one there, and the format
 /// permits either.
 fn name_field(dict: &str, key: &str) -> Option<String> {
-    let needle = format!("/{key}");
-    let after = dict[dict.find(&needle)? + needle.len()..].trim_start();
-    let rest = after.strip_prefix('/')?;
-    let end = rest
-        .find(|c: char| c.is_whitespace() || "/<>[]()".contains(c))
-        .unwrap_or(rest.len());
-    Some(rest[..end].to_string())
+    leading_name(field(dict, key)?.trim_start()).map(str::to_string)
 }
 
-/// The value of `/Key 123` inside a dictionary's text, a plain integer
-/// rather than a name, a string or a reference.
+/// The value of `/Filter`, which is a single name or an array of them applied in
+/// order. Names joined with " then ", so a one-item array reads as that one name.
+fn filter_field(dict: &str) -> Option<String> {
+    let after = field(dict, "Filter")?.trim_start();
+    let Some(items) = after.strip_prefix('[') else {
+        return leading_name(after).map(str::to_string);
+    };
+
+    let items = items.get(..items.find(']')?)?;
+    let names: Vec<&str> = items
+        .split('/')
+        .skip(1)
+        .map(|name| name.trim_end())
+        .filter(|name| !name.is_empty())
+        .collect();
+    Some(names.join(" then "))
+}
+
+/// An integer written directly, or the object an indirect reference names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Number {
+    Direct(u64),
+    Reference(u32),
+}
+
+/// The value of `/Key 123` or `/Key 123 0 R` inside a dictionary's text. Telling the
+/// two apart is the whole point: read as a plain number, `/Length 5 0 R` is a stream
+/// five bytes long.
+fn number_or_reference(dict: &str, key: &str) -> Option<Number> {
+    let after = field(dict, key)?.trim_start();
+    let digits = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+    let number: u64 = after.get(..digits)?.parse().ok()?;
+
+    let rest = after.get(digits..)?.trim_start();
+    let generation = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    if generation > 0 {
+        let rest = rest.get(generation..)?.trim_start();
+        let ends = rest.get(1..).is_none_or(|tail| {
+            tail.bytes().next().is_none_or(ends_name)
+        });
+        if rest.starts_with('R') && ends {
+            return u32::try_from(number).ok().map(Number::Reference);
+        }
+    }
+
+    Some(Number::Direct(number))
+}
+
+/// The value of `/Key 123`, when it is written as a plain integer.
 fn number_field(dict: &str, key: &str) -> Option<u64> {
-    let needle = format!("/{key}");
-    let after = dict[dict.find(&needle)? + needle.len()..].trim_start();
-    let end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
-    after.get(..end)?.parse().ok()
+    match number_or_reference(dict, key)? {
+        Number::Direct(number) => Some(number),
+        Number::Reference(_) => None,
+    }
 }
 
 /// The object number of `/Key N G R` inside a dictionary's text: an
 /// indirect reference to another object, which is how a dictionary points at
-/// something too large to hold inline. The leading digit run is the object
-/// number whether what follows is a plain integer or a reference, so this is
-/// [`number_field`] under a name that says what the number means here.
+/// something too large to hold inline.
 fn reference_field(dict: &str, key: &str) -> Option<u32> {
-    number_field(dict, key)?.try_into().ok()
+    match number_or_reference(dict, key)? {
+        Number::Reference(number) => Some(number),
+        Number::Direct(_) => None,
+    }
 }
 
 /// A stream's raw bytes, wherever compression leaves them.
@@ -153,9 +290,8 @@ fn reference_field(dict: &str, key: &str) -> Option<u32> {
 pub struct Stream {
     pub offset: usize,
     pub length: usize,
-    /// The name of the stream's own `/Filter`, empty when it carries its
-    /// bytes uncompressed or names its filter as an array rather than a
-    /// single name, which this does not walk.
+    /// The names in the stream's own `/Filter`, joined with " then ", empty when
+    /// it carries its bytes uncompressed.
     pub filter: String,
 }
 
@@ -171,10 +307,10 @@ pub struct Object {
     pub kind: Option<String>,
     pub subtype: Option<String>,
     pub stream: Option<Stream>,
-    /// True when the document's last cross-reference table does not list
-    /// this object's offset. Only set when that table could be read at all;
-    /// a document using a cross-reference stream instead leaves every object
-    /// unmarked rather than guessing.
+    /// True when the document's cross-reference tables, followed back through every
+    /// revision, do not list this object's offset as live. Only set when they could
+    /// all be read; a document using a cross-reference stream instead leaves every
+    /// object unmarked rather than guessing.
     pub orphaned: bool,
 }
 
@@ -192,12 +328,13 @@ pub struct Document {
     /// One entry per `%%EOF` found, in file order. More than one means the
     /// document has been incrementally updated at least once.
     pub revisions: Vec<Revision>,
-    /// True when a trailer names an `/Encrypt` dictionary.
+    /// True when a trailer or a cross-reference stream names an `/Encrypt` dictionary.
     pub encrypted: bool,
     /// `/Info` dictionary fields this module knows how to read, in the order
     /// they were found.
     pub info: Vec<(String, String)>,
-    /// Object numbers whose `/Subtype` names them as a file attachment.
+    /// Object numbers whose `/Type` names them as a file attachment, which is what the
+    /// format says it should be, or whose `/Subtype` does, which some writers do.
     pub embedded_files: Vec<u32>,
     /// Bytes after the last `%%EOF`. A reader stops there; anything past it
     /// was appended by something other than the tool that wrote the PDF.
@@ -249,23 +386,34 @@ fn dict_end(data: &[u8], open: usize) -> Option<usize> {
     None
 }
 
-/// Every `N G obj` block in the file, walked independent of any index.
-fn objects(data: &[u8]) -> Vec<Object> {
+/// One `N G obj` header, before anything after it has been read.
+struct Header {
+    number: u32,
+    generation: u16,
+    offset: usize,
+    body_at: usize,
+}
+
+/// Every `N G obj` header in the file, walked independent of any index.
+fn headers(data: &[u8]) -> Vec<Header> {
     let mut out = Vec::new();
     let mut at = 0usize;
 
-    while let Some(found) = bytes::find(data, at, b" obj") {
+    while out.len() < MAX_OBJECTS
+        && let Some(found) = bytes::find(data, at, b" obj")
+    {
+        at = found + 4;
+
         // Walk backwards over the generation and object number that must
         // precede " obj", rather than forward from a match: the signature is
         // the keyword, and what makes this a real object header is what sits
         // in front of it.
-        let Some(gen_end) = Some(found) else { break };
+        let gen_end = found;
         let mut gen_start = gen_end;
         while gen_start > 0 && data[gen_start - 1].is_ascii_digit() {
             gen_start -= 1;
         }
         if gen_start == gen_end || gen_start == 0 || data[gen_start - 1] != b' ' {
-            at = found + 4;
             continue;
         }
 
@@ -275,7 +423,6 @@ fn objects(data: &[u8]) -> Vec<Object> {
             num_start -= 1;
         }
         if num_start == num_end {
-            at = found + 4;
             continue;
         }
 
@@ -283,18 +430,98 @@ fn objects(data: &[u8]) -> Vec<Object> {
             core::str::from_utf8(&data[num_start..num_end]).ok().and_then(|s| s.parse().ok()),
             core::str::from_utf8(&data[gen_start..gen_end]).ok().and_then(|s| s.parse().ok()),
         ) else {
-            at = found + 4;
             continue;
         };
 
-        let body_at = found + 4;
-        let dict = data.get(body_at..).and_then(|rest| {
+        out.push(Header {
+            number,
+            generation,
+            offset: num_start,
+            body_at: at,
+        });
+    }
+
+    out
+}
+
+/// Every occurrence of a keyword, in order, so a later question about the next one
+/// is a binary search and not another scan of the rest of the file.
+fn occurrences(data: &[u8], keyword: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while let Some(found) = bytes::find(data, at, keyword) {
+        out.push(found);
+        at = found + keyword.len();
+    }
+    out
+}
+
+/// The integer an object holds, for a `/Length` that points at one.
+fn integer_object(data: &[u8], body_at: usize) -> Option<usize> {
+    let rest = data.get(body_at..)?;
+    let offset = rest.iter().take(64).position(|b| !b.is_ascii_whitespace())?;
+    let (number, _) = digits_at(rest, offset)?;
+    Some(number as usize)
+}
+
+/// Bytes a stream holds, given where it starts and what its dictionary claims.
+///
+/// A claim is taken when it lands on the `endstream` keyword, give or take the line
+/// ending in front of it, whichever `endstream` that is: a stream can hold the keyword
+/// itself, and an embedded PDF stored uncompressed holds dozens. A claim that lands
+/// nowhere is a mistake or a lie, and what is left is the first `endstream` after the
+/// start, less its line ending, which is what an inflate needs to see no junk after
+/// the data.
+fn stream_length(data: &[u8], start: usize, claimed: Option<usize>, first_end: usize) -> usize {
+    if let Some(length) = claimed
+        && let Some(after) = start.checked_add(length)
+    {
+        let landed = data.get(after..).is_some_and(|rest| {
+            rest.starts_with(b"endstream")
+                || rest.starts_with(b"\nendstream")
+                || rest.starts_with(b"\r\nendstream")
+                || rest.starts_with(b"\rendstream")
+        });
+        if landed {
+            return length;
+        }
+    }
+
+    let mut end = first_end;
+    if end > start && data[end - 1] == b'\n' {
+        end -= 1;
+    }
+    if end > start && data[end - 1] == b'\r' {
+        end -= 1;
+    }
+    end - start
+}
+
+/// Every `N G obj` block in the file, walked independent of any index.
+fn objects(data: &[u8]) -> Vec<Object> {
+    let headers = headers(data);
+    let stream_ends = occurrences(data, b"endstream");
+    // By number, for a `/Length` that points elsewhere. The last revision wins.
+    let bodies: HashMap<u32, usize> = headers.iter().map(|h| (h.number, h.body_at)).collect();
+
+    let mut out = Vec::with_capacity(headers.len());
+    let mut overrun = DICT_OVERRUN_TOTAL;
+
+    for (index, header) in headers.iter().enumerate() {
+        let body_at = header.body_at;
+        let limit = headers.get(index + 1).map_or(data.len(), |next| next.offset);
+
+        let dict = data.get(body_at..limit).and_then(|rest| {
             let offset = rest.iter().position(|b| !b.is_ascii_whitespace())?;
             if rest.get(offset..offset + 2)? != b"<<" {
                 return None;
             }
             let open = body_at + offset;
-            let end = dict_end(data, open)?;
+            let end = dict_end(&data[..limit], open).or_else(|| {
+                let further = limit.saturating_add(DICT_OVERRUN.min(overrun)).min(data.len());
+                overrun -= (further - limit).min(overrun);
+                dict_end(&data[..further], open)
+            })?;
             Some((open, end))
         });
 
@@ -318,30 +545,36 @@ fn objects(data: &[u8]) -> Vec<Object> {
                 start += 1;
             }
 
-            let end = bytes::find(data, start, b"endstream")?;
-            let length = number_field(&dict_text, "Length")
-                .map(|n| n as usize)
-                .unwrap_or(end.saturating_sub(start));
+            let next = stream_ends.partition_point(|&end| end < start);
+            let first_end = *stream_ends.get(next)?;
+
+            // Either a number here or a number in another object, which may not
+            // come until later in the file.
+            let claimed = match number_or_reference(&dict_text, "Length") {
+                Some(Number::Direct(length)) => usize::try_from(length).ok(),
+                Some(Number::Reference(object)) => {
+                    bodies.get(&object).and_then(|&at| integer_object(data, at))
+                }
+                None => None,
+            };
 
             Some(Stream {
                 offset: start,
-                length: length.min(end.saturating_sub(start)),
-                filter: name_field(&dict_text, "Filter").unwrap_or_default(),
+                length: stream_length(data, start, claimed, first_end),
+                filter: filter_field(&dict_text).unwrap_or_default(),
             })
         });
 
         out.push(Object {
-            number,
-            generation,
-            offset: num_start,
+            number: header.number,
+            generation: header.generation,
+            offset: header.offset,
             kind: name_field(&dict_text, "Type"),
             subtype: name_field(&dict_text, "Subtype"),
             stream,
             dict: dict_text,
             orphaned: false,
         });
-
-        at = found + 4;
     }
 
     out
@@ -360,23 +593,27 @@ fn revisions(data: &[u8]) -> Vec<Revision> {
     out
 }
 
-/// The object offsets a classic plain-text cross-reference table lists,
-/// reading every subsection it declares.
+/// Object numbers a table mentions, and where each one lives when it is in use.
+type XrefEntries = Vec<(u32, Option<usize>)>;
+
+/// What one classic plain-text cross-reference table lists, reading every subsection
+/// it declares, and where it stops.
 ///
 /// `xref` is followed by one or more subsections, each a `start count`
 /// header line and then `count` fixed-width entries of the form
 /// `nnnnnnnnnn ggggg n` (in use) or `...f` (free). Only `n` entries name a
-/// real offset.
-fn classic_xref(data: &[u8], at: usize) -> Option<Vec<usize>> {
+/// real offset. A free entry still counts: it says this number has no live object,
+/// which overrides whatever an older table said.
+fn classic_xref(data: &[u8], at: usize) -> Option<(XrefEntries, usize)> {
     let mut cursor = at + 4;
-    let mut offsets = Vec::new();
+    let mut entries = Vec::new();
 
     loop {
         while data.get(cursor).is_some_and(u8::is_ascii_whitespace) {
             cursor += 1;
         }
 
-        let Some((_start, after_start)) = digits_at(data, cursor) else {
+        let Some((start, after_start)) = digits_at(data, cursor) else {
             break;
         };
         let mut past = after_start;
@@ -392,18 +629,124 @@ fn classic_xref(data: &[u8], at: usize) -> Option<Vec<usize>> {
             cursor += 1;
         }
 
-        for _ in 0..count {
+        for index in 0..count {
             let entry = data.get(cursor..cursor + 20)?;
             let text = core::str::from_utf8(entry).ok()?;
             let offset: usize = text.get(0..10)?.trim().parse().ok()?;
-            if text.as_bytes().get(17) == Some(&b'n') {
-                offsets.push(offset);
-            }
+            let live = text.as_bytes().get(17) == Some(&b'n');
+            entries.push((start.wrapping_add(index), live.then_some(offset)));
             cursor += 20;
         }
     }
 
-    (!offsets.is_empty()).then_some(offsets)
+    Some((entries, cursor))
+}
+
+/// The dictionary after a keyword, searched only so far, so that a file of nothing
+/// but this keyword cannot have each one scan the rest of it.
+fn dict_after(data: &[u8], at: usize) -> Option<String> {
+    let rest = data.get(at..)?;
+    let offset = rest.iter().position(|b| !b.is_ascii_whitespace())?;
+    if rest.get(offset..offset + 2)? != b"<<" {
+        return None;
+    }
+    let open = at + offset;
+    let limit = open.saturating_add(TRAILER_SPAN).min(data.len());
+    let end = dict_end(&data[..limit], open)?;
+    Some(crate::json::latin1(&data[open..end]))
+}
+
+/// Where the newest cross-reference table sits: the offset the last `startxref` names
+/// when it lands on one, or failing that the last `xref` keyword in the file.
+fn newest_xref(data: &[u8]) -> Option<usize> {
+    let named = data.windows(9).rposition(|w| w == b"startxref").and_then(|at| {
+        let mut digits = at + 9;
+        while data.get(digits).is_some_and(u8::is_ascii_whitespace) {
+            digits += 1;
+        }
+        let (offset, _) = digits_at(data, digits)?;
+        let offset = offset as usize;
+        data.get(offset..)?.starts_with(b"xref").then_some(offset)
+    });
+
+    named.or_else(|| {
+        let mut found = None;
+        let mut from = 0usize;
+        while let Some(at) = bytes::find(data, from, b"xref") {
+            // "xref" alone, not "startxref", which names an offset rather
+            // than starting a table.
+            if at == 0 || data[at - 1] != b't' {
+                found = Some(at);
+            }
+            from = at + 4;
+        }
+        found
+    })
+}
+
+/// The offset of every object the document still reaches, from its cross-reference
+/// tables newest first, or nothing when a table in the chain cannot be read.
+///
+/// An incremental update writes a table of what changed and points back at the one
+/// before it with `/Prev`, so the last table alone lists almost nothing. Read that way
+/// every object the update left alone looks orphaned. The newest entry for a number is
+/// the one that counts, whether it gives that number a new home or frees it.
+fn live_offsets(data: &[u8], mut entries_left: usize) -> Option<HashSet<usize>> {
+    let mut at = newest_xref(data)?;
+    let mut decided: HashSet<u32> = HashSet::new();
+    let mut live: HashSet<usize> = HashSet::new();
+    let mut visited: HashSet<usize> = HashSet::new();
+
+    // A chain that loops is a doctored file, and a table read twice says nothing new.
+    while visited.insert(at) && visited.len() <= MAX_REVISIONS_FOLLOWED {
+        let (entries, end) = classic_xref(data, at)?;
+        entries_left = entries_left.checked_sub(entries.len())?;
+        for (number, offset) in entries {
+            if decided.insert(number)
+                && let Some(offset) = offset
+            {
+                // A little leeway, since plenty of writers point at the line ending
+                // in front of the object rather than at the object.
+                let skip = data
+                    .get(offset..)
+                    .map_or(0, |rest| rest.iter().take(16).take_while(|b| b.is_ascii_whitespace()).count());
+                live.insert(offset + skip);
+            }
+        }
+
+        let mut trailer = end;
+        while data.get(trailer).is_some_and(u8::is_ascii_whitespace) {
+            trailer += 1;
+        }
+        if data.get(trailer..trailer + 7) != Some(b"trailer") {
+            break;
+        }
+        let Some(previous) = dict_after(data, trailer + 7).and_then(|d| number_field(&d, "Prev")) else {
+            break;
+        };
+
+        let previous = usize::try_from(previous).ok()?;
+        if !data.get(previous..)?.starts_with(b"xref") {
+            return None;
+        }
+        at = previous;
+    }
+
+    Some(live)
+}
+
+/// Trailers from the end of the file, newest first, with what each one says.
+fn last_trailers(data: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut end = data.len();
+    for _ in 0..TRAILERS_READ {
+        let Some(at) = data[..end].windows(7).rposition(|w| w == b"trailer") else {
+            break;
+        };
+        out.extend(dict_after(data, at + 7));
+        end = at;
+    }
+    out
 }
 
 /// Reads a PDF, or returns nothing when the file does not open with `%PDF-`.
@@ -414,6 +757,7 @@ pub fn read(data: &[u8]) -> Option<Document> {
 
     let version_end = data[5..]
         .iter()
+        .take(16)
         .position(|b| b.is_ascii_whitespace() || *b == b'\r' || *b == b'\n')
         .map(|p| 5 + p)
         .unwrap_or(data.len().min(9));
@@ -426,29 +770,20 @@ pub fn read(data: &[u8]) -> Option<Document> {
     );
 
     // The last trailer in the file describes the document as a reader would
-    // see it today; an earlier one is a revision that got superseded.
-    let last_trailer = {
-        let mut found = None;
-        let mut from = 0usize;
-        while let Some(at) = bytes::find(data, from, b"trailer") {
-            found = Some(at);
-            from = at + 7;
-        }
-        found
-    };
+    // see it today; an earlier one is a revision that got superseded. A linearized
+    // file writes the fuller trailer first, so the older ones are asked in turn. A
+    // cross-reference stream has no trailer at all and carries the same entries in
+    // its own dictionary.
+    let trailers = last_trailers(data);
+    let xref_stream = objects.iter().rev().find(|o| o.kind.as_deref() == Some("XRef"));
+    let dictionaries: Vec<&str> = trailers
+        .iter()
+        .map(String::as_str)
+        .chain(xref_stream.map(|o| o.dict.as_str()))
+        .collect();
 
-    let trailer_dict = last_trailer.and_then(|at| {
-        let rest = &data[at + 7..];
-        let offset = rest.iter().position(|b| !b.is_ascii_whitespace())?;
-        if rest.get(offset..offset + 2)? != b"<<" {
-            return None;
-        }
-        let open = at + 7 + offset;
-        let end = dict_end(data, open)?;
-        Some(crate::json::latin1(&data[open..end]))
-    });
-
-    let encrypted = trailer_dict.as_deref().is_some_and(|d| d.contains("/Encrypt"));
+    let encrypted = dictionaries.iter().any(|d| field(d, "Encrypt").is_some());
+    let info_number = dictionaries.iter().find_map(|d| reference_field(d, "Info"));
 
     // Where the cross-reference table itself sits: the classic form starts
     // with the bare keyword `xref`; PDF 1.5 and later can carry the same
@@ -458,34 +793,24 @@ pub fn read(data: &[u8]) -> Option<Document> {
     // the second.
     let uses_xref_stream = objects.iter().any(|o| o.kind.as_deref() == Some("XRef"));
 
-    if !uses_xref_stream {
-        let last_xref = {
-            let mut found = None;
-            let mut from = 0usize;
-            while let Some(at) = bytes::find(data, from, b"xref") {
-                // "xref" alone, not "startxref", which names an offset rather
-                // than starting a table.
-                if at == 0 || data[at - 1] != b't' {
-                    found = Some(at);
-                }
-                from = at + 4;
-            }
-            found
-        };
-
-        if let Some(at) = last_xref
-            && let Some(listed) = classic_xref(data, at)
-        {
-            for object in &mut objects {
-                object.orphaned = !listed.contains(&object.offset);
-            }
+    if !uses_xref_stream && let Some(live) = live_offsets(data, MAX_XREF_ENTRIES) {
+        for object in &mut objects {
+            object.orphaned = !live.contains(&object.offset);
         }
     }
 
-    let info = trailer_dict
-        .as_deref()
-        .and_then(|d| reference_field(d, "Info"))
-        .and_then(|number| objects.iter().find(|o| o.number == number))
+    // The revision a reader would see: the live one, or failing that the last one
+    // written, since the first one in the file is the oldest.
+    let info = info_number
+        .and_then(|number| {
+            let holding = |o: &&Object| o.number == number;
+            objects
+                .iter()
+                .rev()
+                .filter(holding)
+                .find(|o| !o.orphaned)
+                .or_else(|| objects.iter().rev().find(holding))
+        })
         .map(|info_object| {
             ["Title", "Author", "Subject", "Producer", "Creator", "CreationDate", "ModDate"]
                 .iter()
@@ -496,7 +821,9 @@ pub fn read(data: &[u8]) -> Option<Document> {
 
     let embedded_files = objects
         .iter()
-        .filter(|o| o.subtype.as_deref() == Some("EmbeddedFile"))
+        .filter(|o| {
+            o.kind.as_deref() == Some("EmbeddedFile") || o.subtype.as_deref() == Some("EmbeddedFile")
+        })
         .map(|o| o.number)
         .collect();
 

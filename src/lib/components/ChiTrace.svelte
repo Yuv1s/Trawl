@@ -4,8 +4,14 @@
 	let {
 		chi,
 		error,
-		blocked = 'Pixels could not be decoded, so the test did not run.'
-	}: { chi: ChiSquare | null; error: string | null; blocked?: string } = $props();
+		blocked = 'Pixels could not be decoded, so the test did not run.',
+		disputed = false
+	}: {
+		chi: ChiSquare | null;
+		error: string | null;
+		blocked?: string;
+		disputed?: boolean;
+	} = $props();
 
 	const W = 720;
 	const H = 220;
@@ -41,9 +47,15 @@
 			</p>
 			<p class="detail">
 				Peak probability {chi.peakProbability.toFixed(3)} across
-				{chi.samples.toLocaleString()} samples. The curve holds near 1 while the payload lasts and collapses
-				where it stops, which is what places the boundary.
+				{chi.samples.toLocaleString()} samples. The curve stays near 1 while the payload lasts and drops
+				where it stops, which marks the boundary.
 			</p>
+			{#if disputed}
+				<p class="detail">
+					RS analysis can read this image and sees nothing in the low bits, so this is more likely a
+					synthetic or noisy image than a payload.
+				</p>
+			{/if}
 		{:else}
 			<p class="headline">No sequential LSB embedding.</p>
 			<p class="detail">
@@ -90,9 +102,9 @@
 		The test asks whether the values 2i and 2i+1 occur equally often, which a random payload forces
 		and an untouched image has no reason to do. So anything that already randomised the low bits
 		reads as embedded here: heavy sensor noise, prior resampling, a synthetic or dithered source.
-		Read a positive as "these low bits are indistinguishable from random", which is evidence, not
-		proof. It also only sees embedding laid down in order from the start, so a payload confined to a
-		region will not show; the bit-plane wall is where that becomes visible.
+		Treat a positive as "these low bits look random" and check it another way. The test also only
+		sees embedding written in order from the start, so a payload confined to one region won't show
+		here. Look for that on the bit-plane wall.
 	</p>
 {/if}
 

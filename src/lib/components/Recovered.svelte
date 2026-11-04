@@ -31,7 +31,7 @@
 	</div>
 
 	<ul>
-		{#each candidates as found (found.offset)}
+		{#each candidates as found (found.text)}
 			<li>
 				<div class="row">
 					<output class="value mono">{found.text}</output>
@@ -48,7 +48,7 @@
 				{/if}
 			</li>
 		{/each}
-		{#each fromPixels as found (found.origin + found.text)}
+		{#each fromPixels as found (found.text)}
 			<li>
 				<div class="row">
 					<output class="value mono">{found.text}</output>

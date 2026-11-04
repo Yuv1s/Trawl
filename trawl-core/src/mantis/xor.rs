@@ -17,7 +17,7 @@
 
 use crate::bytes;
 
-use super::plainness;
+use super::{plainness, shortest_period};
 
 /// How common each character is in ordinary English, including the space.
 ///
@@ -130,23 +130,6 @@ pub fn key_lengths(data: &[u8], max: usize) -> Vec<usize> {
 
     scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(core::cmp::Ordering::Equal));
     scored.into_iter().map(|(length, _)| length).collect()
-}
-
-/// The shortest run the key repeats.
-///
-/// Any multiple of the real key length decrypts perfectly, so the search often
-/// lands on one. Reporting "KEYKEY" when the key was "KEY" is not wrong, but it
-/// is not the answer either.
-fn shortest_period(key: &[u8]) -> Vec<u8> {
-    for period in 1..=key.len() / 2 {
-        if !key.len().is_multiple_of(period) {
-            continue;
-        }
-        if key.chunks(period).all(|chunk| chunk == &key[..period]) {
-            return key[..period].to_vec();
-        }
-    }
-    key.to_vec()
 }
 
 /// Recovers the key of a given length by solving each column on its own.

@@ -170,13 +170,65 @@ fn finds_a_wide_columnar_order_end_to_end() {
 fn wide_search_declines_a_width_that_does_not_divide_evenly() {
     let data = b"this message is not a clean multiple of nine letters long";
     assert_ne!(data.len() % 9, 0, "fixture needs to not divide evenly");
-    assert_eq!(build_wide_order(data, 9), None);
+    assert_eq!(build_wide_order(data, 9, &mut WIDE_BUDGET.clone()), None);
 }
 
 #[test]
 fn wide_search_declines_grids_narrower_than_three() {
-    assert_eq!(build_wide_order(b"aaaaaaaaaa", 2), None);
-    assert_eq!(build_wide_order(b"aaaaaaaaaa", 1), None);
+    assert_eq!(build_wide_order(b"aaaaaaaaaa", 2, &mut WIDE_BUDGET.clone()), None);
+    assert_eq!(build_wide_order(b"aaaaaaaaaa", 1, &mut WIDE_BUDGET.clone()), None);
+}
+
+#[test]
+fn the_head_of_an_arrangement_matches_the_whole_of_it() {
+    let data: Vec<u8> = (0..101u32).map(|i| b'a' + (i % 26) as u8).collect();
+    for order in [vec![0, 1, 2], vec![2, 0, 1], vec![1, 3, 0, 2], vec![4, 2, 0, 3, 1]] {
+        let whole = columnar_decipher(&data, &order);
+        assert_eq!(columnar_head(&data, &order, usize::MAX), whole);
+        assert_eq!(columnar_head(&data, &order, 40), whole[..40].to_vec());
+        assert_eq!(columnar_head(&data, &order, 0), Vec::<u8>::new());
+    }
+}
+
+#[test]
+fn a_long_columnar_message_is_found_from_the_head_of_each_arrangement() {
+    // Every arrangement used to be rebuilt in full and read in full.
+    let prose: &[u8] = b"the museum keeps its oldest maps in a locked room beneath the reading hall, where the air is kept dry and the light is kept low. visitors are welcome on the first thursday of every month. ";
+    let plain = prose.repeat(100);
+    let hidden = columnar_encipher(&plain, &[3, 1, 4, 0, 2]);
+
+    let started = std::time::Instant::now();
+    let found = solve(&hidden).expect("nothing came back");
+    assert_eq!(found.plaintext, plain);
+    // Three seconds as it stands and twenty-four when every arrangement is read in full,
+    // with room left for a busy machine.
+    assert!(started.elapsed().as_secs() < 12, "took {:?}", started.elapsed());
+}
+
+#[test]
+fn a_long_text_with_many_divisors_stops_at_the_wide_budget() {
+    // 5040 x 4 divides by almost every width the wide search tries.
+    let mut state = 0x9e37_79b9u32;
+    let noise: Vec<u8> = (0..20_160)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            b'a' + (state % 26) as u8
+        })
+        .collect();
+
+    let started = std::time::Instant::now();
+    assert_eq!(solve(&noise), None);
+    assert!(started.elapsed().as_secs() < 20, "took {:?}", started.elapsed());
+}
+
+#[test]
+fn a_spent_budget_turns_a_wide_search_away() {
+    let data = vec![b'e'; 9 * 200];
+    let mut budget = 10;
+    assert_eq!(build_wide_order(&data, 9, &mut budget), None);
+    assert_eq!(budget, 10, "nothing was spent on a search that never ran");
 }
 
 /// Why a plain greedy build is not what runs past the exhaustive width: run

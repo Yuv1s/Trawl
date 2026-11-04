@@ -57,7 +57,7 @@
 	function statusChip(status: 'analysed' | 'skipped' | 'error', reason?: string): string {
 		switch (status) {
 			case 'analysed':
-				return '✓ analysed';
+				return 'analysed';
 			case 'skipped':
 				return reason ? `skipped: ${reason}` : 'skipped';
 			case 'error':
@@ -75,21 +75,21 @@
 <div class="zip">
 	{#if hidden.length > 0 || arguing.length > 0 || notes.length > 0 || carrying.length > 0}
 		<ul class="findings">
-			{#each carrying as entry (entry.offset)}
-				{#each entry.flags ?? [] as flag (flag)}
+			{#each carrying as entry, i (i)}
+				{#each new Set(entry.flags ?? []) as flag (flag)}
 					<li class="flagged">
 						<span class="mono big">{flag}</span>
 						<span class="muted"> inside <span class="mono">{entry.name}</span></span>
 					</li>
 				{/each}
 			{/each}
-			{#each hidden as entry (entry.offset)}
+			{#each hidden as entry, i (i)}
 				<li class="flagged">
 					<span class="mono">{entry.name}</span> is in the file but not in the directory, so no ordinary
 					reader will list it
 				</li>
 			{/each}
-			{#each arguing as entry (entry.offset)}
+			{#each arguing as entry, i (i)}
 				<li class="flagged">
 					<span class="mono">{entry.name}</span>: {entry.disagreement}
 				</li>
@@ -101,7 +101,7 @@
 	{:else}
 		<p class="clear">
 			The directory and the headers agree on every entry, nothing sits outside the archive, and no
-			entry is hidden from a listing. That is what an untouched archive looks like.
+			entry is hidden from a listing. This looks like an untouched archive.
 		</p>
 	{/if}
 
@@ -114,7 +114,8 @@
 
 	<table>
 		<caption class="label"
-			>{archive.entries.length} entries{locked.length > 0
+			>{archive.entries.length}
+			{archive.entries.length === 1 ? 'entry' : 'entries'}{locked.length > 0
 				? `, ${locked.length} encrypted`
 				: ''}</caption
 		>
@@ -129,7 +130,7 @@
 			</tr>
 		</thead>
 		<tbody>
-			{#each archive.entries as entry (entry.offset)}
+			{#each archive.entries as entry, i (i)}
 				<tr class:odd={entry.undeclared || entry.disagreement !== null}>
 					<td>
 						<span class="mono name">{entry.name}</span>
@@ -169,12 +170,12 @@
 				</tr>
 				{#if entry.comment}
 					<tr class="aside">
-						<td colspan="5"><span class="label">comment</span> {entry.comment}</td>
+						<td colspan="6"><span class="label">comment</span> {entry.comment}</td>
 					</tr>
 				{/if}
 				{#if entry.text}
 					<tr class="aside">
-						<td colspan="5">
+						<td colspan="6">
 							<div class="content-head">
 								<span class="label">content</span>
 								{#if onpeel}
@@ -187,7 +188,7 @@
 					</tr>
 				{:else if entry.readError}
 					<tr class="aside">
-						<td colspan="5">
+						<td colspan="6">
 							<span class="label">content</span>
 							<span class="muted">could not read: {entry.readError}</span>
 						</td>
@@ -199,8 +200,8 @@
 
 	{#if locked.length > 0}
 		<p class="footnote">
-			Trawl does not crack archive passwords. Reversing one means guessing until a checksum matches,
-			which belongs on hardware you control running something built for it.
+			Trawl doesn't crack archive passwords. That means guessing until a checksum matches, which is
+			a job for dedicated software on your own hardware.
 		</p>
 	{/if}
 </div>

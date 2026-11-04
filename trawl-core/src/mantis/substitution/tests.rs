@@ -122,6 +122,23 @@ fn is_reproducible() {
 /// `cargo test --release measure_separation -- --ignored --nocapture` to
 /// re-derive the table in those doc comments rather than trusting it.
 #[test]
+fn a_long_paste_climbs_on_its_opening_and_deciphers_all_of_it() {
+    // Every swap of every restart read every letter, which is a minute on a long paste,
+    // and the key has only 26 choices to settle.
+    let clean = PROSE.repeat(1 + 40_000 / PROSE.len());
+    let mut key = [0u8; 26];
+    for (i, slot) in key.iter_mut().enumerate() {
+        *slot = ((i + 7) % 26) as u8;
+    }
+    let hidden = encipher(&clean, &key);
+
+    let started = std::time::Instant::now();
+    let found = solve(&hidden).expect("a text this long has to solve");
+    assert_eq!(found.plaintext, clean);
+    assert!(started.elapsed().as_secs() < 20, "took {:?}", started.elapsed());
+}
+
+#[test]
 #[ignore]
 fn measure_separation() {
     fn climbed(text: &[u8]) -> f32 {
@@ -132,7 +149,7 @@ fn measure_separation() {
         let mut rng = Rng::seeded(&cipher);
 
         for _ in 1..RESTARTS {
-            rng.shuffle(&mut key);
+            shuffle(&mut rng, &mut key);
             let score = climb(&cipher, &mut key);
             if score > top {
                 top = score;
@@ -192,7 +209,7 @@ fn probe_restarts() {
         let mut rng = Rng(0x9e3779b97f4a7c15 ^ salt.wrapping_mul(0x100000001b3) | 1);
 
         for _ in 1..restarts {
-            rng.shuffle(&mut work);
+            shuffle(&mut rng, &mut work);
             let score = climb(&cipher, &mut work);
             if score > top {
                 top = score;
@@ -213,7 +230,7 @@ fn probe_restarts() {
                     for (i, slot) in key.iter_mut().enumerate() {
                         *slot = i as u8;
                     }
-                    Rng(salt.wrapping_mul(0x2545f4914f6cdd1d) | 1).shuffle(&mut key);
+                    shuffle(&mut Rng(salt.wrapping_mul(0x2545f4914f6cdd1d) | 1), &mut key);
                     exact(&clean, &key, restarts, salt)
                 })
                 .count();

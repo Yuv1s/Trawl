@@ -3,7 +3,7 @@
 </script>
 
 <svelte:head>
-	<title>Terms — Trawl</title>
+	<title>Terms · Trawl</title>
 	<meta name="description" content="MIT licensed, provided as is, and yours to use responsibly." />
 </svelte:head>
 
@@ -16,17 +16,18 @@
 
 	<h2>No warranty</h2>
 	<p>
-		The software is provided as is, without warranty of any kind. Analysis results are the output of
-		statistical tests and parsers, and they can be wrong. A finding is evidence to check, not proof.
-		An empty result means the checks that ran found nothing, not that a file is clean. Verify
-		anything you intend to rely on.
+		The software is provided as is, without warranty of any kind. Analysis results come from
+		statistical tests and parsers, and they can be wrong. Treat a finding as evidence to check. An
+		empty result means the checks that ran found nothing, and the file may still hide something.
+		Verify anything you intend to rely on.
 	</p>
 
 	<h2>Responsible use</h2>
 	<p>
-		Only analyse files you are permitted to analyse. Competition rules, disclosure agreements and
-		local law are your responsibility, not this tool's. Trawl is built for capture-the-flag work,
-		security education and forensics on material you have authorisation to examine.
+		Only analyse files you are permitted to analyse, and only scan sites you are authorised to test.
+		Competition rules, disclosure agreements and local law are your responsibility. Trawl is built
+		for capture-the-flag work, security education and forensics on material you have authorisation
+		to examine.
 	</p>
 
 	<h2>No liability</h2>
@@ -37,7 +38,7 @@
 
 	<h2>No service</h2>
 	<p>
-		Trawl is not a hosted service. There is no account, no support obligation and no uptime
-		commitment. If the page stops being published, the copy you already have keeps working offline.
+		Trawl comes with no account, support obligation or uptime commitment. If this site goes away,
+		the source code stays available under the MIT licence and you can run your own copy.
 	</p>
 </Legal>

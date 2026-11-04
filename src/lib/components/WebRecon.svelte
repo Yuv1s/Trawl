@@ -1,20 +1,10 @@
 <script lang="ts">
 	import Logo from '$lib/components/Logo.svelte';
 	import HeaderControls from '$lib/components/HeaderControls.svelte';
-	import { getOrCreateScannerToken } from '$lib';
+	import { getOrCreateScannerToken, rememberAddress, SCANNER_URL as scannerUrl } from '$lib';
 	import { SvelteSet } from 'svelte/reactivity';
 
 	let { onreset }: { onreset: () => void } = $props();
-
-	/**
-	 * Where the scanner listens. The scanner is a separate program the person
-	 * runs on their own machine; the offline half of Trawl never touches the
-	 * network, and this half only ever talks to a server they started themselves.
-	 */
-	const scannerUrl = (import.meta.env.VITE_SCANNER_URL ?? 'http://localhost:8099').replace(
-		/\/$/,
-		''
-	);
 
 	/** How often to look for the scanner, in ms. Gentle: this runs until it answers. */
 	const POLL = 2500;
@@ -40,21 +30,28 @@
 	 *  private targets is a choice the person installing it makes. */
 	let allowLocal = $state(false);
 
-	/** One line per system: fetch the installer from this site and run it. */
-	const commands = $derived<Record<Os, string>>({
-		windows: `$env:TRAWL_TOKEN='${scannerToken}'; $env:TRAWL_ORIGIN='${origin}';${allowLocal ? " $env:TRAWL_ALLOW_LOCAL='1';" : ' Remove-Item Env:TRAWL_ALLOW_LOCAL -ErrorAction SilentlyContinue;'} irm ${origin}/install.ps1 | iex`,
-		macos: `curl -fsSL ${origin}/install.sh | TRAWL_TOKEN='${scannerToken}' TRAWL_ORIGIN='${origin}'${allowLocal ? " TRAWL_ALLOW_LOCAL='1'" : ''} sh`,
-		linux: `curl -fsSL ${origin}/install.sh | TRAWL_TOKEN='${scannerToken}' TRAWL_ORIGIN='${origin}'${allowLocal ? " TRAWL_ALLOW_LOCAL='1'" : ''} sh`
-	});
-	const command = $derived(commands[os]);
 	const scannerAddress = new URL(scannerUrl);
 	const scannerPort = scannerAddress.port || (scannerAddress.protocol === 'https:' ? '443' : '80');
+
+	/** One line per system: fetch the installer from this site and run it. */
+	const commands = $derived<Record<Os, string>>({
+		windows: `$env:TRAWL_TOKEN='${scannerToken}'; $env:TRAWL_ORIGIN='${origin}'; $env:PORT='${scannerPort}';${allowLocal ? " $env:TRAWL_ALLOW_LOCAL='1';" : ' Remove-Item Env:TRAWL_ALLOW_LOCAL -ErrorAction SilentlyContinue;'} irm ${origin}/install.ps1 | iex`,
+		macos: `curl -fsSL ${origin}/install.sh | TRAWL_TOKEN='${scannerToken}' TRAWL_ORIGIN='${origin}' PORT='${scannerPort}'${allowLocal ? " TRAWL_ALLOW_LOCAL='1'" : ''} sh`,
+		linux: `curl -fsSL ${origin}/install.sh | TRAWL_TOKEN='${scannerToken}' TRAWL_ORIGIN='${origin}' PORT='${scannerPort}'${allowLocal ? " TRAWL_ALLOW_LOCAL='1'" : ''} sh`
+	});
+	const command = $derived(commands[os]);
+
 	const restartCommands = $derived<Record<Os, string>>({
 		windows: `$env:TRAWL_TOKEN='${scannerToken}'; $env:TRAWL_ORIGIN='${origin}'; $env:PORT='${scannerPort}'; & "$env:LOCALAPPDATA\\trawl\\trawl-scan.exe" --allow-local`,
 		macos: `TRAWL_TOKEN='${scannerToken}' TRAWL_ORIGIN='${origin}' PORT='${scannerPort}' "$HOME/.trawl/bin/trawl-scan" --allow-local`,
 		linux: `TRAWL_TOKEN='${scannerToken}' TRAWL_ORIGIN='${origin}' PORT='${scannerPort}' "$HOME/.trawl/bin/trawl-scan" --allow-local`
 	});
 	const restartCommand = $derived(restartCommands[os]);
+	const cloneCommand = $derived(
+		os === 'windows'
+			? `$env:TRAWL_TOKEN='${scannerToken}'; $env:TRAWL_ORIGIN='${origin}'; npm run scanner`
+			: `TRAWL_TOKEN='${scannerToken}' TRAWL_ORIGIN='${origin}' npm run scanner`
+	);
 
 	let connected = $state(false);
 	/** Whether the scanner will reach local and private targets, from /health. */
@@ -131,6 +128,8 @@
 	type FoundFile = { url: string; status: number; size: number; sensitive: boolean };
 	type ScanResult = {
 		target: string;
+		/** What did not happen and the person should know: skipped checks, limits hit. */
+		notices?: string[];
 		pages: PageResult[];
 		images: string[];
 		scripts: string[];
@@ -199,9 +198,47 @@
 		}
 	}
 
-	/** The scanner's own fetch of a target resource, so the browser never has to. */
-	function proxied(url: string): string {
-		return `${scannerUrl}/fetch?url=${encodeURIComponent(url)}&token=${encodeURIComponent(scannerToken)}`;
+	/**
+	 * Shows a target's image through the scanner, so the browser never reaches the
+	 * target. Fetched with the token in a header and shown from a blob, which keeps
+	 * the token out of any address. Waits until the image is near the viewport, since
+	 * a page can list hundreds and each one is a request the scanner has to make.
+	 */
+	function proxied(url: string) {
+		return (image: HTMLImageElement) => {
+			let blobUrl: string | undefined;
+			const abort = new AbortController();
+
+			const load = async () => {
+				try {
+					const res = await fetch(`${scannerUrl}/fetch?url=${encodeURIComponent(url)}`, {
+						headers: { Authorization: `Bearer ${scannerToken}` },
+						signal: abort.signal
+					});
+					if (!res.ok) return;
+					const blob = await res.blob();
+					if (abort.signal.aborted) return;
+					blobUrl = URL.createObjectURL(blob);
+					image.src = blobUrl;
+				} catch {
+					// A thumbnail that fails stays empty, and the entry still lists the image.
+				}
+			};
+
+			const near = new IntersectionObserver((entries) => {
+				if (entries.some((entry) => entry.isIntersecting)) {
+					near.disconnect();
+					void load();
+				}
+			});
+			near.observe(image);
+
+			return () => {
+				near.disconnect();
+				abort.abort();
+				if (blobUrl) URL.revokeObjectURL(blobUrl);
+			};
+		};
 	}
 
 	const categories = $derived.by<Category[]>(() => {
@@ -336,7 +373,7 @@
 	/** Open the offline tools on a target's image in a new tab, results left intact. */
 	function checkWithTrawl(url: string) {
 		const base = window.location.origin + window.location.pathname;
-		window.open(`${base}?analyse=${encodeURIComponent(url)}`, '_blank', 'noopener,noreferrer');
+		window.open(`${base}?analyse=${rememberAddress(url)}`, '_blank', 'noopener,noreferrer');
 	}
 </script>
 
@@ -359,10 +396,10 @@
 			<div class="pane-head">
 				<h2>Scanner connected</h2>
 				<p>
-					Reached the scanner at <span class="mono">{scannerUrl}</span>{localMode
+					Connected to the scanner at <span class="mono">{scannerUrl}</span>{localMode
 						? ', in local mode'
-						: ''}. Give it a target you are allowed to test, and Remora pulls the page apart into
-					what Trawl already reads.
+						: ''}. Enter a target you're allowed to test, and Remora crawls it for pages, files and
+					flags.
 				</p>
 			</div>
 
@@ -388,8 +425,8 @@
 				<span>
 					<span class="gate-title">Active checks</span>
 					<span class="gate-note"
-						>Sends crafted requests, an injection quote, a privilege field, a timestamp, rather than
-						only reading. Tick only for a target you are authorized to test.</span
+						>Sends crafted requests as well as reading pages: an injection quote, a privilege field,
+						a timestamp. Tick this only for a target you're authorised to test.</span
 					>
 				</span>
 			</label>
@@ -405,9 +442,9 @@
 						autocomplete="off"
 						placeholder="a parameter, field, header or path you suspect (one per line)"></textarea>
 					<p class="gate-note">
-						Optional. Each line is tried in every position at once, as an endpoint, a parameter, a
-						form field and a header, on top of the built-in checks. Leave empty to run the general
-						checks alone.
+						Optional. Each line is tried in every position at once (endpoint, parameter, form field
+						and header) on top of the built-in checks. Leave this empty to run only the built-in
+						checks.
 					</p>
 				</div>
 			{/if}
@@ -474,6 +511,9 @@
 					<span class="mono">{r.target}</span>, {r.pages.length}
 					{r.pages.length === 1 ? 'page' : 'pages'} crawled.
 				</p>
+				{#each r.notices ?? [] as notice (notice)}
+					<p class="notice">{notice}</p>
+				{/each}
 
 				<div class="workbench">
 					<nav class="tree" aria-label="Findings">
@@ -492,7 +532,7 @@
 
 								{#if !closed.has(cat.key)}
 									<ul class="items">
-										{#each cat.items as item (item.id)}
+										{#each cat.items as item, i (i)}
 											<li>
 												<button
 													type="button"
@@ -501,7 +541,7 @@
 													onclick={() => (selected = item)}
 												>
 													{#if item.kind === 'image'}
-														<img class="thumb" src={proxied(item.id)} alt="" loading="lazy" />
+														<img class="thumb" {@attach proxied(item.id)} alt="" />
 													{/if}
 													<span
 														class="item-label mono"
@@ -561,11 +601,10 @@
 								<p class="d-value mono" class:flagged={s.sensitive}>{shortPath(s.id)}</p>
 								<p class="how">
 									{#if s.sensitive}
-										Source control, a backup, or a dotfile that answered to its name. Nothing on the
-										site links to it.
+										Source control, a backup or a dotfile that responded at a guessed path. Nothing
+										on the site links to it.
 									{:else}
-										A file that answered to its name. Nothing on the site links to it, so a person
-										had to know or guess it was there.
+										A file that responded at a guessed path. Nothing on the site links to it.
 									{/if}
 								</p>
 								<a class="open" href={s.id} target="_blank" rel="external noreferrer noopener"
@@ -581,7 +620,7 @@
 									<div class="d-list">
 										<h4 class="label">Flags here</h4>
 										<ul class="plain">
-											{#each onThisPage.flags as f (f.value)}
+											{#each onThisPage.flags as f, i (i)}
 												<li class="mono flagged">{f.value}</li>
 											{/each}
 										</ul>
@@ -591,7 +630,7 @@
 									<div class="d-list">
 										<h4 class="label">Comments here</h4>
 										<ul class="plain">
-											{#each onThisPage.comments as c (c.value)}
+											{#each onThisPage.comments as c, i (i)}
 												<li class="mono comment">{c.value}</li>
 											{/each}
 										</ul>
@@ -602,7 +641,9 @@
 								>
 							{:else if s.kind === 'image'}
 								<span class="d-kind label">Image</span>
-								<div class="shot"><img src={proxied(s.id)} alt={fileName(s.id)} /></div>
+								<div class="shot">
+									{#key s.id}<img {@attach proxied(s.id)} alt={fileName(s.id)} />{/key}
+								</div>
 								<p class="where mono">{shortPath(s.id)}</p>
 								<div class="actions">
 									<button type="button" class="do" onclick={() => checkWithTrawl(s.id)}>
@@ -613,9 +654,9 @@
 									>
 								</div>
 								<p class="hint">
-									Check with Trawl opens a new tab and runs it through the same tools a dropped
-									image gets: the LSB sweeps, the metadata, and anything hidden past the end of the
-									file.
+									Check with Trawl opens a new tab and runs this image through the same tools as a
+									dropped file, including the LSB sweeps, the metadata and anything past the end of
+									the file.
 								</p>
 							{:else}
 								<span class="d-kind label">{s.kind}</span>
@@ -625,7 +666,7 @@
 								>
 							{/if}
 						{:else}
-							<p class="clear">Pick something on the left to look at it.</p>
+							<p class="clear">Pick an item on the left to see it here.</p>
 						{/if}
 					</div>
 				</div>
@@ -634,11 +675,10 @@
 			<div class="pane-head">
 				<h2>Waiting for the scanner</h2>
 				<p>
-					Reaching a live site is the one thing a browser tab cannot do, so this half runs a small
-					program on your own machine. Paste the line for your system into any terminal. It
-					downloads the scanner and starts it, no repository and no setup. Nothing about the target
-					reaches Trawl, because there is nothing to reach: the scanner is yours and runs where you
-					run it.
+					A browser tab can't reach other sites on its own, so this part of Trawl uses a small
+					program on your machine. Paste the line for your system into any terminal. It downloads
+					the scanner and starts it, with no repository or setup. Nothing about your target reaches
+					Trawl's site, because the scanner talks only to the target and to this page.
 				</p>
 			</div>
 
@@ -688,8 +728,9 @@
 				</label>
 
 				<p class="hint">
-					It runs a short script served from this page, which fetches the scanner for {OS_LABEL[os]} and
-					starts it. Read it first if you like, at
+					The line runs a short script from this site, which downloads the scanner for {OS_LABEL[
+						os
+					]} and starts it. You can read the script first at
 					<span class="mono">{origin}/{os === 'windows' ? 'install.ps1' : 'install.sh'}</span>.
 				</p>
 			</div>
@@ -700,9 +741,10 @@
 			</div>
 
 			<p class="footnote">
-				This switches over the moment the scanner answers, so start it and leave this open. Building
-				from a clone of the repo instead? Run <span class="mono">npm run scanner</span> in the Trawl
-				folder. Either way a different port is fine: point Trawl at it with
+				This page switches over as soon as the scanner answers, so start it and leave this tab open.
+				From a clone of the repo, run this in the Trawl folder instead:
+				<span class="mono">{cloneCommand}</span>. To use a different port, set
+				<span class="mono">PORT</span> for the scanner and point Trawl at it with
 				<span class="mono">VITE_SCANNER_URL</span>.
 			</p>
 		{/if}
@@ -788,7 +830,14 @@
 	.pane {
 		padding-top: var(--s5);
 		display: grid;
+		grid-template-columns: minmax(0, 1fr);
 		gap: var(--s5);
+	}
+
+	.hint .mono,
+	.footnote .mono,
+	.pane-head .mono {
+		overflow-wrap: anywhere;
 	}
 
 	.pane-head h2 {
@@ -1075,6 +1124,13 @@
 		line-height: 1.5;
 	}
 	.local-restart .copy-error {
+		font-size: var(--t-label);
+	}
+
+	.notice {
+		margin: var(--s2) 0 0;
+		max-width: 72ch;
+		color: var(--signal);
 		font-size: var(--t-label);
 	}
 
