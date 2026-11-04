@@ -1,9 +1,11 @@
-![Trawl](src/lib/assets/TrawlBanner.png)
+# Trawl
 
-Live at **[trawlctf.vercel.app](https://trawlctf.vercel.app)**.
+Drop in a file or paste a string, and Trawl looks for whatever is hidden in it. It runs in your
+browser, so nothing gets uploaded.
 
-Drop a file into the page, or paste a string, and Trawl looks for whatever is
-hidden in it. Your files stay on your computer.
+![A PNG is dropped onto Trawl and a flag hidden in its pixels appears, then a pasted string is peeled through base64 and hex to another flag.](.github/demo.gif)
+
+**[Try it at trawlctf.vercel.app](https://trawlctf.vercel.app)**. There's nothing to install and no account.
 
 It is built for capture-the-flag competitions, where a puzzle often arrives as
 an ordinary-looking image, a sound file or a line of text with a message buried

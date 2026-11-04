@@ -15,7 +15,7 @@
 	import type { TourStep } from '$lib/tour/types';
 	import type { Report } from '$lib/analysis/rsa';
 	import Logo from '$lib/components/Logo.svelte';
-	import banner from '$lib/assets/TrawlBanner.png';
+
 	import ToolRack from '$lib/components/ToolRack.svelte';
 	import Recovered from '$lib/components/Recovered.svelte';
 	import ChunkList from '$lib/components/ChunkList.svelte';
@@ -874,11 +874,15 @@
 		content="Local CTF toolkit for steganography, cryptography and forensics. Nothing leaves your machine."
 	/>
 	<meta property="og:url" content="https://trawlctf.vercel.app/" />
-	<meta property="og:image" content="https://trawlctf.vercel.app{banner}" />
-	<meta property="og:image:width" content="1600" />
-	<meta property="og:image:height" content="500" />
+	<meta property="og:image" content="https://trawlctf.vercel.app/og.png" />
+	<meta property="og:image:width" content="1200" />
+	<meta property="og:image:height" content="630" />
+	<meta
+		property="og:image:alt"
+		content="Trawl showing a flag it found hidden in the pixels of a PNG."
+	/>
 	<meta name="twitter:card" content="summary_large_image" />
-	<meta name="twitter:image" content="https://trawlctf.vercel.app{banner}" />
+	<meta name="twitter:image" content="https://trawlctf.vercel.app/og.png" />
 </svelte:head>
 
 {#if view.phase === 'idle'}
@@ -947,7 +951,9 @@
 					<div class="skeleton" aria-hidden="true">
 						{#each RACK_BARS as width, i (i)}<span style="width: {width}%"></span>{/each}
 					</div>
-					<p class="working label">Reading the file</p>
+					<p class="working label">
+						{view.name === 'pasted text' ? 'Reading the text' : 'Reading the file'}
+					</p>
 				</aside>
 				<main class="pane">
 					<div class="skeleton" aria-hidden="true">

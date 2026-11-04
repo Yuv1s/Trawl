@@ -1,0 +1,4 @@
+contact_links:
+  - name: Report a security problem
+    url: https://github.com/Yuv1s/trawl/security/advisories/new
+    about: Please report these privately, not in a public issue.

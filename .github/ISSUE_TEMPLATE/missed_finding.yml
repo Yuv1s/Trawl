@@ -1,0 +1,32 @@
+name: Missed finding
+description: Trawl missed something hidden in a file, or reported something that isn't there.
+labels: [bug]
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What went wrong
+      options:
+        - It missed something
+        - It reported something that isn't there
+    validations:
+      required: true
+  - type: textarea
+    id: hidden
+    attributes:
+      label: What is in the file
+      description: What is hidden, and how. Name the technique or tool if you know it.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: What Trawl showed
+      description: Which tools reported what, and any note about where it stopped.
+    validations:
+      required: true
+  - type: textarea
+    id: sample
+    attributes:
+      label: The file
+      description: Attach it or link to the public challenge. Please don't attach anything from a competition that is still running.

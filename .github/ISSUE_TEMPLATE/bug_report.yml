@@ -1,0 +1,39 @@
+name: Bug report
+description: Something crashed, froze or looks wrong.
+labels: [bug]
+body:
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened
+      description: What you did, and what Trawl did.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where
+      options:
+        - The website
+        - Running it locally
+        - The Remora scanner
+    validations:
+      required: true
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and system
+      placeholder: Firefox 140 on Windows 11
+    validations:
+      required: true
+  - type: textarea
+    id: sample
+    attributes:
+      label: A file that shows it
+      description: A small sample helps most. Please don't attach anything from a competition that is still running.
