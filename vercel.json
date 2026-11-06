@@ -6,6 +6,9 @@
 	"outputDirectory": "build",
 	"cleanUrls": true,
 	"trailingSlash": false,
+	"git": {
+		"deploymentEnabled": { "dependabot/**": false }
+	},
 	"headers": [
 		{
 			"source": "/(.*)",

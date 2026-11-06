@@ -36,7 +36,6 @@ SOURCES = (
     "trawl-core/build.rs",
     "package.json",
     "package-lock.json",
-    "svelte.config.js",
     "vite.config.ts",
 )
 
