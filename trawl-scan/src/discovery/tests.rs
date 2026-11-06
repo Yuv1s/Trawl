@@ -83,3 +83,33 @@ fn the_wordlist_holds_the_names_a_flag_actually_gets() {
     // Every entry is a rooted path.
     assert!(DISCOVERY_PATHS.iter().all(|p| p.starts_with('/')));
 }
+
+#[test]
+fn an_answer_that_says_the_request_went_wrong_is_told_apart() {
+    let honest = Baseline::from_samples(&[(404, 10), (404, 10)]);
+    assert!(honest.went_wrong(429));
+    assert!(honest.went_wrong(503));
+    assert!(!honest.went_wrong(404));
+    assert!(!honest.went_wrong(403));
+    assert!(!honest.went_wrong(200));
+
+    // Nonsense gets a 500 here, so a 500 says nothing went wrong with this name.
+    let broken = Baseline::from_samples(&[(500, 10), (500, 10)]);
+    assert!(!broken.went_wrong(500));
+    assert!(broken.went_wrong(503));
+}
+
+#[test]
+fn a_refusal_is_new_only_if_nonsense_did_not_get_it_before() {
+    let honest = Baseline::from_samples(&[(404, 10), (404, 10)]);
+    assert!(honest.is_new_refusal(401));
+    assert!(honest.is_new_refusal(403));
+    assert!(honest.is_new_refusal(429));
+    assert!(!honest.is_new_refusal(404));
+    assert!(!honest.is_new_refusal(200));
+
+    // Nonsense always got a 403 here, so getting one again means nothing has changed.
+    let guarded = Baseline::from_samples(&[(403, 10), (403, 10)]);
+    assert!(!guarded.is_new_refusal(403));
+    assert!(guarded.is_new_refusal(401));
+}

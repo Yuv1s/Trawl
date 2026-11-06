@@ -405,19 +405,26 @@ fn flags_in(body: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// What one fetched page contributes: its flags, its comments, and every
-/// reference on it.
+/// What one fetched page contributes: its flags, its comments, every reference on it,
+/// and which of those readers stopped at a ceiling with more to go.
+#[derive(Default)]
+struct Gleaned {
+    flags: Vec<Located>,
+    comments: Vec<Located>,
+    references: Vec<crate::crawl::Reference>,
+    links_cut: bool,
+    comments_cut: bool,
+    decoding_cut: bool,
+}
+
+/// Reads one fetched page, from where it was actually served.
 ///
 /// Flags come from four places now: plain in the body, in a linked filename,
 /// out of a decoding the source suggests, and in a response header. The header
 /// scan is why `X-Flag` and a base64 cookie get read; the decode scan is why an
 /// encoded variable does. All of it runs through the same flag-shape filter, so
 /// a page hiding nothing contributes nothing.
-fn glean(
-    page_url: &str,
-    body: &[u8],
-    headers: &[(String, String)],
-) -> (Vec<Located>, Vec<Located>, Vec<crate::crawl::Reference>) {
+fn glean(page_url: &str, body: &[u8], headers: &[(String, String)]) -> Gleaned {
     let page = reqwest::Url::parse(page_url).ok();
 
     let mut flags: Vec<Located> = flags_in(body)
@@ -425,10 +432,10 @@ fn glean(
         .map(|value| located(value, page_url, ""))
         .collect();
 
-    let references = page
+    let (references, links_cut) = page
         .as_ref()
         .map(|base| crate::crawl::references(base, body))
-        .unwrap_or_default();
+        .map_or((Vec::new(), false), |found| (found.items, found.cut));
 
     // A flag can hide in a filename rather than the text, where the URL encodes
     // its braces out of the detector's sight. Decoding each reference puts it
@@ -441,7 +448,9 @@ fn glean(
 
     // Encoded flags: a base64 variable, a rotated comment, a colour written as
     // CSS escapes, an array XORed against a byte.
-    for found in crate::decode::harvest(body) {
+    let decoded = crate::decode::harvest(body);
+    let mut decoding_cut = decoded.cut;
+    for found in decoded.items {
         flags.push(located(
             found.value,
             page_url,
@@ -460,7 +469,9 @@ fn glean(
                 &format!("in the {name} response header"),
             ));
         }
-        for found in crate::decode::harvest(value.as_bytes()) {
+        let decoded = crate::decode::harvest(value.as_bytes());
+        decoding_cut |= decoded.cut;
+        for found in decoded.items {
             flags.push(located(
                 found.value,
                 page_url,
@@ -469,12 +480,21 @@ fn glean(
         }
     }
 
-    let comments = crate::crawl::comments(body)
+    let read_comments = crate::crawl::comments(body);
+    let comments = read_comments
+        .items
         .into_iter()
         .map(|value| located(value, page_url, ""))
         .collect();
 
-    (flags, comments, references)
+    Gleaned {
+        flags,
+        comments,
+        references,
+        links_cut,
+        comments_cut: read_comments.cut,
+        decoding_cut,
+    }
 }
 
 /// Whether a URL is on the same origin as the scan's entry: scheme, host and
@@ -585,22 +605,24 @@ fn categorize(
 }
 
 /// Queues the same-host pages a sitemap lists, so one reachable only through the
-/// sitemap is still crawled.
+/// sitemap is still crawled. Says whether it listed more than are read.
 fn enqueue_sitemap(
     body: &[u8],
     page_url: &str,
     entry: &reqwest::Url,
     visited: &mut HashSet<String>,
     queue: &mut Vec<String>,
-) {
+) -> bool {
     let Ok(base) = reqwest::Url::parse(page_url) else {
-        return;
+        return false;
     };
-    for loc in crate::crawl::sitemap_locs(&base, body) {
+    let locs = crate::crawl::sitemap_locs(&base, body);
+    for loc in locs.items {
         if same_origin(&loc, entry) && visited.insert(loc.clone()) {
             queue.push(loc);
         }
     }
+    locs.cut
 }
 
 /// Files a site never links to but sometimes leaves reachable: a source backup,
@@ -644,7 +666,7 @@ async fn glean_off_thread(
     page_url: String,
     body: Vec<u8>,
     headers: Vec<(String, String)>,
-) -> (Vec<Located>, Vec<Located>, Vec<crate::crawl::Reference>) {
+) -> Gleaned {
     tokio::task::spawn_blocking(move || glean(&page_url, &body, &headers))
         .await
         .unwrap_or_default()
@@ -681,8 +703,9 @@ async fn harvest_resources(
         }
         fetched += 1;
 
+        // A body that was not served is not a body that held nothing.
         let answer = crate::fetch::fetch(url, allow_local).await;
-        harvested.failed += usize::from(answer.is_err());
+        harvested.failed += usize::from(!matches!(&answer, Ok(res) if res.status == 200));
         if let Ok(res) = answer
             && res.status == 200
         {
@@ -691,23 +714,25 @@ async fn harvest_resources(
             // The decode battery is pure CPU over the body, so it runs off the
             // async worker the same way the page gleaning does.
             let body = res.body;
-            let url_owned = url.clone();
-            let found = tokio::task::spawn_blocking(move || {
+            let source = res.final_url;
+            let (found, decoding_cut) = tokio::task::spawn_blocking(move || {
                 let mut out: Vec<Located> = flags_in(&body)
                     .into_iter()
-                    .map(|value| located(value, &url_owned, ""))
+                    .map(|value| located(value, &source, ""))
                     .collect();
-                for found in crate::decode::harvest(&body) {
+                let decoded = crate::decode::harvest(&body);
+                for found in decoded.items {
                     out.push(located(
                         found.value,
-                        &url_owned,
+                        &source,
                         &format!("{} in the source", found.how),
                     ));
                 }
-                out
+                (out, decoded.cut)
             })
             .await
             .unwrap_or_default();
+            harvested.decoding_cut += usize::from(decoding_cut);
             result.flags.extend(found);
         }
     }
@@ -724,6 +749,7 @@ struct Harvested {
     cut: usize,
     left: usize,
     failed: usize,
+    decoding_cut: usize,
 }
 
 /// Most files one sweep will report. A soft-404 server that slips calibration
@@ -739,8 +765,8 @@ const MAX_FOUND: usize = 40;
 /// is recorded as a found file, its body read for flags, and anything it in
 /// turn references bucketed like any other page's.
 ///
-/// Returns how many of those hits were cut at the body limit, and whether the sweep
-/// stopped at its limit on finds with names still to try.
+/// Returns how many of those hits were cut at the body limit. What it left undone goes in
+/// `undone`.
 #[allow(clippy::too_many_arguments)]
 async fn probe_by_name(
     allow_local: bool,
@@ -752,19 +778,15 @@ async fn probe_by_name(
     scripts: &mut Vec<String>,
     assets: &mut Vec<String>,
     external: &mut Vec<String>,
-) -> (usize, bool) {
+    undone: &mut Undone,
+) -> usize {
     let base = entry.clone();
     let mut cut = 0;
-    let mut capped = false;
 
     // Ask for two paths that cannot be there and remember the answer, so a
     // server that says 200 to everything does not make every name look found.
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
     let mut samples = Vec::new();
-    for path in crate::discovery::calibration_paths(seed) {
+    for path in crate::discovery::calibration_paths(fresh_seed()) {
         if let Ok(url) = base.join(&path)
             && let Ok(res) = crate::fetch::fetch(url.as_str(), allow_local).await
         {
@@ -780,7 +802,7 @@ async fn probe_by_name(
 
     for (path, sensitive) in sensitive.chain(loot) {
         if result.found.len() >= MAX_FOUND {
-            capped = true;
+            undone.sweep_capped = true;
             break;
         }
         if Instant::now() >= deadline {
@@ -795,10 +817,25 @@ async fn probe_by_name(
         }
 
         let Ok(page) = crate::fetch::fetch(&probe, allow_local).await else {
+            undone.names_unanswered += 1;
             continue;
         };
+        if baseline.went_wrong(page.status) {
+            undone.names_unanswered += 1;
+            continue;
+        }
         if !baseline.is_hit(page.status, page.body.len()) {
             continue;
+        }
+
+        // A bot check or a rate limit that starts partway answers every name like this, so
+        // each one has to be told apart from nonsense as it comes. Stopping here also stops
+        // sending requests at a site that has asked for fewer.
+        if matches!(page.status, 401 | 403)
+            && refuses_anything(&base, &baseline, allow_local).await
+        {
+            undone.sweep_refused = true;
+            break;
         }
         cut += usize::from(page.truncated);
 
@@ -810,10 +847,10 @@ async fn probe_by_name(
         });
 
         if !page.body.is_empty() {
-            let (flags, comments, references) =
-                glean_off_thread(probe.clone(), page.body, page.headers).await;
-            result.flags.extend(flags);
-            result.comments.extend(comments);
+            let gleaned = glean_off_thread(page.final_url, page.body, page.headers).await;
+            undone.note(&gleaned);
+            result.flags.extend(gleaned.flags);
+            result.comments.extend(gleaned.comments);
 
             let mut buckets = Buckets {
                 images: &mut *images,
@@ -821,11 +858,37 @@ async fn probe_by_name(
                 assets: &mut *assets,
                 external: &mut *external,
             };
-            categorize(references, entry, &mut buckets);
+            categorize(gleaned.references, entry, &mut buckets);
         }
     }
 
-    (cut, capped)
+    cut
+}
+
+fn fresh_seed() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// Whether a path that cannot exist now gets a refusal it did not get when the sweep began,
+/// which makes a name's refusal a bot check or a rate limit rather than a guarded file. So
+/// does no answer at all, since a refusal that cannot be checked is not worth reporting as a
+/// file.
+async fn refuses_anything(
+    base: &reqwest::Url,
+    baseline: &crate::discovery::Baseline,
+    allow_local: bool,
+) -> bool {
+    let [path, _] = crate::discovery::calibration_paths(fresh_seed());
+    let Ok(url) = base.join(&path) else {
+        return false;
+    };
+    match crate::fetch::fetch(url.as_str(), allow_local).await {
+        Ok(answer) => baseline.is_new_refusal(answer.status),
+        Err(_) => true,
+    }
 }
 
 /// What a scan left undone, apart from running out of time, which has a notice of its own.
@@ -835,7 +898,22 @@ struct Undone {
     resources_left: usize,
     failed: usize,
     sweep_capped: bool,
+    sweep_refused: bool,
+    names_unanswered: usize,
     active_stopped: bool,
+    active_failed: usize,
+    links_cut: usize,
+    comments_cut: usize,
+    decoding_cut: usize,
+}
+
+impl Undone {
+    /// Counts what one page's readers stopped short of.
+    fn note(&mut self, gleaned: &Gleaned) {
+        self.links_cut += usize::from(gleaned.links_cut);
+        self.comments_cut += usize::from(gleaned.comments_cut);
+        self.decoding_cut += usize::from(gleaned.decoding_cut);
+    }
 }
 
 /// One line for each thing a scan stopped short of, so that what it did not reach does not
@@ -863,6 +941,44 @@ fn undone_notices(undone: &Undone) -> Vec<String> {
     if undone.sweep_capped {
         notices.push(format!(
             "The file name sweep stopped after {MAX_FOUND} finds, so the names after that were not tried."
+        ));
+    }
+    if undone.sweep_refused {
+        notices.push(
+            "The site started refusing requests during the file name sweep, which usually means a bot check or a rate limit. The names after that were not tried."
+                .to_string(),
+        );
+    }
+    if undone.names_unanswered > 0 {
+        notices.push(format!(
+            "File names the sweep got no clear answer for, so they may still be there: {}.",
+            undone.names_unanswered
+        ));
+    }
+    if undone.links_cut > 0 {
+        notices.push(format!(
+            "Pages or files that list more than the {} links Trawl reads from each, so the rest were not followed: {}.",
+            crate::crawl::MAX_REFERENCES,
+            undone.links_cut
+        ));
+    }
+    if undone.comments_cut > 0 {
+        notices.push(format!(
+            "Pages with more than the {} comments Trawl lists from each, so the rest are not shown: {}.",
+            crate::crawl::MAX_COMMENTS,
+            undone.comments_cut
+        ));
+    }
+    if undone.decoding_cut > 0 {
+        notices.push(format!(
+            "Responses with more encoded text than Trawl decodes from each, so a flag encoded further in would not show here: {}.",
+            undone.decoding_cut
+        ));
+    }
+    if undone.active_failed > 0 {
+        notices.push(format!(
+            "Active requests that got no answer, so the checks behind them did not run: {}.",
+            undone.active_failed
         ));
     }
     if undone.active_stopped {
@@ -950,21 +1066,22 @@ async fn scan(
 
     // The entry, whose links seed the queue.
     {
-        let (flags, comments, references) =
+        let gleaned =
             glean_off_thread(entry_url.clone(), entry.body.clone(), entry.headers.clone()).await;
+        undone.note(&gleaned);
         result.pages.push(PageResult {
             url: entry_url.clone(),
             status: entry.status,
         });
-        result.flags.extend(flags);
-        result.comments.extend(comments);
-        enqueue_sitemap(
+        result.flags.extend(gleaned.flags);
+        result.comments.extend(gleaned.comments);
+        undone.links_cut += usize::from(enqueue_sitemap(
             &entry.body,
             &entry_url,
             &entry_parsed,
             &mut visited,
             &mut queue,
-        );
+        ));
         bodies.push(entry.body);
 
         let mut buckets = Buckets {
@@ -973,7 +1090,7 @@ async fn scan(
             assets: &mut assets,
             external: &mut external,
         };
-        for link in categorize(references, &entry_parsed, &mut buckets) {
+        for link in categorize(gleaned.references, &entry_parsed, &mut buckets) {
             if visited.insert(link.clone()) {
                 queue.push(link);
             }
@@ -983,14 +1100,18 @@ async fn scan(
     // robots.txt names paths a crawler is asked to avoid, which is a map to what
     // is worth a look. Its paths join the queue like any other, but only those on
     // the entry's own origin: an absolute Disallow pointing at another host is not
-    // the target and is not fetched.
-    if let Ok(robots_url) = entry_parsed.join("/robots.txt")
-        && let Ok(robots) = crate::fetch::fetch(robots_url.as_str(), allow_local).await
-    {
-        cut += usize::from(robots.truncated);
-        for path in crate::crawl::robots_paths(&entry_parsed, &robots.body) {
-            if same_origin(&path, &entry_parsed) && visited.insert(path.clone()) {
-                queue.push(path);
+    // the target and is not fetched. Its paths hang off the root, wherever the entry landed.
+    if let Ok(robots_url) = entry_parsed.join("/robots.txt") {
+        let answer = crate::fetch::fetch(robots_url.as_str(), allow_local).await;
+        undone.failed += usize::from(answer.is_err());
+        if let Ok(robots) = answer {
+            cut += usize::from(robots.truncated);
+            let paths = crate::crawl::robots_paths(&robots_url, &robots.body);
+            undone.links_cut += usize::from(paths.cut);
+            for path in paths.items {
+                if same_origin(&path, &entry_parsed) && visited.insert(path.clone()) {
+                    queue.push(path);
+                }
             }
         }
     }
@@ -1010,15 +1131,28 @@ async fn scan(
         undone.failed += usize::from(answer.is_err());
         if let Ok(page) = answer {
             cut += usize::from(page.truncated);
-            let (flags, comments, references) =
-                glean_off_thread(url.clone(), page.body.clone(), page.headers.clone()).await;
+            // Read as the page it turned out to be: a link on a page that a redirect led to
+            // resolves against where that page lives, and what it holds is credited to it.
+            let gleaned = glean_off_thread(
+                page.final_url.clone(),
+                page.body.clone(),
+                page.headers.clone(),
+            )
+            .await;
+            undone.note(&gleaned);
             result.pages.push(PageResult {
                 url: url.clone(),
                 status: page.status,
             });
-            result.flags.extend(flags);
-            result.comments.extend(comments);
-            enqueue_sitemap(&page.body, &url, &entry_parsed, &mut visited, &mut queue);
+            result.flags.extend(gleaned.flags);
+            result.comments.extend(gleaned.comments);
+            undone.links_cut += usize::from(enqueue_sitemap(
+                &page.body,
+                &page.final_url,
+                &entry_parsed,
+                &mut visited,
+                &mut queue,
+            ));
             bodies.push(page.body);
 
             let mut buckets = Buckets {
@@ -1027,7 +1161,7 @@ async fn scan(
                 assets: &mut assets,
                 external: &mut external,
             };
-            categorize(references, &entry_parsed, &mut buckets);
+            categorize(gleaned.references, &entry_parsed, &mut buckets);
         }
     }
 
@@ -1042,7 +1176,7 @@ async fn scan(
     // not turn every guess into a find. Each hit still runs the guard.
     if arrived.same_site {
         if Instant::now() < deadline {
-            let (sweep_cut, sweep_capped) = probe_by_name(
+            cut += probe_by_name(
                 allow_local,
                 deadline,
                 &entry_parsed,
@@ -1052,10 +1186,9 @@ async fn scan(
                 &mut scripts,
                 &mut assets,
                 &mut external,
+                &mut undone,
             )
             .await;
-            cut += sweep_cut;
-            undone.sweep_capped = sweep_capped;
         } else {
             time_limit_hit = true;
         }
@@ -1074,6 +1207,7 @@ async fn scan(
     cut += harvested.cut;
     undone.resources_left = harvested.left;
     undone.failed += harvested.failed;
+    undone.decoding_cut += harvested.decoding_cut;
     if Instant::now() >= deadline {
         time_limit_hit = true;
     }
@@ -1088,6 +1222,7 @@ async fn scan(
                 crate::active::run(&entry_url, allow_local, &bodies, &request.hints).await;
             cut += active.cut;
             undone.active_stopped = active.stopped;
+            undone.active_failed = active.failed;
             for hit in active.hits {
                 result
                     .flags
@@ -1307,32 +1442,35 @@ mod tests {
         headers
     }
 
-    /// Answers every connection for as long as the test runs: the body a path names,
-    /// whatever its query, or else a 404 carrying `not_found`.
-    async fn site(routes: Vec<(&'static str, Vec<u8>)>, not_found: Vec<u8>) -> SocketAddr {
+    /// Answers every connection for as long as the test runs, with what `answer` says for
+    /// the path, whatever its query, and how many requests came before it: a status line
+    /// with any headers, and a body.
+    async fn scripted_site<F>(answer: F) -> SocketAddr
+    where
+        F: Fn(&str, usize) -> (String, Vec<u8>) + Send + Sync + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let at = listener.local_addr().unwrap();
-        let answers = Arc::new((routes, not_found));
+        let answer = Arc::new(answer);
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                let answers = answers.clone();
+                let answer = answer.clone();
+                let served = served.clone();
                 tokio::spawn(async move {
                     let mut request = [0u8; 2048];
                     let read = socket.read(&mut request).await.unwrap_or(0);
                     let request = String::from_utf8_lossy(&request[..read]);
                     let path = request.split([' ', '?']).nth(1).unwrap_or("/");
 
-                    let (routes, not_found) = &*answers;
-                    let (status, body) = match routes.iter().find(|(route, _)| *route == path) {
-                        Some((_, body)) => ("200 OK", body),
-                        None => ("404 Not Found", not_found),
-                    };
+                    let before = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let (status, body) = answer(path, before);
                     let head = format!(
                         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
                     );
                     let _ = socket.write_all(head.as_bytes()).await;
-                    let _ = socket.write_all(body).await;
+                    let _ = socket.write_all(&body).await;
                     // Left unread, a request's tail would reset the connection under the
                     // reply on its way back.
                     let _ = socket.shutdown().await;
@@ -1341,6 +1479,29 @@ mod tests {
             }
         });
         at
+    }
+
+    /// The body a path names, whatever its query, or else a 404 carrying `not_found`.
+    async fn site(routes: Vec<(&'static str, Vec<u8>)>, not_found: Vec<u8>) -> SocketAddr {
+        scripted_site(
+            move |path, _| match routes.iter().find(|(route, _)| *route == path) {
+                Some((_, body)) => ("200 OK".to_string(), body.clone()),
+                None => ("404 Not Found".to_string(), not_found.clone()),
+            },
+        )
+        .await
+    }
+
+    fn found_here(body: &str) -> (String, Vec<u8>) {
+        ("200 OK".to_string(), body.as_bytes().to_vec())
+    }
+
+    fn not_here() -> (String, Vec<u8>) {
+        ("404 Not Found".to_string(), Vec::new())
+    }
+
+    fn moved_to(location: &str) -> (String, Vec<u8>) {
+        (format!("302 Found\r\nLocation: {location}"), Vec::new())
     }
 
     /// `head`, filler up to all a fetch reads, then `tail`, which it never gets to.
@@ -1488,6 +1649,272 @@ mod tests {
         let outcome = crate::active::run(&format!("http://{at}/"), true, &[], &[]).await;
 
         assert!(!outcome.stopped);
+        assert_eq!(outcome.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn an_active_pass_at_a_target_that_drops_every_probe_says_they_failed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
+
+        let outcome = crate::active::run(&format!("http://{at}/"), true, &[], &[]).await;
+
+        assert!(outcome.failed > 0);
+        assert!(outcome.hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_site_that_starts_refusing_partway_is_not_a_list_of_finds() {
+        // The entry, robots.txt, two calibration paths and two names answer honestly. Then
+        // a bot check answers everything with the same 403.
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = requests.clone();
+        let at = scripted_site(move |path, before| {
+            counted.store(before + 1, std::sync::atomic::Ordering::SeqCst);
+            if before >= 6 {
+                return ("403 Forbidden".to_string(), b"Security Checkpoint".to_vec());
+            }
+            if path == "/" {
+                found_here("home")
+            } else {
+                not_here()
+            }
+        })
+        .await;
+
+        let result = scanned(at, false).await;
+
+        assert!(result.found.is_empty(), "{:?}", result.found.len());
+        let expected = undone_notices(&Undone {
+            sweep_refused: true,
+            ..Undone::default()
+        });
+        assert!(
+            result.notices.contains(&expected[0]),
+            "{:?}",
+            result.notices
+        );
+        // One name, and one nonsense path to check it against, and no more.
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 8);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_that_alternates_between_401_and_403_is_not_a_list_of_finds() {
+        let at = scripted_site(|path, before| {
+            if before >= 6 {
+                let status = if before % 2 == 0 { "403 Forbidden" } else { "401 Unauthorized" };
+                return (status.to_string(), b"Security Checkpoint".to_vec());
+            }
+            if path == "/" { found_here("home") } else { not_here() }
+        })
+        .await;
+
+        let result = scanned(at, false).await;
+
+        assert!(result.found.is_empty(), "{:?}", result.found.len());
+        let expected = undone_notices(&Undone {
+            sweep_refused: true,
+            ..Undone::default()
+        });
+        assert!(result.notices.contains(&expected[0]), "{:?}", result.notices);
+    }
+
+    #[tokio::test]
+    async fn a_file_guarded_differently_from_a_site_that_forbids_everything_is_still_a_find() {
+        let at = scripted_site(|path, _| match path {
+            "/" => found_here("home"),
+            "/.git/config" => ("401 Unauthorized".to_string(), b"who are you".to_vec()),
+            _ => ("403 Forbidden".to_string(), b"no".to_vec()),
+        })
+        .await;
+
+        let result = scanned(at, false).await;
+
+        let git = format!("http://{at}/.git/config");
+        assert!(result.found.iter().any(|found| found.url == git && found.status == 401));
+        let refused = undone_notices(&Undone {
+            sweep_refused: true,
+            ..Undone::default()
+        });
+        assert!(!result.notices.contains(&refused[0]), "{:?}", result.notices);
+    }
+
+    #[tokio::test]
+    async fn a_guarded_file_on_a_site_that_answers_honestly_is_still_a_find() {
+        let at = scripted_site(|path, _| match path {
+            "/" => found_here("home"),
+            "/.git/config" => ("403 Forbidden".to_string(), b"no".to_vec()),
+            _ => not_here(),
+        })
+        .await;
+
+        let result = scanned(at, false).await;
+
+        let git = format!("http://{at}/.git/config");
+        assert!(
+            result
+                .found
+                .iter()
+                .any(|found| found.url == git && found.status == 403)
+        );
+        let refused = undone_notices(&Undone {
+            sweep_refused: true,
+            ..Undone::default()
+        });
+        assert!(
+            !result.notices.contains(&refused[0]),
+            "{:?}",
+            result.notices
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_the_sweep_got_no_clear_answer_for_is_counted() {
+        let at = scripted_site(|path, _| match path {
+            "/" => found_here("home"),
+            "/.git/HEAD" => ("503 Service Unavailable".to_string(), Vec::new()),
+            _ => not_here(),
+        })
+        .await;
+
+        let result = scanned(at, false).await;
+
+        let expected = undone_notices(&Undone {
+            names_unanswered: 1,
+            ..Undone::default()
+        });
+        assert!(
+            result.notices.contains(&expected[0]),
+            "{:?}",
+            result.notices
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirected_page_is_read_from_where_it_landed() {
+        let at = scripted_site(|path, _| match path {
+            "/" => found_here(r#"<a href="/go">go</a>"#),
+            "/go" => moved_to("/nested/page"),
+            "/nested/page" => found_here(r#"<img src="image.png"> flag{on_the_nested_page}"#),
+            "/.env" => moved_to("/deep/login"),
+            "/deep/login" => found_here(r#"<img src="logo.png"> flag{past_the_sweep}"#),
+            _ => not_here(),
+        })
+        .await;
+
+        let result = scanned(at, false).await;
+
+        let url = |path: &str| format!("http://{at}{path}");
+        assert!(
+            result.images.contains(&url("/nested/image.png")),
+            "{:?}",
+            result.images
+        );
+        assert!(
+            result.images.contains(&url("/deep/logo.png")),
+            "{:?}",
+            result.images
+        );
+        assert!(
+            !result.images.contains(&url("/image.png")),
+            "{:?}",
+            result.images
+        );
+
+        let source = |value: &str| {
+            let flag = result
+                .flags
+                .iter()
+                .find(|flag| flag.value == value)
+                .unwrap();
+            flag.source.clone()
+        };
+        assert_eq!(source("flag{on_the_nested_page}"), url("/nested/page"));
+        assert_eq!(source("flag{past_the_sweep}"), url("/deep/login"));
+    }
+
+    #[tokio::test]
+    async fn a_robots_path_hangs_off_the_root_wherever_the_entry_landed() {
+        let at = scripted_site(|path, _| match path {
+            "/" => moved_to("/deep/dir/"),
+            "/deep/dir/" => found_here("home"),
+            "/robots.txt" => found_here("Allow: secret\n"),
+            "/secret" => found_here("here"),
+            _ => not_here(),
+        })
+        .await;
+
+        let result = scanned(at, false).await;
+
+        let secret = format!("http://{at}/secret");
+        assert!(result.pages.iter().any(|page| page.url == secret));
+    }
+
+    #[tokio::test]
+    async fn a_script_that_was_not_served_counts_as_not_fetched() {
+        let at = site(
+            vec![("/", br#"<script src="/gone.js"></script>"#.to_vec())],
+            Vec::new(),
+        )
+        .await;
+
+        let result = scanned(at, false).await;
+
+        let expected = undone_notices(&Undone {
+            failed: 1,
+            ..Undone::default()
+        });
+        assert!(
+            result.notices.contains(&expected[0]),
+            "{:?}",
+            result.notices
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_past_what_its_readers_keep_says_so() {
+        let mut page = String::new();
+        for i in 0..=crate::crawl::MAX_REFERENCES {
+            page.push_str(&format!(r#"<img src="/i{i}.png">"#));
+        }
+        for i in 0..=crate::crawl::MAX_COMMENTS {
+            page.push_str(&format!("<!-- c{i} -->"));
+        }
+        page.push_str(&"abcdef0123456789 ".repeat(4097));
+        let at = site(vec![("/", page.into_bytes())], Vec::new()).await;
+
+        let result = scanned(at, false).await;
+
+        let expected = undone_notices(&Undone {
+            links_cut: 1,
+            comments_cut: 1,
+            decoding_cut: 1,
+            ..Undone::default()
+        });
+        assert_eq!(expected.len(), 3);
+        for notice in &expected {
+            assert!(result.notices.contains(notice), "{:?}", result.notices);
+        }
+    }
+
+    #[test]
+    fn what_a_scan_could_not_finish_gets_a_line_each() {
+        let notices = undone_notices(&Undone {
+            sweep_refused: true,
+            names_unanswered: 2,
+            active_failed: 3,
+            ..Undone::default()
+        });
+
+        assert_eq!(notices.len(), 3);
+        assert!(notices[0].contains("started refusing"), "{notices:?}");
+        assert!(notices[1].ends_with(": 2."), "{notices:?}");
+        assert!(notices[2].ends_with(": 3."), "{notices:?}");
     }
 
     #[test]
@@ -1517,14 +1944,19 @@ mod tests {
     #[tokio::test]
     async fn a_long_answer_the_scan_did_not_search_is_not_counted() {
         // The script and every name tried answer with a long 404, which only says nothing
-        // is there. The calibration requests get the same, and are only ever measured.
+        // is there. The calibration requests get the same, and are only ever measured. So
+        // the script is one thing the scan could not fetch, and nothing was cut.
         let page = br#"<script src="/gone.js"></script>"#.to_vec();
         let routes = vec![("/", page), ("/robots.txt", Vec::new())];
         let at = site(routes, past_the_limit("", "x")).await;
 
         let result = scanned(at, false).await;
 
-        assert!(result.notices.is_empty(), "{:?}", result.notices);
+        let expected = undone_notices(&Undone {
+            failed: 1,
+            ..Undone::default()
+        });
+        assert_eq!(result.notices, expected);
     }
 
     #[tokio::test]

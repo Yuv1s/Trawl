@@ -34,6 +34,8 @@ pub struct Outcome {
     pub cut: usize,
     /// True when the budget or the clock turned a check away, so not every one ran.
     pub stopped: bool,
+    /// Requests that got no answer at all, which says nothing about what they asked.
+    pub failed: usize,
 }
 
 fn flags_in(body: &[u8]) -> Vec<String> {
@@ -353,6 +355,7 @@ struct Probe<'a> {
     hits: Vec<Hit>,
     cut: usize,
     stopped: bool,
+    failed: usize,
     /// The wordlists a probe draws on, each already carrying any hints the person
     /// gave: a name to try as a parameter, a field, a header marker.
     params: Vec<String>,
@@ -459,9 +462,9 @@ impl Probe<'_> {
         // a redirect off the target's origin. This is the one place all probe
         // requests pass through, so the rule is set here once.
         request.stop_at_cross_origin = true;
-        let response = fetch::fetch_with(url, self.allow_local, &request)
-            .await
-            .ok()?;
+        let answer = fetch::fetch_with(url, self.allow_local, &request).await;
+        self.failed += usize::from(answer.is_err());
+        let response = answer.ok()?;
         self.cut += usize::from(response.truncated);
         Some(response)
     }
@@ -617,6 +620,7 @@ pub async fn run(
             hits: Vec::new(),
             cut: 0,
             stopped: false,
+            failed: 0,
         };
     };
     let hints = clean_hints(hints);
@@ -663,6 +667,7 @@ pub async fn run(
         hits: Vec::new(),
         cut: 0,
         stopped: false,
+        failed: 0,
         params,
         time_params,
         fields,
@@ -718,6 +723,7 @@ pub async fn run(
         hits: probe.hits,
         cut: probe.cut,
         stopped: probe.stopped,
+        failed: probe.failed,
     }
 }
 

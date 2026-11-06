@@ -8,6 +8,7 @@
 //! is kept only when a flag falls out of it. That is what lets every reading be
 //! tried on every token and still stay silent on a page that hid nothing.
 
+use crate::crawl::Capped;
 use trawl_core::bytes;
 
 /// A flag a decoding revealed, and the reading that revealed it.
@@ -132,10 +133,10 @@ fn runs(data: &[u8], keep: impl Fn(u8) -> bool, min: usize) -> Vec<&[u8]> {
 
 /// Arrays of small integers, `[75, 65, 76, ...]`, read as bytes. A payload
 /// written this way is usually one XOR away from readable.
-fn int_arrays(text: &[u8]) -> Vec<Vec<u8>> {
+fn int_arrays(text: &[u8]) -> Capped<Vec<u8>> {
     let mut out = Vec::new();
     let mut i = 0;
-    while i < text.len() && out.len() < MAX_ARRAYS {
+    while i < text.len() {
         if text[i] != b'[' {
             i += 1;
             continue;
@@ -175,6 +176,12 @@ fn int_arrays(text: &[u8]) -> Vec<Vec<u8>> {
                 bytes.push(value as u8);
             }
             if bytes.len() >= 4 {
+                if out.len() >= MAX_ARRAYS {
+                    return Capped {
+                        items: out,
+                        cut: true,
+                    };
+                }
                 out.push(bytes);
             }
             i = j + 1;
@@ -182,7 +189,10 @@ fn int_arrays(text: &[u8]) -> Vec<Vec<u8>> {
             i += 1;
         }
     }
-    out
+    Capped {
+        items: out,
+        cut: false,
+    }
 }
 
 /// Ceilings so a large page cannot make the harvest crawl. The flag filter keeps
@@ -208,7 +218,7 @@ fn add(out: &mut Vec<Harvested>, values: Vec<String>, how: &str) {
 
 /// Every flag a battery of decodings reads out of a run of text, each tagged
 /// with the reading that found it. Empty for text that was hiding nothing.
-pub fn harvest(text: &[u8]) -> Vec<Harvested> {
+pub fn harvest(text: &[u8]) -> Capped<Harvested> {
     let mut out: Vec<Harvested> = Vec::new();
 
     add(&mut out, flags_in(&rot13(text)), "ROT13");
@@ -217,13 +227,17 @@ pub fn harvest(text: &[u8]) -> Vec<Harvested> {
         add(&mut out, flags_in(&css_unescape(text)), "CSS escapes");
     }
 
-    for token in runs(text, is_hex, 16).into_iter().take(MAX_TOKENS) {
+    let hex = runs(text, is_hex, 16);
+    let base64 = runs(text, is_base64, 16);
+    let mut cut = hex.len() > MAX_TOKENS || base64.len() > MAX_TOKENS;
+
+    for token in hex.into_iter().take(MAX_TOKENS) {
         if let Some(decoded) = from_hex(token) {
             add(&mut out, flags_in(&decoded), "hex");
         }
     }
 
-    for token in runs(text, is_base64, 16).into_iter().take(MAX_TOKENS) {
+    for token in base64.into_iter().take(MAX_TOKENS) {
         if let Some(decoded) = from_base64(token, B64).or_else(|| from_base64(token, B64_URL)) {
             add(&mut out, flags_in(&decoded), "base64");
         }
@@ -235,14 +249,17 @@ pub fn harvest(text: &[u8]) -> Vec<Harvested> {
         }
     }
 
-    for array in int_arrays(text) {
+    let arrays = int_arrays(text);
+    cut |= arrays.cut;
+    for array in arrays.items {
         for key in 1u8..=255 {
             let xored: Vec<u8> = array.iter().map(|&b| b ^ key).collect();
             add(&mut out, flags_in(&xored), &format!("XOR 0x{key:02x}"));
         }
     }
 
-    out
+    cut |= out.len() >= MAX_HARVESTED;
+    Capped { items: out, cut }
 }
 
 #[cfg(test)]

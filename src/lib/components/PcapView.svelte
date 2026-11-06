@@ -41,8 +41,10 @@
 				<li class="flagged">
 					Segments of <span class="mono">{stream.src} → {stream.dst}</span> disagree about
 					{(stream.conflicting ?? 0).toLocaleString()} byte{stream.conflicting === 1 ? '' : 's'}, so
-					the capture tells two stories. Flags from every reading are listed below, and nothing here
-					says which one the connection really carried.
+					the capture tells two stories. Flags from {cap.overlaysCapped
+						? 'the readings Trawl tried'
+						: 'every reading'} are listed below, and nothing here says which one the connection really
+					carried.
 				</li>
 			{/each}
 		</ul>

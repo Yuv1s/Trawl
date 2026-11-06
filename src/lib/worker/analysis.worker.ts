@@ -814,6 +814,7 @@ function troubleIn(readers: ChildReaders, detectors: string[]): string | undefin
 	if (pcap?.packetsCapped) {
 		said.push(`Trawl read the first ${pcap.packetCount.toLocaleString()} packets and stopped`);
 	}
+	if (pcap?.overlaysCapped) said.push('not every disagreeing TCP segment was tried');
 
 	if (said.length === 0) return undefined;
 
@@ -1510,6 +1511,11 @@ async function analyseRoot(
 	if (pcap?.packetsCapped) {
 		notes.push(
 			`Trawl read the first ${pcap.packetCount.toLocaleString()} packets of this capture and stopped. Anything sent after that was not reassembled.`
+		);
+	}
+	if (pcap?.overlaysCapped) {
+		notes.push(
+			'This capture has more disagreeing TCP segments than Trawl tries one by one. A flag that only reads correctly in a segment it skipped would not show here.'
 		);
 	}
 	if (binary?.symbolsCapped) {

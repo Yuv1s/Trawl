@@ -1244,20 +1244,22 @@ fn read_table(db: &Db, row: SchemaRow, tags: &[String], budget: &mut Budget) -> 
         let walked = pages;
         db.walk_leaves(row.rootpage, 0, &mut seen, &mut pages, &mut |page, head| {
             // Every cell the page lists is a row, whatever else about it can be read.
-            // Past the cap nothing is decoded, so counting a large table stays cheap, and
-            // only a record in pieces is read, which no scan of the raw file can see whole.
+            // Past the cap nothing is decoded, so counting a large table stays cheap, except
+            // what a scan of the raw file cannot read: a record in pieces, and UTF-16BE text,
+            // which it reads a byte off, so a closing brace pairs with whatever follows it.
             let listed = be_u16(page, head + 3).unwrap_or(0) as usize;
             row_count += listed;
+            let raw_scan_misses = db.encoding == Encoding::Utf16Be;
 
             for off in live_cell_offsets(page, head) {
                 let shown = rows.len() < MAX_ROWS;
-                let spills = db.spills(page, off);
-                if !shown && !spills {
+                let needs_reading = db.spills(page, off) || raw_scan_misses;
+                if !shown && !needs_reading {
                     continue;
                 }
 
                 let Some((rowid, payload, whole)) = db.record(page, off, budget) else {
-                    flags.truncated |= spills;
+                    flags.truncated |= needs_reading;
                     continue;
                 };
                 record_flags(&payload, db.encoding, tags, budget, &mut flags);

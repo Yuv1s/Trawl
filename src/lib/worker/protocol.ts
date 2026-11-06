@@ -453,6 +453,8 @@ export type PcapCapture = {
 	packetsCapped?: boolean;
 	/** True when the streams held more flags than are reported. */
 	flagsTruncated?: boolean;
+	/** True when segments that disagree were left untried at the capture's limit. */
+	overlaysCapped?: boolean;
 };
 
 export type BinarySection = {

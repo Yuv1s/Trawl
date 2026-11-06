@@ -177,6 +177,48 @@ describe('the writeup', () => {
 		expect(writeupMarkdown(analysis({}), [], [])).not.toContain('What this does not cover');
 	});
 
+	it('says which readers failed, so a clean section does not read as a clean file', () => {
+		const clean = writeupMarkdown(analysis({}), [], []);
+		expect(clean).toContain('No detector produced a candidate.');
+
+		const markdown = writeupMarkdown(
+			analysis({
+				pixelError: 'the pixel data is larger than Trawl reads',
+				audioError: 'the samples stopped short',
+				jpeg: { error: 'progressive scans are not read' },
+				wav: { error: 'no fmt chunk' },
+				gif: { error: 'no image block' }
+			} as unknown as Partial<Analysis>),
+			[],
+			[]
+		);
+
+		expect(markdown).toContain('## What this does not cover');
+		expect(markdown).toContain('The pixel tools did not run: the pixel data is larger');
+		expect(markdown).toContain('The audio tools did not finish: the samples stopped short');
+		expect(markdown).toContain('The JPEG could not be read: progressive scans are not read');
+		expect(markdown).toContain('The WAV could not be read: no fmt chunk');
+		expect(markdown).toContain('The GIF frames could not be read: no image block');
+		expect(markdown).not.toContain('No detector produced a candidate.');
+		expect(markdown).toContain('No candidate from the detectors that ran.');
+	});
+
+	it.each([
+		['a PNG header', { structure: { header: { error: 'no IHDR' }, chunks: [] } }, 'no IHDR'],
+		['the pixels', { pixelError: 'too large' }, 'too large'],
+		['the audio', { audioError: 'cut short' }, 'cut short'],
+		['a JPEG', { jpeg: { error: 'progressive' } }, 'progressive'],
+		['a WAV', { wav: { error: 'no fmt chunk' } }, 'no fmt chunk'],
+		['GIF frames', { gif: { error: 'no image block' } }, 'no image block'],
+		['a reader that crashed', { crashed: ['pixel'] }, 'pixel reader crashed']
+	])('does not call a file clean when %s could not be read', (_, failed, says) => {
+		const markdown = writeupMarkdown(analysis(failed as unknown as Partial<Analysis>), [], []);
+
+		expect(markdown).toContain(says);
+		expect(markdown).not.toContain('No detector produced a candidate.');
+		expect(markdown).toContain('No candidate from the detectors that ran.');
+	});
+
 	it('leaves out sections for formats the file is not', () => {
 		const markdown = writeupMarkdown(analysis({}), [], []);
 

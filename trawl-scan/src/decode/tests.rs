@@ -1,7 +1,7 @@
 use super::*;
 
 fn found(text: &[u8]) -> Vec<String> {
-    harvest(text).into_iter().map(|h| h.value).collect()
+    harvest(text).items.into_iter().map(|h| h.value).collect()
 }
 
 fn base64(data: &[u8]) -> String {
@@ -48,7 +48,7 @@ fn reads_a_hex_variable_out_of_source() {
 #[test]
 fn reads_a_rot13_comment() {
     let html = b"<!-- legacy bearing synt{ebg13_gheaf_gur_gvqr} -->";
-    let result = harvest(html);
+    let result = harvest(html).items;
     assert!(
         result
             .iter()
@@ -73,7 +73,7 @@ fn reverses_an_etag_before_decoding_it() {
         .rev()
         .collect();
     let header = format!("ETag: \"{forward}\"");
-    let result = harvest(header.as_bytes());
+    let result = harvest(header.as_bytes()).items;
     assert!(
         result
             .iter()
@@ -87,7 +87,7 @@ fn xors_an_integer_array_against_the_right_byte() {
         "const driftVector = {};",
         xor_array("flag{xored_vectors}", 0x2d)
     );
-    let result = harvest(js.as_bytes());
+    let result = harvest(js.as_bytes()).items;
     assert!(
         result
             .iter()
@@ -108,9 +108,9 @@ fn stays_quiet_on_ordinary_text() {
         <p>The tide comes in at 0600 and 1800. Numbers: [1, 2, 3, 4, 5].</p>
         <a href="/about">About</a> <script>const total = 42;</script></body></html>"#;
     assert!(
-        harvest(html).is_empty(),
+        harvest(html).items.is_empty(),
         "harvest was not quiet: {:?}",
-        harvest(html)
+        harvest(html).items
     );
 }
 
@@ -126,4 +126,30 @@ fn one_flag_is_reported_once_even_if_two_readings_find_it() {
             .count(),
         1
     );
+}
+
+#[test]
+fn more_encoded_text_than_it_reads_says_so() {
+    // Hex decoys up to the limit, then the real one, which is never reached.
+    let hidden: String = b"flag{past_the_decoys}"
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let decoys = "abcdef0123456789 ".repeat(MAX_TOKENS);
+    let text = format!("{decoys}{hidden}");
+
+    let read = harvest(text.as_bytes());
+
+    assert!(read.cut);
+    assert!(read.items.is_empty());
+    assert!(!harvest(hidden.as_bytes()).cut);
+}
+
+#[test]
+fn more_arrays_than_it_reads_says_so() {
+    let many = "[1, 2, 3, 4] ".repeat(MAX_ARRAYS + 1);
+    assert!(harvest(many.as_bytes()).cut);
+
+    let few = "[1, 2, 3, 4] ".repeat(MAX_ARRAYS);
+    assert!(!harvest(few.as_bytes()).cut);
 }

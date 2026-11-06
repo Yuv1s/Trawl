@@ -610,6 +610,51 @@ fn a_real_flag_between_two_forgeries_is_found_too() {
 }
 
 #[test]
+fn running_out_of_overlays_says_so() {
+    let copies: [&[u8]; 4] = [
+        b"flag{forged_number_one}",
+        b"flag{forged_number_two}",
+        b"flag{the_real_one_here}",
+        b"flag{forged_number_six}",
+    ];
+    let file = copies.concat();
+    let parts = copies
+        .iter()
+        .enumerate()
+        .map(|(i, copy)| (1000u32, i * copy.len(), copy.len()))
+        .collect();
+    let segments = Segments { parts };
+
+    let search = |mut overlays: usize| {
+        let mut flags_left = bytes::MAX_FLAGS;
+        search_flow(&file, &segments, &[], &mut flags_left, &mut overlays)
+    };
+
+    let short = search(1);
+    assert!(short.overlays_capped);
+    assert!(!short.flags.contains(&"flag{the_real_one_here}".to_string()));
+
+    let enough = search(3);
+    assert!(!enough.overlays_capped);
+    assert!(
+        enough
+            .flags
+            .contains(&"flag{the_real_one_here}".to_string())
+    );
+}
+
+#[test]
+fn running_out_of_overlays_reaches_the_page() {
+    let frames: Vec<Vec<u8>> = (0..=MAX_OVERLAYS + 1)
+        .map(|i| tcp_frame(SRV, CLI, 80, 5000, 1000, format!("{i:08}").as_bytes()))
+        .collect();
+
+    let page = json(&pcap_file(1, &frames), &[]);
+
+    assert!(page.contains(r#""overlaysCapped":true"#), "{}", &page[..200]);
+}
+
+#[test]
 fn a_retransmission_is_no_disagreement() {
     let file = pcap_file(
         1,

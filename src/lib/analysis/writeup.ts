@@ -55,6 +55,20 @@ function gifSourceHits(source: GifSource): string[] {
 	return out;
 }
 
+/** What a reader could not read, which the page shows beside its tool and the writeup has to carry. */
+function readerFailures(analysis: Analysis): string[] {
+	const failures: string[] = [];
+	const { structure, jpeg, wav, gif, pixelError, audioError } = analysis;
+	if (structure && isHeaderError(structure.header))
+		failures.push(`The PNG header could not be read: ${structure.header.error}`);
+	if (pixelError) failures.push(`The pixel tools did not run: ${pixelError}`);
+	if (audioError) failures.push(`The audio tools did not finish: ${audioError}`);
+	if (jpeg && isJpegError(jpeg)) failures.push(`The JPEG could not be read: ${jpeg.error}`);
+	if (wav && isWavError(wav)) failures.push(`The WAV could not be read: ${wav.error}`);
+	if (gif?.error) failures.push(`The GIF frames could not be read: ${gif.error}`);
+	return failures;
+}
+
 export function writeupMarkdown(
 	analysis: Analysis,
 	flags: FlagHit[],
@@ -82,11 +96,13 @@ export function writeupMarkdown(
 	sections.push('', '## Recovered candidates', candidates.length ? list(candidates) : 'None.');
 
 	// A writeup gets read without the page, so what the page warns about has to travel with it.
+	const failures = readerFailures(analysis);
 	const limits = [
 		...analysis.crashed.map(
 			(reader) => `Trawl's ${reader} reader crashed on this file, so its results are missing.`
 		),
-		...(analysis.notes ?? [])
+		...(analysis.notes ?? []),
+		...failures
 	];
 	if (limits.length) sections.push('', '## What this does not cover', list(limits.map(clean)));
 
@@ -147,11 +163,11 @@ export function writeupMarkdown(
 		stego.push(`JPEG coefficient sweep: ${clean(candidate.reason)}`);
 	for (const candidate of analysis.paletteStego?.candidates ?? [])
 		stego.push(`Palette indices: ${clean(candidate.reason)}`);
-	sections.push(
-		'',
-		'## Steganography',
-		stego.length ? list(stego) : 'No detector produced a candidate.'
-	);
+	const nothingFound =
+		failures.length > 0 || analysis.crashed.length > 0
+			? 'No candidate from the detectors that ran. See what this does not cover.'
+			: 'No detector produced a candidate.';
+	sections.push('', '## Steganography', stego.length ? list(stego) : nothingFound);
 
 	const archive: string[] = [];
 	for (const entry of analysis.zip?.entries ?? []) {

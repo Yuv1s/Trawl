@@ -329,6 +329,29 @@ function captureOfFlags(connections: number): Uint8Array<ArrayBuffer> {
 	return concat(PCAP_HEADER, ...records);
 }
 
+/** A capture of one connection, where this many TCP segments each give the same bytes a new value. */
+function captureArguing(segments: number): Uint8Array<ArrayBuffer> {
+	const payloadLength = 8;
+	const ip = 40 + payloadLength;
+	const record = concat(
+		littleEndian([4, 0], [4, 0], [4, 14 + ip], [4, 14 + ip]),
+		new Uint8Array(12),
+		Uint8Array.of(0x08, 0x00, 0x45, 0, ip >> 8, ip & 0xff, 0, 0, 0, 0, 64, 6, 0, 0),
+		Uint8Array.of(10, 0, 0, 1, 10, 0, 0, 2),
+		Uint8Array.of(0, 80, 0, 81, 0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x18, 0, 0, 0, 0, 0, 0),
+		new Uint8Array(payloadLength)
+	);
+	const payload = new DataView(record.buffer, record.length - payloadLength);
+
+	const out = new Uint8Array(PCAP_HEADER.length + record.length * segments);
+	out.set(PCAP_HEADER);
+	for (let i = 0; i < segments; i++) {
+		payload.setUint32(0, i);
+		out.set(record, PCAP_HEADER.length + i * record.length);
+	}
+	return out;
+}
+
 /** A database of one table whose only row runs on to an overflow page that is not there. */
 function databaseCutShort(): Uint8Array<ArrayBuffer> {
 	const size = 512;
@@ -929,6 +952,11 @@ describe('a file built to get in the way', () => {
 				'packets and stopped'
 			],
 			[
+				'more disagreeing segments than are tried',
+				() => captureArguing(65_538),
+				'not every disagreeing TCP segment was tried'
+			],
+			[
 				'a database cell that stops short',
 				databaseCutShort,
 				'a long database cell was not read to its end'
@@ -1155,6 +1183,16 @@ describe('a file built to get in the way', () => {
 		expect(new TextDecoder().decode(extracted.bytes)).toContain(REAL);
 		expect(extracted.label).toContain('by column');
 	});
+
+	it(
+		'says when a capture has more disagreeing segments than it tries',
+		{ timeout: 60_000 },
+		async () => {
+			const { notes } = await analyse(captureArguing(65_538));
+
+			expect(notes?.join(' ')).toContain('more disagreeing TCP segments than Trawl tries');
+		}
+	);
 
 	it('says when a capture saved fewer bytes of a packet than it carried', async () => {
 		worker = new AnalysisWorker();

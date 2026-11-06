@@ -88,6 +88,19 @@ impl Baseline {
             _ => false,
         }
     }
+
+    /// Whether an answer says the request went wrong rather than anything about the file,
+    /// so a name that got one is unknown instead of absent. A server error counts unless
+    /// nonsense gets the same one, which makes it this server's not-found answer.
+    pub fn went_wrong(&self, status: u16) -> bool {
+        status == 429 || (status >= 500 && status != self.status)
+    }
+
+    /// Whether a path that cannot exist got a refusal this server did not give when it was
+    /// calibrated, which says it has started turning requests away.
+    pub fn is_new_refusal(&self, status: u16) -> bool {
+        matches!(status, 401 | 403 | 429) && status != self.status
+    }
 }
 
 /// Common names for files that carry a flag or the keys to one, and the

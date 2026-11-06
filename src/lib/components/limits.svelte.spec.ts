@@ -380,6 +380,19 @@ describe('a view of more than a person reads', () => {
 		unmount = view.unmount;
 
 		await expect.element(page.getByText(/disagree about\s+2 bytes/)).toBeVisible();
+		await expect.element(page.getByText(/Flags from every reading/)).toBeVisible();
+	});
+
+	it('does not claim every reading when it stopped short of some', async () => {
+		const streams = [{ ...stream(0), conflicting: 2 }];
+
+		const view = await render(PcapView, {
+			cap: { ...capture(streams, 1), overlaysCapped: true }
+		});
+		unmount = view.unmount;
+
+		await expect.element(page.getByText(/Flags from the readings Trawl tried/)).toBeVisible();
+		expect(document.body.textContent).not.toContain('every reading');
 	});
 
 	it('draws capped tables of JPEG segments and comments', async () => {

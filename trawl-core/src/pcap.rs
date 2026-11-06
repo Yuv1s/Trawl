@@ -125,6 +125,8 @@ pub struct Capture {
     pub packets_capped: bool,
     /// True when the streams held more flags than are reported.
     pub flags_truncated: bool,
+    /// True when segments that disagree were left untried at [`MAX_OVERLAYS`].
+    pub overlays_capped: bool,
 }
 
 // Big-endian network-order readers, for the protocol fields inside a frame.
@@ -769,6 +771,8 @@ struct FlowFlags {
     carried: usize,
     /// Bytes two segments gave different values for.
     conflicting: usize,
+    /// True when segments that disagree were left untried at the file's limit.
+    overlays_capped: bool,
 }
 
 /// Searches every run of a direction for flags, each reading of it where segments disagree.
@@ -792,6 +796,7 @@ fn search_flow(
         truncated: false,
         carried: 0,
         conflicting: 0,
+        overlays_capped: false,
     };
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -868,6 +873,7 @@ fn search_flow(
 
         for (index, offset) in disagreeing {
             if *overlays_left == 0 {
+                found.overlays_capped = true;
                 break;
             }
             *overlays_left -= 1;
@@ -1034,6 +1040,7 @@ pub fn read(data: &[u8], tags: &[String]) -> Option<Capture> {
     let mut flags_left = bytes::MAX_FLAGS;
     let mut overlays_left = MAX_OVERLAYS;
     let mut flags_truncated = false;
+    let mut overlays_capped = false;
     let mut streams: Vec<Stream> = Vec::new();
     for (_, (src_ip, sp, dst_ip, dp), segments) in flows {
         let limit = MAX_STREAM_BYTES.min(budget.max(FLOW_ALLOWANCE));
@@ -1045,6 +1052,7 @@ pub fn read(data: &[u8], tags: &[String]) -> Option<Capture> {
 
         let searched = search_flow(data, &segments, tags, &mut flags_left, &mut overlays_left);
         flags_truncated |= searched.truncated;
+        overlays_capped |= searched.overlays_capped;
 
         let embedded_file = (buf.len() >= 8).then(|| bytes::identify(&buf)).flatten();
         streams.push(Stream {
@@ -1110,6 +1118,7 @@ pub fn read(data: &[u8], tags: &[String]) -> Option<Capture> {
         dns,
         packets_capped,
         flags_truncated,
+        overlays_capped,
     })
 }
 
@@ -1140,6 +1149,8 @@ pub fn json(data: &[u8], tags: &[String]) -> String {
     push_bool(&mut out, "packetsCapped", cap.packets_capped);
     out.push(',');
     push_bool(&mut out, "flagsTruncated", cap.flags_truncated);
+    out.push(',');
+    push_bool(&mut out, "overlaysCapped", cap.overlays_capped);
     out.push(',');
 
     push_string(&mut out, "protocols");

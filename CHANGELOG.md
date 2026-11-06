@@ -2,6 +2,32 @@
 
 The scanner's version is what changes here. The site is always the latest code.
 
+## 0.1.5 (2026-11-05)
+
+### Fixed
+
+- A site that starts refusing requests partway through a scan, as a bot check or a rate limit does,
+  no longer looks like a list of guarded files. The file name sweep stops and says so.
+- A hostile site could make the scanner use gigabytes of memory with a long redirect and a huge
+  `robots.txt`. A `robots.txt` now has the same limit on links as a page, its paths hang off the
+  site's root, and the scanner won't request a URL longer than 8 KiB.
+- A name with many addresses that all stall could hold one request for minutes, past the scan's time
+  limit. Each address now gets what is left of the request's time.
+- Links nothing could fetch, like `mailto:`, no longer use up a page's limit on links ahead of a real
+  one.
+- A scan now says when a page lists more links or comments than it reads, or holds more encoded text
+  than it decodes.
+- A scan now says when active requests got no answer, when the file name sweep got no clear answer
+  for a name, and when a script or stylesheet it found answered with an error. These used to read as
+  finding nothing.
+- A page reached through a redirect is now read from where it landed, so its relative links resolve
+  correctly and what it holds is credited to that page.
+- A flag in a UTF-16BE SQLite database, past the 200 rows shown, could be missed.
+- The page now says when a capture has more disagreeing TCP segments than Trawl tries one by one. It
+  used to say flags from every reading were listed.
+- The writeup now says when the pixel, audio, JPEG, WAV or GIF tools could not run on a file. It could
+  say no detector found anything when the detectors never ran.
+
 ## 0.1.4 (2026-11-04)
 
 The tag `v0.1.3` has no release. A settings mistake stopped the workflow before it built anything, so

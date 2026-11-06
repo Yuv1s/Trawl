@@ -72,11 +72,11 @@ describe('WebRecon scanner version', () => {
 		const view = await render(WebRecon, { onreset: vi.fn() });
 		unmount = view.unmount;
 
-		await expect.element(page.getByText(/this page expects 0\.1\.4/)).toBeVisible();
+		await expect.element(page.getByText(/this page expects 0\.1\.5/)).toBeVisible();
 	});
 
 	it('says nothing about a current scanner', async () => {
-		healthAnswering('0.1.4');
+		healthAnswering('0.1.5');
 		const view = await render(WebRecon, { onreset: vi.fn() });
 		unmount = view.unmount;
 

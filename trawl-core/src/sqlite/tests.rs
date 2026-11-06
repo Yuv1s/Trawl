@@ -585,6 +585,71 @@ fn a_flag_in_pieces_past_the_rows_shown_is_found() {
     assert_eq!(db.tables[0].flags, flags);
 }
 
+/// A UTF-16BE database of one table, whose rows are `(null, text, a nonzero byte)`, so no
+/// text ends on the zero byte a shifted scan of the file would need for its last character.
+fn big_endian_database(texts: &[&str]) -> Vec<u8> {
+    let wide = |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_be_bytes).collect() };
+
+    let parts = ["table", "notes", "notes", "", NOTES];
+    let mut types = Vec::new();
+    let mut values = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i == 3 {
+            types.push(1);
+            values.push(2);
+        } else {
+            types.extend_from_slice(&varint_of(wide(part).len() as u64 * 2 + 13));
+            values.extend_from_slice(&wide(part));
+        }
+    }
+    let mut schema = varint_of(1 + types.len() as u64);
+    schema.extend_from_slice(&types);
+    schema.extend_from_slice(&values);
+    let mut schema_cell = varint_of(schema.len() as u64);
+    schema_cell.extend_from_slice(&varint_of(1));
+    schema_cell.extend_from_slice(&schema);
+
+    let mut rows = Leaf::new(PAGE, 0);
+    for (i, text) in texts.iter().enumerate() {
+        let body = wide(text);
+        let serial = varint_of(body.len() as u64 * 2 + 13);
+        let mut record = varint_of(3 + serial.len() as u64);
+        record.push(0);
+        record.extend_from_slice(&serial);
+        record.push(1);
+        record.extend_from_slice(&body);
+        record.push(0x41);
+
+        let mut cell = varint_of(record.len() as u64);
+        cell.extend_from_slice(&varint_of(i as u64 + 1));
+        cell.extend_from_slice(&record);
+        rows = rows.live(&cell);
+    }
+
+    file_of(
+        PAGE,
+        3,
+        vec![
+            Leaf::new(PAGE, 100).live(&schema_cell).build(),
+            rows.build(),
+        ],
+    )
+}
+
+#[test]
+fn a_flag_in_a_big_endian_row_past_the_rows_shown_is_found() {
+    let mut texts = vec!["x"; MAX_ROWS];
+    texts.push("flag{past_the_rows_shown}");
+
+    let db = read(&big_endian_database(&texts)).unwrap();
+
+    assert_eq!(db.encoding, "UTF-16BE");
+    assert_eq!(db.tables[0].rows.len(), MAX_ROWS);
+    assert_eq!(db.tables[0].row_count, MAX_ROWS + 1);
+    assert_eq!(db.tables[0].flags, ["flag{past_the_rows_shown}"]);
+    assert!(!db.flags_truncated);
+}
+
 /// A record of one value, with the serial type given.
 fn record_of(serial: u64, value: &[u8]) -> Vec<u8> {
     let types = varint_of(serial);

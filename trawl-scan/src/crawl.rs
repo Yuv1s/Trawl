@@ -20,8 +20,16 @@ use std::collections::HashSet;
 /// the result balloon. A real page references dozens of things and holds a
 /// handful of comments; a page with tens of thousands is an attack on the
 /// scanner's time and memory, not a site to crawl. Past these the rest are left.
-const MAX_REFERENCES: usize = 2000;
-const MAX_COMMENTS: usize = 2000;
+pub const MAX_REFERENCES: usize = 2000;
+pub const MAX_COMMENTS: usize = 2000;
+
+/// What a reader kept, and whether it stopped at its ceiling with more to go, so the scan
+/// can say so rather than let what it dropped read as never having been there.
+#[derive(Debug)]
+pub struct Capped<T> {
+    pub items: Vec<T>,
+    pub cut: bool,
+}
 
 /// What a referenced URL turns out to be, judged by its file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,11 +59,26 @@ pub struct Reference {
 /// Longest attribute value read. Past this it is not a link anyone could follow.
 const MAX_ATTRIBUTE_VALUE: usize = 4096;
 
+/// Whether a value names a scheme nothing here could fetch, like `mailto:`. These are dropped
+/// on sight, or a page could spend its whole allowance on them ahead of a real link.
+fn names_another_scheme(value: &str) -> bool {
+    let Some((scheme, _)) = value.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        && !scheme.eq_ignore_ascii_case("http")
+        && !scheme.eq_ignore_ascii_case("https")
+}
+
 /// Pulls the value out of every `href`, `src` and `action` attribute.
 ///
 /// Boundary-checked so `datasrc` is not mistaken for `src`, and it reads both
 /// quoted and bare values. Anything stranger than that it lets go by.
-fn attribute_values(html: &str) -> Vec<String> {
+fn attribute_values(html: &str) -> Capped<String> {
     let bytes = html.as_bytes();
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -116,40 +139,53 @@ fn attribute_values(html: &str) -> Vec<String> {
             from = i;
 
             let value = html[start..i].trim();
-            if !value.is_empty() && seen.insert(value) {
-                out.push(value.to_string());
+            if !value.is_empty() && !names_another_scheme(value) && seen.insert(value) {
                 if out.len() >= MAX_REFERENCES {
-                    return out;
+                    return Capped {
+                        items: out,
+                        cut: true,
+                    };
                 }
+                out.push(value.to_string());
             }
         }
     }
 
-    out
+    Capped {
+        items: out,
+        cut: false,
+    }
 }
 
 /// Everything between `<!--` and `-->`, which is where a developer leaves the
 /// thing they meant to take out.
-pub fn comments(body: &[u8]) -> Vec<String> {
+pub fn comments(body: &[u8]) -> Capped<String> {
     let html = String::from_utf8_lossy(body);
     let mut out = Vec::new();
     let mut rest = html.as_ref();
 
-    while out.len() < MAX_COMMENTS
-        && let Some(start) = rest.find("<!--")
-    {
+    while let Some(start) = rest.find("<!--") {
         let after = &rest[start + 4..];
         let Some(end) = after.find("-->") else {
             break;
         };
         let body = after[..end].trim();
         if !body.is_empty() {
+            if out.len() >= MAX_COMMENTS {
+                return Capped {
+                    items: out,
+                    cut: true,
+                };
+            }
             out.push(body.to_string());
         }
         rest = &after[end + 3..];
     }
 
-    out
+    Capped {
+        items: out,
+        cut: false,
+    }
 }
 
 fn classify(url: &Url) -> Kind {
@@ -176,15 +212,13 @@ fn classify(url: &Url) -> Kind {
 ///
 /// Relative links become absolute, anything that is not http(s) is dropped, and
 /// the list is deduplicated so a link repeated across a page is one finding.
-pub fn references(base: &Url, body: &[u8]) -> Vec<Reference> {
+pub fn references(base: &Url, body: &[u8]) -> Capped<Reference> {
     let html = String::from_utf8_lossy(body);
     let mut out: Vec<Reference> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
-    for raw in attribute_values(&html) {
-        if out.len() >= MAX_REFERENCES {
-            break;
-        }
+    let values = attribute_values(&html);
+    for raw in values.items {
         let Ok(mut abs) = base.join(&raw) else {
             continue;
         };
@@ -212,7 +246,10 @@ pub fn references(base: &Url, body: &[u8]) -> Vec<Reference> {
         });
     }
 
-    out
+    Capped {
+        items: out,
+        cut: values.cut,
+    }
 }
 
 /// Percent-decodes a URL enough to read a flag out of it.
@@ -247,7 +284,9 @@ pub fn decode_url(url: &str) -> String {
 ///
 /// `Disallow` and `Allow` lines both name paths worth a look; `Sitemap` lines
 /// name another file to read. All three are returned, resolved to absolute URLs.
-pub fn robots_paths(base: &Url, body: &[u8]) -> Vec<String> {
+///
+/// Every entry costs a copy of the base URL, so this holds to the same ceiling as a page.
+pub fn robots_paths(base: &Url, body: &[u8]) -> Capped<String> {
     let text = String::from_utf8_lossy(body);
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -274,12 +313,21 @@ pub fn robots_paths(base: &Url, body: &[u8]) -> Vec<String> {
         if let Ok(abs) = base.join(value) {
             let url = abs.to_string();
             if seen.insert(url.clone()) {
+                if out.len() >= MAX_REFERENCES {
+                    return Capped {
+                        items: out,
+                        cut: true,
+                    };
+                }
                 out.push(url);
             }
         }
     }
 
-    out
+    Capped {
+        items: out,
+        cut: false,
+    }
 }
 
 /// The URLs a sitemap lists in its `<loc>` tags, resolved to absolute.
@@ -288,15 +336,13 @@ pub fn robots_paths(base: &Url, body: &[u8]) -> Vec<String> {
 /// page a challenge leaves off the menu. The references scanner reads `href`,
 /// `src` and `action`, and a `<loc>` is none of those, so a sitemap needs its
 /// own small reader.
-pub fn sitemap_locs(base: &Url, body: &[u8]) -> Vec<String> {
+pub fn sitemap_locs(base: &Url, body: &[u8]) -> Capped<String> {
     let text = String::from_utf8_lossy(body);
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut rest = text.as_ref();
 
-    while out.len() < MAX_REFERENCES
-        && let Some(start) = rest.find("<loc>")
-    {
+    while let Some(start) = rest.find("<loc>") {
         let after = &rest[start + 5..];
         let Some(end) = after.find("</loc>") else {
             break;
@@ -305,13 +351,22 @@ pub fn sitemap_locs(base: &Url, body: &[u8]) -> Vec<String> {
         if let Ok(abs) = base.join(raw) {
             let url = abs.to_string();
             if seen.insert(url.clone()) {
+                if out.len() >= MAX_REFERENCES {
+                    return Capped {
+                        items: out,
+                        cut: true,
+                    };
+                }
                 out.push(url);
             }
         }
         rest = &after[end + 6..];
     }
 
-    out
+    Capped {
+        items: out,
+        cut: false,
+    }
 }
 
 #[cfg(test)]

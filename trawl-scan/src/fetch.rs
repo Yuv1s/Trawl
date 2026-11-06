@@ -16,7 +16,7 @@
 //! `http://169.254.169.254`, and the guard would never see it.
 
 use crate::guard;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 /// Longest a single request may take.
@@ -40,6 +40,10 @@ const FETCH_DEADLINE: Duration = Duration::from_secs(25);
 /// Most redirects to follow before giving up. A chain longer than this is either
 /// broken or trying to wear the guard down.
 const MAX_REDIRECTS: usize = 5;
+
+/// Longest URL to request. A server turns away far shorter ones, and a hostile redirect can
+/// be hundreds of kilobytes long, which every link on the page it leads to then copies.
+const MAX_URL: usize = 8 * 1024;
 
 /// Most of a body to read by default. Enough for any page or script worth
 /// scanning, and a cap so a hostile server cannot stream gigabytes at the
@@ -95,6 +99,86 @@ impl std::fmt::Display for FetchError {
             FetchError::Network(why) => write!(f, "network error: {why}"),
         }
     }
+}
+
+fn require_sane_length(url: &reqwest::Url) -> Result<(), FetchError> {
+    if url.as_str().len() > MAX_URL {
+        return Err(FetchError::BadUrl(format!(
+            "longer than the {MAX_URL} bytes Trawl will request"
+        )));
+    }
+    Ok(())
+}
+
+/// One request, ready to try against each address its name resolved to.
+struct Attempt<'a> {
+    host: &'a str,
+    port: u16,
+    method: &'a reqwest::Method,
+    url: &'a reqwest::Url,
+    headers: &'a [(String, String)],
+    body: Option<&'a Vec<u8>>,
+    /// Longest one address may take.
+    timeout: Duration,
+    /// When the whole fetch is out of time, however many addresses are left.
+    deadline: Instant,
+}
+
+/// Tries each vetted address in turn until one answers.
+///
+/// A name that resolves to several addresses is the ordinary case, and `localhost` is the
+/// one that bites: it usually lists ::1 first, and a service bound only to 127.0.0.1 is not
+/// there, so the ::1 attempt has to fail before the working address is reached. On many
+/// machines that failure is a two-second stall rather than a refusal, so IPv4 is tried first
+/// and a short connect timeout keeps a dead address from holding the request.
+///
+/// Each address gets what the fetch has left rather than a timeout of its own, or a hostile
+/// name listing many addresses that accept and then stall could hold it for minutes.
+async fn first_answer(
+    mut addresses: Vec<IpAddr>,
+    attempt: &Attempt<'_>,
+) -> Result<reqwest::Response, FetchError> {
+    addresses.sort_by_key(|addr| addr.is_ipv6());
+
+    let mut last_error = None;
+    for addr in addresses {
+        let left = attempt.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(FetchError::Network("fetch deadline exceeded".into()));
+        }
+
+        // Pinned to the vetted IP and told not to follow redirects itself,
+        // nor to consult any proxy: a proxy would resolve the name again and
+        // send the request there, undoing the IP pin the guard depends on.
+        // The hostname still drives TLS, so certificate checking is unaffected.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .timeout(attempt.timeout.min(left))
+            .connect_timeout(CONNECT_TIMEOUT.min(left))
+            .resolve(attempt.host, SocketAddr::new(addr, attempt.port))
+            .build()
+            .map_err(|e| FetchError::Network(e.to_string()))?;
+
+        let mut builder = client.request(attempt.method.clone(), attempt.url.clone());
+        for (name, value) in attempt.headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        if let Some(body) = attempt.body {
+            builder = builder.body(body.clone());
+        }
+
+        match builder.send().await {
+            Ok(got) => return Ok(got),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(FetchError::Network(
+        last_error
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "could not connect".into()),
+    ))
 }
 
 /// Whether two addresses are the same service: one origin, or loopback names on one port,
@@ -171,6 +255,7 @@ pub async fn fetch_with(
 ) -> Result<Fetched, FetchError> {
     let mut current = reqwest::Url::parse(url).map_err(|e| FetchError::BadUrl(e.to_string()))?;
     require_web_scheme(&current)?;
+    require_sane_length(&current)?;
     // Local access is for the service that was asked for. A local page redirecting anywhere
     // else is held to the strict guard, or it could send the scanner to any other service
     // on the person's machine or network.
@@ -224,63 +309,25 @@ pub async fn fetch_with(
                 reason.to_string()
             }));
         }
-        let mut addresses = resolved.safe_addresses();
+        let addresses = resolved.safe_addresses();
         if addresses.is_empty() {
             return Err(FetchError::Network("host did not resolve".into()));
         }
 
-        // Every vetted address is tried in turn until one answers. A name that
-        // resolves to several addresses is the ordinary case, and `localhost` is
-        // the one that bites: it usually lists ::1 first, and a service bound
-        // only to 127.0.0.1 is not there, so the ::1 attempt has to fail before
-        // the working address is reached. On many machines that failure is a
-        // two-second stall rather than a refusal, so IPv4 is tried first and a
-        // short connect timeout keeps a dead address from holding the request.
-        addresses.sort_by_key(|addr| addr.is_ipv6());
-
-        // The hop's timeout never outlasts what is left of the whole-fetch budget.
-        let hop_timeout = request.timeout.unwrap_or(TIMEOUT).min(remaining);
-
-        let mut resp = None;
-        let mut last_error = None;
-        for addr in addresses {
-            // Pinned to the vetted IP and told not to follow redirects itself,
-            // nor to consult any proxy: a proxy would resolve the name again and
-            // send the request there, undoing the IP pin the guard depends on.
-            // The hostname still drives TLS, so certificate checking is unaffected.
-            let client = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .no_proxy()
-                .timeout(hop_timeout)
-                .connect_timeout(CONNECT_TIMEOUT.min(remaining))
-                .resolve(&host, SocketAddr::new(addr, port))
-                .build()
-                .map_err(|e| FetchError::Network(e.to_string()))?;
-
-            let mut builder = client.request(method.clone(), current.clone());
-            for (name, value) in &headers {
-                builder = builder.header(name.as_str(), value.as_str());
-            }
-            if let Some(body) = &body {
-                builder = builder.body(body.clone());
-            }
-
-            match builder.send().await {
-                Ok(got) => {
-                    resp = Some(got);
-                    break;
-                }
-                Err(error) => last_error = Some(error),
-            }
-        }
-
-        let mut resp = resp.ok_or_else(|| {
-            FetchError::Network(
-                last_error
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "could not connect".into()),
-            )
-        })?;
+        let mut resp = first_answer(
+            addresses,
+            &Attempt {
+                host: &host,
+                port,
+                method: &method,
+                url: &current,
+                headers: &headers,
+                body: body.as_ref(),
+                timeout: request.timeout.unwrap_or(TIMEOUT),
+                deadline: started + FETCH_DEADLINE,
+            },
+        )
+        .await?;
 
         let status = resp.status();
 
@@ -294,6 +341,7 @@ pub async fn fetch_with(
                 .join(location)
                 .map_err(|e| FetchError::BadUrl(e.to_string()))?;
             require_web_scheme(&target)?;
+            require_sane_length(&target)?;
 
             let same_origin = target.origin() == current.origin();
             let method_is_get_or_head =
@@ -452,6 +500,54 @@ mod tests {
 
         assert_eq!(page.body, b"here");
         assert!(page.final_url.ends_with("/next"));
+    }
+
+    #[tokio::test]
+    async fn a_name_with_many_stalling_addresses_stays_inside_the_deadline() {
+        let stalling = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = stalling.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = stalling.accept().await {
+                held.push(socket);
+            }
+        });
+
+        let url = reqwest::Url::parse(&format!("http://stalling.test:{}/", at.port())).unwrap();
+        let started = Instant::now();
+        let answer = first_answer(
+            vec![at.ip(); 8],
+            &Attempt {
+                host: "stalling.test",
+                port: at.port(),
+                method: &reqwest::Method::GET,
+                url: &url,
+                headers: &[],
+                body: None,
+                timeout: Duration::from_millis(500),
+                deadline: started + Duration::from_millis(600),
+            },
+        )
+        .await;
+
+        assert!(answer.is_err());
+        // Each address taking its full timeout would be four seconds.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_an_overlong_url_is_refused() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = listener.local_addr().unwrap();
+        redirect_once(listener, format!("/{}", "a".repeat(MAX_URL)));
+
+        let answer = fetch(&format!("http://{at}/"), true).await;
+
+        assert!(matches!(answer, Err(FetchError::BadUrl(_))), "{answer:?}");
     }
 
     #[test]
